@@ -1,0 +1,54 @@
+services:
+  crispasr:
+    # image: ${CRISPASR_IMAGE:-crispasr-local:main}
+    image: ${CRISPASR_IMAGE_CUDA:-crispasr-local:main-cuda}
+    # build:
+    #   context: .
+    #   # dockerfile: .devops/main.Dockerfile
+    #   dockerfile: .devops/main-cuda.Dockerfile
+    ports:
+      - "8002:8080"
+    user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./models:/models
+      - ./cache:/cache
+    environment:
+      # CRISPASR_MODEL: ${CRISPASR_MODEL:-/models/model.gguf}
+      CRISPASR_BACKEND: ${CRISPASR_BACKEND:-}
+      CRISPASR_LANGUAGE: ${CRISPASR_LANGUAGE:-auto}
+      # CRISPASR_PORT: ${CRISPASR_PORT:-8080}
+      CRISPASR_AUTO_DOWNLOAD: ${CRISPASR_AUTO_DOWNLOAD:-0}
+      CRISPASR_CACHE_DIR: ${CRISPASR_CACHE_DIR:-/cache}
+      CRISPASR_API_KEYS: ${CRISPASR_API_KEYS:-}
+      CRISPASR_DIAGNOSTICS: ${CRISPASR_DIAGNOSTICS:-}
+      CRISPASR_EXTRA_ARGS: ${CRISPASR_EXTRA_ARGS:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # Resource limits - all tunable via environment variables with sensible defaults.
+    # CPU limits are expressed as number of cores (float), memory as Docker size strings (e.g. 8G).
+    deploy:
+      resources:
+        limits:
+          # Hard cap on CPU cores the container may consume
+          cpus: 2
+          # Hard cap on RAM
+          memory: 8G
+        reservations:
+          # Minimum CPU cores guaranteed to the container
+          # cpus: 1
+          # # Minimum RAM guaranteed to the container
+          # memory: 1G
+          devices:
+            # Grant access to all NVIDIA GPUs; set CRISPASR_GPU_COUNT to an
+            # integer (e.g. 1) to restrict to a specific number of GPUs.
+            - driver: nvidia
+              count: ${CRISPASR_GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+    pull_policy: always
