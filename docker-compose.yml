@@ -12,7 +12,7 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - ./models:/models
+      # - ./models:/models
       - ./cache:/cache
     environment:
       # CRISPASR_MODEL: ${CRISPASR_MODEL:-/models/model.gguf}
