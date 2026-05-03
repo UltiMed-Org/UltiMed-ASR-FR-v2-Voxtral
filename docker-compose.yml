@@ -1,5 +1,6 @@
 services:
   crispasr:
+    container_name: crispasr
     # image: ${CRISPASR_IMAGE:-crispasr-local:main}
     image: ${CRISPASR_IMAGE_CUDA:-crispasr-local:main-cuda}
     # build:
