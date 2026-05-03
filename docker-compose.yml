@@ -16,10 +16,10 @@ services:
       - ./models_ignore_backups/:/models
       - ./cache:/cache
     environment:
-      # CRISPASR_MODEL: ${CRISPASR_MODEL:-/models/model.gguf}
+      CRISPASR_MODEL: ${CRISPASR_MODEL:-}
       CRISPASR_BACKEND: ${CRISPASR_BACKEND:-}
       CRISPASR_LANGUAGE: ${CRISPASR_LANGUAGE:-auto}
-      # CRISPASR_PORT: ${CRISPASR_PORT:-8080}
+      CRISPASR_PORT: ${CRISPASR_PORT:-8080}
       CRISPASR_AUTO_DOWNLOAD: ${CRISPASR_AUTO_DOWNLOAD:-0}
       CRISPASR_CACHE_DIR: ${CRISPASR_CACHE_DIR:-/cache}
       CRISPASR_API_KEYS: ${CRISPASR_API_KEYS:-}
