@@ -53,3 +53,5 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     pull_policy: always
+    labels:
+      - "com.centurylinklabs.watchtower.scope=autoupdate"
