@@ -93,3 +93,5 @@ CrispASR
 
 
 .aider*
+models_ignore_backups/
+cache
