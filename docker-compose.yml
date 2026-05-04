@@ -2,7 +2,7 @@ services:
   crispasr:
     container_name: crispasr
     # image: ${CRISPASR_IMAGE:-crispasr-local:main}
-    image: ${CRISPASR_IMAGE_CUDA:-crispasr-local:main-cuda}
+    image: ghcr.io/crispstrobe/crispasr:main-cuda
     # build:
     #   context: .
     #   # dockerfile: .devops/main.Dockerfile
@@ -16,17 +16,18 @@ services:
       - ./models_ignore_backups/:/models
       - ./cache:/cache
     environment:
-      CRISPASR_MODEL: ${CRISPASR_MODEL:-}
-      CRISPASR_BACKEND: ${CRISPASR_BACKEND:-}
-      CRISPASR_LANGUAGE: ${CRISPASR_LANGUAGE:-auto}
-      CRISPASR_PORT: ${CRISPASR_PORT:-8080}
-      CRISPASR_AUTO_DOWNLOAD: ${CRISPASR_AUTO_DOWNLOAD:-0}
-      CRISPASR_CACHE_DIR: ${CRISPASR_CACHE_DIR:-/cache}
-      CRISPASR_API_KEYS: ${CRISPASR_API_KEYS:-}
-      CRISPASR_DIAGNOSTICS: ${CRISPASR_DIAGNOSTICS:-}
-      CRISPASR_KV_QUANT: ${CRISPASR_KV_QUANT:-}
-      CRISPASR_GGUF_MAP: ${CRISPASR_GGUF_MAP:-}
-      CRISPASR_EXTRA_ARGS: ${CRISPASR_EXTRA_ARGS:-}
+      # CRISPASR_PORT=8002
+      - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
+      - # CRISPASR_MODEL=/models/parakeet.gguf
+      - # CRISPASR_BACKEND=parakeet
+      - # CRISPASR_BACKEND=voxtral4b
+      - CRISPASR_LANGUAGE=auto
+      - CRISPASR_AUTO_DOWNLOAD=0
+      - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
+      - CRISPASR_EXTRA_ARGS="--verbose"
+      - CRISPASR_DIAGNOSTICS=0
+      - CRISPASR_KV_QUANT=q4_0
+      - CRISPASR_GGUF_PRELOAD=1
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
