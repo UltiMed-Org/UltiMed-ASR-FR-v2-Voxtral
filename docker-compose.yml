@@ -26,7 +26,8 @@ services:
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
       - CRISPASR_EXTRA_ARGS="--verbose"
       - CRISPASR_DIAGNOSTICS=0
-      - CRISPASR_KV_QUANT=q4_0
+      - CRISPASR_KV_QUANT_V=q8_0
+      - CRISPASR_KV_QUANT_K=q4_0
       - CRISPASR_GGUF_PRELOAD=1
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
