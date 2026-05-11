@@ -59,3 +59,34 @@ services:
     pull_policy: always
     labels:
       - "com.centurylinklabs.watchtower.scope=autoupdate"
+
+  crispasr-tts:
+    container_name: crispasr-tts
+    # Same image as the ASR service. TTS in this image is CLI-only (no HTTP
+    # endpoint), so we override the entrypoint to keep the container idle and
+    # drive it via `docker exec crispasr-tts crispasr --backend qwen3-tts-... --tts ...`
+    # Refs:
+    #   https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF
+    #   https://github.com/CrispStrobe/CrispASR
+    image: ghcr.io/crispstrobe/crispasr:main-cuda
+    entrypoint: ["sleep", "infinity"]
+    user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
+      - ./cache:/cache
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${CRISPASR_GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+    pull_policy: always
+    labels:
+      - "com.centurylinklabs.watchtower.scope=autoupdate"
