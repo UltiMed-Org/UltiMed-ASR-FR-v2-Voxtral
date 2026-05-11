@@ -62,20 +62,35 @@ services:
 
   crispasr-tts:
     container_name: crispasr-tts
-    # Same image as the ASR service. TTS in this image is CLI-only (no HTTP
-    # endpoint), so we override the entrypoint to keep the container idle and
-    # drive it via `docker exec crispasr-tts crispasr --backend qwen3-tts-... --tts ...`
-    # Refs:
+    # OpenAI-compatible TTS server (POST /v1/audio/speech) backed by
+    # Qwen3-TTS VoiceDesign. See:
+    #   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
     #   https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF
-    #   https://github.com/CrispStrobe/CrispASR
     image: ghcr.io/crispstrobe/crispasr:main-cuda
-    entrypoint: ["sleep", "infinity"]
+    ports:
+      - "8003:8080"
     user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
     security_opt:
       - no-new-privileges:true
     volumes:
       - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
       - ./cache:/cache
+    command:
+      - "--server"
+      - "--backend"
+      - "qwen3-tts-1.7b-voicedesign"
+      - "-m"
+      - "auto"
+      - "--port"
+      - "8080"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     deploy:
       resources:
         limits:
