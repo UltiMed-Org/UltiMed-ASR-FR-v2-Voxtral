@@ -16,11 +16,11 @@ services:
       - ./models_ignore_backups/:/models
       - ./cache:/cache
     environment:
-      # CRISPASR_PORT=8002
+      # - CRISPASR_PORT=8002
       - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
-      - # CRISPASR_MODEL=/models/parakeet.gguf
-      - # CRISPASR_BACKEND=parakeet
-      - # CRISPASR_BACKEND=voxtral4b
+      # - CRISPASR_MODEL=/models/parakeet.gguf
+      # - CRISPASR_BACKEND=parakeet
+      # - CRISPASR_BACKEND=voxtral4b
       - CRISPASR_LANGUAGE=auto
       - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
