@@ -75,16 +75,11 @@ services:
     volumes:
       - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
       - ./cache:/cache
-    command:
-      - "--server"
-      - "--backend"
-      - "qwen3-tts-1.7b-voicedesign"
-      - "-m"
-      - "auto"
-      - "--port"
-      - "8080"
-      - "--host"
-      - "0.0.0.0"
+    environment:
+      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
+      - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      - CRISPASR_AUTO_DOWNLOAD=0
+      - CRISPASR_EXTRA_ARGS="--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
