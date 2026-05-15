@@ -98,3 +98,4 @@ cache
 original_repo_for_quantization/
 
 **/*.gguf
+**/*.mp3
