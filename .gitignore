@@ -96,3 +96,5 @@ CrispASR
 models_ignore_backups/
 cache
 original_repo_for_quantization/
+
+**/*.gguf
