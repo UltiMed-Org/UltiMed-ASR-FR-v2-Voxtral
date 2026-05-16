@@ -76,11 +76,14 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
+      # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
+      - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
       - ./cache:/cache
     environment:
-      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
-      - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
+      # - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
+      - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
       - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
     healthcheck:
