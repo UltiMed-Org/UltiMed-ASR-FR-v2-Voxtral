@@ -69,7 +69,7 @@ services:
     build:
       context: ./original_repo_for_quantization
       dockerfile: .devops/main-cuda.Dockerfile
-    image: ghcr.io/crispstrobe/crispasr:main-cuda
+    # image: ghcr.io/crispstrobe/crispasr:main-cuda
     ports:
       - "8003:8080"
     user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
