@@ -66,10 +66,10 @@ services:
     # Qwen3-TTS VoiceDesign. See:
     #   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
     #   https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF
-    build:
-      context: ./original_repo_for_quantization
-      dockerfile: .devops/main-cuda.Dockerfile
-    # image: ghcr.io/crispstrobe/crispasr:main-cuda
+    # build:
+    #   context: ./original_repo_for_quantization
+    #   dockerfile: .devops/main-cuda.Dockerfile
+    image: ghcr.io/crispstrobe/crispasr:main-cuda
     ports:
       - "8003:8080"
     user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
