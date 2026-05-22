@@ -80,13 +80,16 @@ def cmd_check(base_url: str) -> int:
 
 
 def cmd_synth(base_url: str, instruction: str, text: str, out: Path,
-              response_format: str, speed: float, timeout: float) -> int:
+              response_format: str, speed: float, timeout: float,
+              seed: int | None) -> int:
     body = {
         "input": text,
         "instructions": instruction,
         "response_format": response_format,
         "speed": speed,
     }
+    if seed is not None:
+        body["seed"] = seed
     url = f"{base_url}/v1/audio/speech"
     print(f"POST {url}", file=sys.stderr)
     try:
@@ -122,6 +125,8 @@ def main() -> int:
                    help="Speech speed, 0.25 to 4.0 (default: 1.0).")
     p.add_argument("--timeout", type=float, default=300.0,
                    help="HTTP timeout in seconds (default: 300).")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Optional integer seed for reproducible synthesis (default: not sent).")
     args = p.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -140,6 +145,7 @@ def main() -> int:
         response_format=args.format,
         speed=args.speed,
         timeout=args.timeout,
+        seed=args.seed,
     )
 
 
