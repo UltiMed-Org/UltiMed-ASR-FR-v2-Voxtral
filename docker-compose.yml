@@ -22,9 +22,11 @@ services:
       # - CRISPASR_BACKEND=parakeet
       # - CRISPASR_BACKEND=voxtral4b
       - CRISPASR_LANGUAGE=auto
-      - CRISPASR_AUTO_DOWNLOAD=0
+      # Enabled so the pyannote segment model ("auto") can be fetched into /cache on first use
+      - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
-      - CRISPASR_EXTRA_ARGS="--verbose"
+      # Pyannote diarization: https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization
+      - CRISPASR_EXTRA_ARGS="--verbose --diarize --diarize-method pyannote --sherpa-segment-model auto"
       - CRISPASR_DIAGNOSTICS=0
       - CRISPASR_KV_QUANT_V=q8_0
       - CRISPASR_KV_QUANT_K=q8_0
