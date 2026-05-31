@@ -88,6 +88,7 @@ services:
       - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
       - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
+      # - QWEN3_TTS_SEED=2
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
