@@ -17,28 +17,29 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
-      # The 4B GGUF needs the voxtral4b backend; plain "voxtral" is the
-      # smaller 2.5GB standard variant (that mismatch is part of why a
-      # different voxtral was being downloaded).
-      - CRISPASR_BACKEND=voxtral4b
-      - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
-      # - CRISPASR_BACKEND=voxtral        # 2.5GB standard variant
-      # - CRISPASR_MODEL=/models/parakeet.gguf
-      # - CRISPASR_BACKEND=parakeet
+      # --- Active backend: parakeet ---
+      # No local parakeet.gguf here, so AUTO_DOWNLOAD=1 makes the entrypoint pass
+      # "-m auto" and fetch cstr/parakeet-tdt-0.6b-v3-GGUF (~467MB) on first run.
+      # CRISPASR_MODEL is ignored while AUTO_DOWNLOAD=1.
+      - CRISPASR_BACKEND=parakeet
+      - CRISPASR_AUTO_DOWNLOAD=1
+      # --- Alternative: local voxtral 4B (uncomment both, and set AUTO_DOWNLOAD=0) ---
+      # The 4B GGUF needs the voxtral4b backend; plain "voxtral" is the smaller
+      # 2.5GB standard variant. With AUTO_DOWNLOAD=0 the entrypoint uses the local
+      # file in CRISPASR_MODEL instead of downloading the registry model.
+      # - CRISPASR_BACKEND=voxtral4b
+      # - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
       - CRISPASR_LANGUAGE=auto
-      # Keep this at 0. AUTO_DOWNLOAD=1 makes the entrypoint pass "-m auto" and
-      # ignore CRISPASR_MODEL, so it downloads the registry voxtral instead of
-      # the local file. The pyannote segment model auto-downloads on its own via
-      # "--sherpa-segment-model auto" below, independent of this flag.
-      - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
       # Pyannote diarization: https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization
       # No surrounding quotes: the entrypoint runs eval "args+=($CRISPASR_EXTRA_ARGS)",
       # so quotes collapse the whole string into one argument (that broke startup).
       - CRISPASR_EXTRA_ARGS=--verbose --diarize --diarize-method pyannote --sherpa-segment-model auto
       - CRISPASR_DIAGNOSTICS=0
-      - CRISPASR_KV_QUANT_V=q8_0
-      - CRISPASR_KV_QUANT_K=q8_0
+      # KV-cache quant is transformer-only (voxtral); parakeet is CTC/TDT with no
+      # KV cache, so these are no-ops here. Re-enable when switching to voxtral.
+      # - CRISPASR_KV_QUANT_V=q8_0
+      # - CRISPASR_KV_QUANT_K=q8_0
       - CRISPASR_GGUF_PRELOAD=1
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
