@@ -17,16 +17,25 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
+      # The 4B GGUF needs the voxtral4b backend; plain "voxtral" is the
+      # smaller 2.5GB standard variant (that mismatch is part of why a
+      # different voxtral was being downloaded).
+      - CRISPASR_BACKEND=voxtral4b
       - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
+      # - CRISPASR_BACKEND=voxtral        # 2.5GB standard variant
       # - CRISPASR_MODEL=/models/parakeet.gguf
       # - CRISPASR_BACKEND=parakeet
-      # - CRISPASR_BACKEND=voxtral4b
       - CRISPASR_LANGUAGE=auto
-      # Enabled so the pyannote segment model ("auto") can be fetched into /cache on first use
-      - CRISPASR_AUTO_DOWNLOAD=1
+      # Keep this at 0. AUTO_DOWNLOAD=1 makes the entrypoint pass "-m auto" and
+      # ignore CRISPASR_MODEL, so it downloads the registry voxtral instead of
+      # the local file. The pyannote segment model auto-downloads on its own via
+      # "--sherpa-segment-model auto" below, independent of this flag.
+      - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
       # Pyannote diarization: https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization
-      - CRISPASR_EXTRA_ARGS="--verbose --diarize --diarize-method pyannote --sherpa-segment-model auto"
+      # No surrounding quotes: the entrypoint runs eval "args+=($CRISPASR_EXTRA_ARGS)",
+      # so quotes collapse the whole string into one argument (that broke startup).
+      - CRISPASR_EXTRA_ARGS=--verbose --diarize --diarize-method pyannote --sherpa-segment-model auto
       - CRISPASR_DIAGNOSTICS=0
       - CRISPASR_KV_QUANT_V=q8_0
       - CRISPASR_KV_QUANT_K=q8_0
