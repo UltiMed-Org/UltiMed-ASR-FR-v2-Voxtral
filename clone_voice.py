@@ -52,8 +52,18 @@ REC_MAX_SEC = 15.0  # upstream recommends a reference clip <= 15 s
 
 # Encoder deps, injected per-bake via `uv run --with` (kept out of this script's
 # own deps so the menu does not wait on a multi-GB torch install).
+# hume-tada pins torch>=2.7,<2.8 but leaves torchaudio/torchvision unpinned;
+# torchaudio and torchvision MUST match torch's version exactly or you get
+# "undefined symbol: torch_library_impl" at import. Pin the matched 2.7.1 set.
+# transformers is capped <5 (hume-tada's constraint) to avoid resolver thrash.
 UV_WITH = [
-    "torch", "torchaudio", "gguf", "numpy", "transformers",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
+    "transformers>=4.57.1,<5",
+    "gguf",
+    "numpy",
+    "soundfile",  # load_audio fallback if torchaudio.load ever balks
     "git+https://github.com/HumeAI/tada.git",
 ]
 
