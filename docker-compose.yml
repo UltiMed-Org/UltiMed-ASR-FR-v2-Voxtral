@@ -104,13 +104,19 @@ services:
       # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
       # - QWEN3_TTS_SEED=2
       # --- Active backend: TADA 3B multilingual (French) ---
-      # tada-1b is English-only; tada-3b-ml adds ar/ch/de/es/fr/it/ja/pl/pt.
+      # Backend MUST be "tada": that is the canonical -m auto registry key for the
+      # 3B multilingual model (HumeAI/tada-3b-ml, supports ar/ch/de/es/fr/it/ja/pl/pt).
+      # The docs also mention "tada-3b-ml", but that string is NOT in the auto-download
+      # registry (src/crispasr_model_registry.cpp), so "-m auto --backend tada-3b-ml"
+      # fails with "failed to resolve model 'auto' for backend 'tada-3b-ml'".
+      # ("tada-1b" / "tada-tts-1b" are the English-only variant.)
       # AUTO_DOWNLOAD=1 -> entrypoint passes "-m auto --auto-download", fetching
-      # the ~4GB Q4_K model + ~1GB codec into /cache on first run. No --codec-model
-      # needed (TADA auto-discovers it, unlike qwen). CRISPASR_LANGUAGE=fr maps to
-      # "-l fr", which also auto-downloads tada-ref-fr.gguf (the default French voice).
+      # tada-tts-3b-ml-f16.gguf (~8GB) + tada-codec-f16.gguf (~1GB) + the default
+      # tada-ref.gguf into /cache. No --codec-model needed (auto-discovered, unlike
+      # qwen). CRISPASR_LANGUAGE=fr maps to "-l fr", which auto-downloads
+      # tada-ref-fr.gguf (the French voice) at runtime.
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
-      - CRISPASR_BACKEND=tada-3b-ml
+      - CRISPASR_BACKEND=tada
       - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_LANGUAGE=fr
       - CRISPASR_EXTRA_ARGS=--verbose
