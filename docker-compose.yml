@@ -91,8 +91,12 @@ services:
       # --- Qwen3-TTS (previous): mounted a local model dir at /models ---
       # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
       # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
-      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec+French ref into the
-      #     --cache-dir (/cache), so no /models mount is needed. ---
+      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec into /cache. We ALSO mount
+      #     /models to supply the voice reference GGUF. "-l fr" did NOT auto-fetch
+      #     tada-ref-fr.gguf (cache only had the English tada-ref.gguf), which made
+      #     French garbled, so the French ref is passed explicitly via --voice in
+      #     CRISPASR_EXTRA_ARGS below. Swap in a cloned ref here once you bake one. ---
+      - ./models_tts_ignore_backups/:/models
       - ./cache:/cache
     environment:
       # --- Qwen3-TTS (previous) ---
@@ -119,9 +123,13 @@ services:
       - CRISPASR_BACKEND=tada
       - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_LANGUAGE=fr
-      - CRISPASR_EXTRA_ARGS=--verbose
+      # --voice forces the French reference (acoustic prompt). Without it the runtime
+      # falls back to the English tada-ref.gguf and French comes out garbled. Point
+      # this at a cloned ref (e.g. /models/tada-ref-custom.gguf) to use your own voice.
+      - CRISPASR_EXTRA_ARGS=--verbose --voice /models/tada-ref-fr.gguf
       # Timing robustness (default 4); raise toward 8 if prosody rushes/garbles.
       # - TADA_NUM_CANDIDATES=4
+      - TADA_NUM_CANDIDATES=16
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
