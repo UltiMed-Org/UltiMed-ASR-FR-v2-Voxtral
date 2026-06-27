@@ -88,17 +88,34 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
+      # --- Qwen3-TTS (previous): mounted a local model dir at /models ---
       # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
-      - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
+      # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
+      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec+French ref into the
+      #     --cache-dir (/cache), so no /models mount is needed. ---
       - ./cache:/cache
     environment:
+      # --- Qwen3-TTS (previous) ---
       # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
       # - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
-      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
-      - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
-      - CRISPASR_AUTO_DOWNLOAD=0
-      - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
+      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
+      # - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
+      # - CRISPASR_AUTO_DOWNLOAD=0
+      # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
       # - QWEN3_TTS_SEED=2
+      # --- Active backend: TADA 3B multilingual (French) ---
+      # tada-1b is English-only; tada-3b-ml adds ar/ch/de/es/fr/it/ja/pl/pt.
+      # AUTO_DOWNLOAD=1 -> entrypoint passes "-m auto --auto-download", fetching
+      # the ~4GB Q4_K model + ~1GB codec into /cache on first run. No --codec-model
+      # needed (TADA auto-discovers it, unlike qwen). CRISPASR_LANGUAGE=fr maps to
+      # "-l fr", which also auto-downloads tada-ref-fr.gguf (the default French voice).
+      # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
+      - CRISPASR_BACKEND=tada-3b-ml
+      - CRISPASR_AUTO_DOWNLOAD=1
+      - CRISPASR_LANGUAGE=fr
+      - CRISPASR_EXTRA_ARGS=--verbose
+      # Timing robustness (default 4); raise toward 8 if prosody rushes/garbles.
+      # - TADA_NUM_CANDIDATES=4
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
