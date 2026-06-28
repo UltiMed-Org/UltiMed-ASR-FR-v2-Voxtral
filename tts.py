@@ -24,6 +24,14 @@ falls back to the value it was started with (env vars / CLI flags); this
 is the server's per-request contract and keeps requests from leaking
 settings into each other.
 
+Scope note: only the *sampler* knobs are per-request for TADA. The voice
+reference is bound once at server startup (the container's
+`--voice /models/tada-ref-*.gguf`); TADA's `synthesize()` never re-reads
+the voice, so a per-request `voice` is silently ignored. Changing a TADA
+voice means restarting the server with a different baked ref. The
+`--voice` / cloning flags here are kept for backends that do honour
+per-request voice.
+
 Refs:
   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
   CrispASR docs/tts.md (TADA talker sampling), docs/server.md (/v1/audio/speech)
@@ -103,9 +111,15 @@ def build_speech_body(
         Voice-direction prose. Only qwen3-tts VoiceDesign honours it; TADA
         silently ignores it, so it is opt-in here rather than always sent.
     voice : str or None
-        Backend voice selector. For TADA this is a baked reference: a bare
-        name resolving under the server's `--voice-dir`, or a path to a
-        `tada-ref-*.gguf`. Omit to use the server's `--voice` default.
+        Backend voice selector, passed through verbatim. NOTE: the TADA
+        backend binds its voice reference once at server *startup* (from
+        `--voice` / `TADA_PROMPT_CACHE` / the language default) and its
+        per-call `synthesize()` never re-reads the voice, so this field is
+        silently ignored by TADA (verified in `crispasr_backend_tada.cpp`:
+        the prompt is loaded only in `init()`, not per request). To change a
+        TADA voice you must restart the server with a different baked
+        `tada-ref-*.gguf`. The field still works for backends that honour
+        per-request voice (qwen3-tts base, vibevoice-1.5b, ...).
     seed : int or None
         RNG seed. With sampling on, the same seed + text is reproducible and
         different seeds change the wording.
@@ -129,6 +143,9 @@ def build_speech_body(
     consent_attestation : str or None
         Required by the server when `voice` ends in `.wav` (runtime voice
         cloning): a free-text speaker-consent statement, logged for audit.
+        Inert for TADA, which rejects `.wav` voices outright (bake a
+        `tada-ref-*.gguf` instead); relevant only for backends that clone
+        from a `.wav` at request time.
     spoken_disclaimer : bool or None
         Set False to skip the audible AI-disclosure prefix on voice-cloned
         output. Machine-readable provenance (watermark + C2PA) is always
@@ -234,14 +251,19 @@ def main() -> int:
 
     voice = p.add_argument_group(
         "voice / cloning",
-        "Select or clone the speaking voice. For TADA, --voice is a baked "
-        "reference (a bare name under the server's --voice-dir, or a path to a "
-        "tada-ref-*.gguf).")
+        "Select the speaking voice. WARNING: the deployed TADA backend binds its "
+        "voice at server startup (--voice <tada-ref-*.gguf>) and IGNORES a "
+        "per-request voice, so these flags are no-ops against the current "
+        "container. To change a TADA voice, restart the server with a different "
+        "baked ref. The flags still apply to backends that honour per-request "
+        "voice (qwen3-tts base, vibevoice-1.5b, ...).")
     voice.add_argument("--voice", default=None,
-                       help="Voice name or reference path (default: server's --voice).")
+                       help="Voice name or reference path (ignored by TADA per-request; "
+                            "default: server's startup --voice).")
     voice.add_argument("--consent-attestation", default=None,
                        help="Speaker-consent statement, required by the server when "
-                            "--voice ends in .wav (runtime voice cloning).")
+                            "--voice ends in .wav (request-time cloning). TADA rejects "
+                            ".wav voices, so this is inert for TADA.")
     voice.add_argument("--spoken-disclaimer", action=argparse.BooleanOptionalAction,
                        default=None,
                        help="Audible AI-disclosure prefix on cloned output (server default: on). "
