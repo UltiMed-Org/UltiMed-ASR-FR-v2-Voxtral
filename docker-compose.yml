@@ -94,11 +94,12 @@ services:
       # --- Qwen3-TTS (previous): mounted a local model dir at /models ---
       # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
       # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
-      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec into /cache. We ALSO mount
-      #     /models to supply the voice reference GGUF. "-l fr" did NOT auto-fetch
-      #     tada-ref-fr.gguf (cache only had the English tada-ref.gguf), which made
-      #     French garbled, so the French ref is passed explicitly via --voice in
-      #     CRISPASR_EXTRA_ARGS below. Swap in a cloned ref here once you bake one. ---
+      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec (+ the default English
+      #     tada-ref.gguf) into /cache. We ALSO mount /models to supply a specific
+      #     voice reference GGUF, pinned via --voice in CRISPASR_EXTRA_ARGS below;
+      #     swap in your own baked ref here. (With "-l fr" and no --voice the runtime
+      #     now auto-downloads tada-ref-fr.gguf itself, so the explicit --voice is
+      #     about choosing a voice, not a workaround for a missing French ref.) ---
       - ./models_tts_ignore_backups/:/models
       - ./cache:/cache
     environment:
@@ -119,15 +120,20 @@ services:
       # ("tada-1b" / "tada-tts-1b" are the English-only variant.)
       # AUTO_DOWNLOAD=1 -> entrypoint passes "-m auto --auto-download", fetching
       # tada-tts-3b-ml-f16.gguf (~8GB) + tada-codec-f16.gguf (~1GB) + the default
-      # tada-ref.gguf into /cache. No --codec-model needed (auto-discovered, unlike
-      # qwen). CRISPASR_LANGUAGE=fr maps to "-l fr", which auto-downloads
-      # tada-ref-fr.gguf (the French voice) at runtime.
+      # English tada-ref.gguf into /cache. No --codec-model needed (auto-discovered,
+      # unlike qwen). For TADA, CRISPASR_LANGUAGE ("-l fr") ONLY selects the voice
+      # reference (it does not otherwise condition synthesis): with no --voice it
+      # makes the runtime auto-download and use tada-ref-fr.gguf. Because we DO pass
+      # an explicit --voice below, that selection is overridden and -l fr is inert
+      # here (the French comes from the pinned reference itself); it only takes
+      # effect if you drop --voice.
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
       - CRISPASR_BACKEND=tada
       - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_LANGUAGE=fr
-      # --voice sets the STARTUP-DEFAULT reference (acoustic prompt). Without it the
-      # runtime falls back to the English tada-ref.gguf and French comes out garbled.
+      # --voice sets the STARTUP-DEFAULT reference (acoustic prompt), pinning a
+      # specific voice and overriding the -l-based selection above. (Drop it and
+      # "-l fr" + auto-download would fetch and use the generic tada-ref-fr.gguf.)
       # As of CrispASR #201 the voice is also switchable per request: a client can
       # POST "voice":"tada-ref-de.gguf" (path or cache/registry name) and TADA reloads
       # it live, so this flag only decides what bare requests (no voice field) get.
