@@ -134,8 +134,11 @@ services:
       # Point it at a cloned ref (e.g. /models/tada-ref-custom.gguf) to make your own
       # voice the default.
       - CRISPASR_EXTRA_ARGS=--verbose --voice /models/tada-ref-alicia.gguf
-      # Timing robustness (default 4); raise toward 8 if prosody rushes/garbles.
-      - TADA_NUM_CANDIDATES=4
+      # num_acoustic_candidates: leave UNSET so the server uses its default of 1
+      # (upstream InferenceOptions). Best-of-N (>1) is opt-in and on the CPU/Q4_K
+      # path the ranker often picks a WORSE flow-matching draw, mangling words
+      # ("four hours" -> "and forth"). Uncomment to A/B a higher count:
+      # - TADA_NUM_CANDIDATES=8
       # Acoustic flow-matching startup defaults (CrispASR #197); each is also
       # per-request via the API (num_steps / cfg_scale / noise_temp). num_steps is
       # the main quick-vs-accurate lever: more ODE steps = crisper but slower.
