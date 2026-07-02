@@ -145,10 +145,13 @@ def build_speech_body(
         Enable talker sampling. False forces the old greedy argmax decode
         (loops / drops words on hard or non-English text). TADA default: on.
     num_candidates : int or None
-        TADA per-token *duration* flow-matching candidates: higher = more
-        robust timing, lower = faster (1 = single noise draw). Tunes timing
-        only, not which words are spoken. Server default 4 (env
-        `TADA_NUM_CANDIDATES`).
+        TADA per-token flow-matching candidates (server maps this to
+        `num_acoustic_candidates`): draw N noise samples per token and keep
+        the "best" by a reconstruction scorer. Server default 1 (matches
+        upstream InferenceOptions). >1 is opt-in via `TADA_NUM_CANDIDATES`;
+        on the C++/CPU path best-of-N often ranks a WORSE draw (it can
+        mangle words, e.g. "four hours" -> "and forth"), so 1 is the
+        recommended default.
     num_steps : int or None
         TADA *acoustic* flow-matching ODE steps (server field `num_steps`,
         mapping to `num_flow_matching_steps`, default 10). The main
@@ -311,8 +314,8 @@ def main() -> int:
                       help="Enable talker sampling. --no-do-sample forces the old greedy "
                            "argmax decode (loops / drops words on hard text).")
     tada.add_argument("--num-candidates", type=int, default=None,
-                      help="TADA per-token duration flow-matching candidates: higher = more "
-                           "robust timing, lower = faster (1 = single noise draw). Server default 4.")
+                      help="TADA per-token flow-matching candidates (best-of-N noise draws). "
+                           "Server default 1; >1 is opt-in and can pick a worse draw on CPU.")
 
     # TADA acoustic flow-matching knobs (CrispASR #197). These steer audio
     # *quality* (not which words), and like the sampler knobs fall back to the
