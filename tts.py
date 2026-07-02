@@ -10,14 +10,18 @@ docker-compose.yml). Run `tts.py --check` to confirm the server is alive
 and the model loaded.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
-client exposes TADA's per-request talker-sampling knobs. As of CrispASR
-#197 the talker samples by default (matching upstream `InferenceOptions`:
-do_sample=on, temperature=0.6, top_p=0.9, top_k=0, repetition_penalty=1.1)
-instead of pure greedy argmax, which fixed the looping / word-dropping /
-garbled-liaison hallucinations on French. Those knobs, plus the duration
-flow-matching `num_candidates`, are now tunable at query time without
-restarting the container. See PR.md and CrispASR docs/tts.md
-("Talker text sampling") + docs/server.md for the field contract.
+client exposes TADA's per-request knobs. As of CrispASR #197 the talker
+samples by default (matching upstream `InferenceOptions`: do_sample=on,
+temperature=0.6, top_p=0.9, top_k=0, repetition_penalty=1.1) instead of
+pure greedy argmax, which fixed the looping / word-dropping /
+garbled-liaison hallucinations on French. The same rebuild also made TADA
+synthesize the whole utterance in one pass; it used to split on every
+period and pad silence between sentences, which produced a trailing ~9 s
+pause plus wind/hum on short inputs. Tunable at query time without a
+restart: the talker sampler, the duration flow-matching `num_candidates`,
+and the acoustic flow-matching knobs `num_steps` / `cfg_scale` /
+`noise_temp`. See PR.md and CrispASR docs/tts.md ("Talker text sampling")
++ docs/server.md for the field contract.
 
 Any knob left unset here is omitted from the request body so the server
 falls back to the value it was started with (env vars / CLI flags); this
@@ -87,6 +91,9 @@ def build_speech_body(
     repetition_penalty: float | None = None,
     do_sample: bool | None = None,
     num_candidates: int | None = None,
+    num_steps: int | None = None,
+    cfg_scale: float | None = None,
+    noise_temp: float | None = None,
     consent_attestation: str | None = None,
     spoken_disclaimer: bool | None = None,
 ) -> dict:
@@ -140,6 +147,18 @@ def build_speech_body(
         robust timing, lower = faster (1 = single noise draw). Tunes timing
         only, not which words are spoken. Server default 4 (env
         `TADA_NUM_CANDIDATES`).
+    num_steps : int or None
+        TADA *acoustic* flow-matching ODE steps (server field `num_steps`,
+        mapping to `num_flow_matching_steps`, default 10). The main
+        quick-vs-accurate lever: more steps = crisper acoustics but slower
+        (4 vs 25 steps both ASR-verbatim, 25 audibly crisper). Env
+        `TADA_NUM_FM_STEPS`.
+    cfg_scale : float or None
+        TADA acoustic classifier-free guidance (server field `cfg_scale`,
+        mapping to `acoustic_cfg`, default 1.6). Env `TADA_ACOUSTIC_CFG`.
+    noise_temp : float or None
+        TADA acoustic noise temperature (server field `noise_temp`, default
+        0.9). Env `TADA_NOISE_TEMP`.
     consent_attestation : str or None
         Required by the server when `voice` ends in `.wav` (runtime voice
         cloning): a free-text speaker-consent statement, logged for audit.
@@ -173,6 +192,9 @@ def build_speech_body(
         "repetition_penalty": repetition_penalty,
         "do_sample": do_sample,
         "num_candidates": num_candidates,
+        "num_steps": num_steps,
+        "cfg_scale": cfg_scale,
+        "noise_temp": noise_temp,
         "consent_attestation": consent_attestation,
         "spoken_disclaimer": spoken_disclaimer,
     }
@@ -290,6 +312,21 @@ def main() -> int:
     tada.add_argument("--num-candidates", type=int, default=None,
                       help="TADA per-token duration flow-matching candidates: higher = more "
                            "robust timing, lower = faster (1 = single noise draw). Server default 4.")
+
+    # TADA acoustic flow-matching knobs (CrispASR #197). These steer audio
+    # *quality* (not which words), and like the sampler knobs fall back to the
+    # server's startup value when unset.
+    acoustic = p.add_argument_group(
+        "TADA acoustics",
+        "Per-request acoustic flow-matching knobs. Unset = server default "
+        "(num_steps 10, cfg_scale 1.6, noise_temp 0.9).")
+    acoustic.add_argument("--num-steps", type=int, default=None,
+                          help="Acoustic flow-matching ODE steps: more = crisper but slower "
+                               "(the main quick-vs-accurate lever). Server default 10.")
+    acoustic.add_argument("--cfg-scale", type=float, default=None,
+                          help="Acoustic classifier-free guidance weight. Server default 1.6.")
+    acoustic.add_argument("--noise-temp", type=float, default=None,
+                          help="Acoustic noise temperature. Server default 0.9.")
     args = p.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -313,6 +350,9 @@ def main() -> int:
         repetition_penalty=args.repetition_penalty,
         do_sample=args.do_sample,
         num_candidates=args.num_candidates,
+        num_steps=args.num_steps,
+        cfg_scale=args.cfg_scale,
+        noise_temp=args.noise_temp,
         consent_attestation=args.consent_attestation,
         spoken_disclaimer=args.spoken_disclaimer,
     )
