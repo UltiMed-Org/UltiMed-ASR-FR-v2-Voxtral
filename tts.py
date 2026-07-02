@@ -28,13 +28,15 @@ falls back to the value it was started with (env vars / CLI flags); this
 is the server's per-request contract and keeps requests from leaking
 settings into each other.
 
-Scope note: only the *sampler* knobs are per-request for TADA. The voice
-reference is bound once at server startup (the container's
-`--voice /models/tada-ref-*.gguf`); TADA's `synthesize()` never re-reads
-the voice, so a per-request `voice` is silently ignored. Changing a TADA
-voice means restarting the server with a different baked ref. The
-`--voice` / cloning flags here are kept for backends that do honour
-per-request voice.
+Voice is per-request too (CrispASR #201): point `voice` at a different
+`tada-ref-*.gguf` (an absolute path, or a cache/registry name that
+auto-downloads) and TADA reloads it on the next call. Omitting `voice`,
+or passing `"default"` / `"auto"`, keeps whatever ref is currently loaded
+(no reload, no cross-request leak). A `.wav` handed straight to `voice` is
+still rejected by TADA: bake a ref offline first (CLI `--make-ref`, or
+convert-tada-ref-to-gguf.py from audio + transcript), then switch to it
+live. On-the-fly ref generation from audio is not wired into the server
+yet.
 
 Refs:
   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
@@ -118,15 +120,15 @@ def build_speech_body(
         Voice-direction prose. Only qwen3-tts VoiceDesign honours it; TADA
         silently ignores it, so it is opt-in here rather than always sent.
     voice : str or None
-        Backend voice selector, passed through verbatim. NOTE: the TADA
-        backend binds its voice reference once at server *startup* (from
-        `--voice` / `TADA_PROMPT_CACHE` / the language default) and its
-        per-call `synthesize()` never re-reads the voice, so this field is
-        silently ignored by TADA (verified in `crispasr_backend_tada.cpp`:
-        the prompt is loaded only in `init()`, not per request). To change a
-        TADA voice you must restart the server with a different baked
-        `tada-ref-*.gguf`. The field still works for backends that honour
-        per-request voice (qwen3-tts base, vibevoice-1.5b, ...).
+        Backend voice selector, passed through verbatim. TADA honours this
+        per request (CrispASR #201): a `tada-ref-*.gguf` given as an
+        absolute path, or as a cache/registry name that auto-downloads,
+        makes the backend reload that reference on the next call (it logs
+        `switched voice -> ...`). Passing `"default"` / `"auto"`, or
+        omitting it, keeps whatever ref is currently loaded (no reload, no
+        cross-request leak). A `.wav` handed straight to `voice` is still
+        rejected by TADA (bake a ref offline first). Also honoured by
+        qwen3-tts base, vibevoice-1.5b, ...
     seed : int or None
         RNG seed. With sampling on, the same seed + text is reproducible and
         different seeds change the wording.
@@ -273,15 +275,14 @@ def main() -> int:
 
     voice = p.add_argument_group(
         "voice / cloning",
-        "Select the speaking voice. WARNING: the deployed TADA backend binds its "
-        "voice at server startup (--voice <tada-ref-*.gguf>) and IGNORES a "
-        "per-request voice, so these flags are no-ops against the current "
-        "container. To change a TADA voice, restart the server with a different "
-        "baked ref. The flags still apply to backends that honour per-request "
-        "voice (qwen3-tts base, vibevoice-1.5b, ...).")
+        "Select the speaking voice. TADA honours --voice per request (CrispASR "
+        "#201): pass a tada-ref-*.gguf path or a cache/registry name and the "
+        "backend reloads it live; 'default'/'auto'/unset keeps the loaded ref. A "
+        ".wav is still rejected by TADA (bake a ref offline first). Also honoured "
+        "by qwen3-tts base, vibevoice-1.5b, ...")
     voice.add_argument("--voice", default=None,
-                       help="Voice name or reference path (ignored by TADA per-request; "
-                            "default: server's startup --voice).")
+                       help="Voice name or reference path (TADA reloads it live; "
+                            "'default'/'auto'/unset keeps the server's current voice).")
     voice.add_argument("--consent-attestation", default=None,
                        help="Speaker-consent statement, required by the server when "
                             "--voice ends in .wav (request-time cloning). TADA rejects "
