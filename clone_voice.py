@@ -159,7 +159,10 @@ def parse_selection(raw: str, n: int) -> list[int]:
     return idx
 
 
-def bake(v: Voice, language: str, device: str) -> bool:
+def bake(v: Voice, language: str, device: str, skip_if_baked: bool = False) -> bool:
+    if skip_if_baked and v.out_path.exists():
+        print(f"  {v.name}: already baked -> {v.out_path} (skipping)")
+        return True
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     transcript = v.transcript()
     if not transcript:
@@ -240,11 +243,12 @@ def main() -> int:
     p.add_argument("--set-active", action="store_true",
                    help="After a single bake, point docker-compose.yml --voice at it.")
     p.add_argument("--yes", action="store_true", help="Assume yes to prompts (non-interactive).")
+    p.add_argument("--skip-if-baked", action="store_true",
+                   help="Bake only voices whose tada-ref gguf is missing; reuse existing ones.")
+    p.add_argument("--print-path", action="store_true",
+                   help="Print each selected voice's /models/*.gguf container path and exit "
+                        "(no baking, no encoder/ffmpeg needed). One path per line on stdout.")
     args = p.parse_args()
-
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        die("ffmpeg/ffprobe required (sudo apt install ffmpeg)")
-    ensure_converter()
 
     voices = discover()
     if not voices:
@@ -267,7 +271,20 @@ def main() -> int:
             return 0
         selected = [voices[i] for i in parse_selection(raw, len(voices))]
 
-    baked = [v for v in selected if bake(v, args.language, args.device)]
+    # --print-path only resolves the canonical container voice path(s) for the
+    # selection: this is the single source of the tada-ref naming/mount convention
+    # (tts.py calls it instead of duplicating slugify()). No encoder deps needed,
+    # so it runs before the ffmpeg check / converter download below.
+    if args.print_path:
+        for v in selected:
+            print(v.container_voice)
+        return 0
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        die("ffmpeg/ffprobe required (sudo apt install ffmpeg)")
+    ensure_converter()
+
+    baked = [v for v in selected if bake(v, args.language, args.device, args.skip_if_baked)]
     if not baked:
         die("no references were baked")
 
