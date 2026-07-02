@@ -36,7 +36,10 @@ or passing `"default"` / `"auto"`, keeps whatever ref is currently loaded
 still rejected by TADA: bake a ref offline first (CLI `--make-ref`, or
 convert-tada-ref-to-gguf.py from audio + transcript), then switch to it
 live. On-the-fly ref generation from audio is not wired into the server
-yet.
+yet. As a convenience, `--voice-name NAME` bakes ./voices/<NAME> into a
+ref on the host (delegating to clone_voice.py, which owns the torch
+converter + naming) if it is not already baked, then synthesizes with it
+in one call, no restart.
 
 Refs:
   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -207,6 +211,55 @@ def build_speech_body(
     return body
 
 
+def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
+    """Bake ./voices/<name> into a tada-ref GGUF (if needed) and return the
+    container-side voice path to send as the request `voice`.
+
+    The heavy lifting is delegated to the sibling clone_voice.py (the host
+    "torch converter" path): it pins torch, wraps convert-tada-ref-to-gguf.py,
+    transcodes the reference audio, writes tada-ref-<slug>.gguf into the /models
+    mount, and owns the naming/caching/mount convention. We reuse it rather than
+    reimplement any of that, so tts.py stays dependency-free. The baked ref is
+    then usable per request thanks to TADA's live voice reload (CrispASR #201),
+    with no container restart.
+
+    Requires `uv` (already used to run this script) and, on the first bake for a
+    voice, ffmpeg + the encoder deps/weights clone_voice.py pulls in. Baking is
+    skipped when the gguf already exists unless `force` is set.
+    """
+    cloner = Path(__file__).resolve().parent / "clone_voice.py"
+    if not cloner.exists():
+        raise SystemExit(f"--voice-name needs clone_voice.py next to tts.py, not found at {cloner}")
+
+    def _run(extra: list[str], capture: bool) -> str:
+        cmd = ["uv", "run", "--script", str(cloner), "--name", name, *extra]
+        try:
+            if capture:
+                r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return (r.stdout or "").strip()
+            # Baking: stream clone_voice.py's chatter to OUR stderr so tts.py's
+            # stdout stays reserved for the final output path.
+            subprocess.run(cmd, stdout=sys.stderr, check=True)
+            return ""
+        except FileNotFoundError:
+            raise SystemExit("`uv` not found on PATH (needed to run clone_voice.py)")
+        except subprocess.CalledProcessError as e:
+            detail = (((e.stderr or "") + (e.stdout or "")).strip() if capture else "")
+            raise SystemExit(f"clone_voice.py failed for voice {name!r}: {detail or 'see output above'}")
+
+    # Resolve the canonical /models/*.gguf path first (cheap: no encoder/torch).
+    container_voice = _run(["--print-path"], capture=True).splitlines()[-1].strip()
+    if not container_voice:
+        raise SystemExit(f"could not resolve a voice path for {name!r} via clone_voice.py "
+                         f"(is there a ./voices/{name}.<audio> + {name}.txt pair?)")
+    # Bake only when missing (--skip-if-baked) unless the caller forces a rebuild.
+    bake_extra = [] if language is None else ["--language", language]
+    if not force:
+        bake_extra.append("--skip-if-baked")
+    _run(bake_extra, capture=False)
+    return container_voice
+
+
 def cmd_check(base_url: str) -> int:
     print(f"GET {base_url}/health", file=sys.stderr)
     try:
@@ -286,6 +339,17 @@ def main() -> int:
     voice.add_argument("--voice", default=None,
                        help="Voice name or reference path (TADA reloads it live; "
                             "'default'/'auto'/unset keeps the server's current voice).")
+    voice.add_argument("--voice-name", default=None,
+                       help="Bake ./voices/<NAME> (its <NAME>.txt transcript) into a tada-ref "
+                            "gguf via clone_voice.py if not already baked, then synthesize with "
+                            "it live (no container restart; TADA reloads per request). Mutually "
+                            "exclusive with --voice. With no --text, just bakes and prints the "
+                            "resolved /models/*.gguf path.")
+    voice.add_argument("--voice-language", default=None,
+                       help="Language code for the encoder when baking --voice-name "
+                            "(default: clone_voice.py's own default, fr).")
+    voice.add_argument("--force-bake", action="store_true",
+                       help="Re-bake the --voice-name reference even if its gguf already exists.")
     voice.add_argument("--consent-attestation", default=None,
                        help="Speaker-consent statement, required by the server when "
                             "--voice ends in .wav (request-time cloning). TADA rejects "
@@ -338,8 +402,17 @@ def main() -> int:
     if args.check:
         return cmd_check(base_url)
 
+    if args.voice_name:
+        if args.voice:
+            p.error("--voice and --voice-name are mutually exclusive")
+        args.voice = ensure_baked_voice(args.voice_name, args.voice_language, args.force_bake)
+        if not args.text:
+            # Bake-only: emit the resolved container voice path on stdout.
+            print(args.voice)
+            return 0
+
     if not args.text:
-        p.error("--text is required unless --check is given")
+        p.error("--text is required unless --check or --voice-name is given")
 
     body = build_speech_body(
         text=args.text,
