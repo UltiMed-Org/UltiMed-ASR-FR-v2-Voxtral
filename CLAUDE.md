@@ -18,7 +18,8 @@ Two moving parts:
    - `crispasr-tts` (TTS) on host **:8003** — active backend `tada` (HumeAI TADA 3B
      multilingual, French). No API key.
    Both have `pull_policy: always` and a watchtower `autoupdate` label, so new releases
-   roll in automatically.
+   roll in automatically. A third, optional service `voxtral-tts` (locally built, vLLM,
+   not the CrispASR image) offers an alternative TTS on the same :8003; see "Voxtral TTS".
 2. **Two stdlib-only client scripts at the root**, run via `uv` (PEP 723 inline deps,
    no venv): `tts.py` (→ :8003) and `asr.py` (→ :8002). Support tooling lives in `utils/`.
 
@@ -99,6 +100,33 @@ loaded one. A raw `.wav` is **not** accepted by TADA — bake a ref first.
 CrispASR's C++ port) to decide whether silent/garbled output is a CrispASR port bug vs a
 bad model/reference/transcript. See `utils/README.md`.
 
+## Voxtral TTS (alternative TTS via vLLM, not CrispASR)
+
+`voxtral-tts` is a **separate service** for a different text->audio model,
+`mistralai/Voxtral-4B-TTS-2603`, which is a **vLLM** model, NOT a CrispASR backend. (In
+CrispASR, `voxtral`/`voxtral4b` are ASR, i.e. speech->text; the "multiple voxtral models"
+in `docker-compose.yml` and `models_ignore_backups/` are all ASR.) So this service uses
+none of the `ghcr.io/crispstrobe/crispasr` image or the `CRISPASR_*` env vars. It builds
+its own image from `voxtral/Dockerfile` (base `vllm/vllm-openai` + the `vllm-omni`
+extension, versions pinned to match `voxtral/install.sh`), and `voxtral/entrypoint.sh`
+runs `vllm-omni serve` the same way `install.sh` does by hand.
+
+- **Port clash by design:** it binds host **:8003**, the same port as `crispasr-tts`
+  (TADA), so only one TTS can be up at a time. Do NOT `sudo docker compose up` with no
+  args (that starts everything and the two collide on :8003); start it explicitly:
+  `sudo docker compose up -d --build voxtral-tts`.
+- **Client:** `voxtral/query_test.py` (PEP 723, run via `uv`), a small OpenAI TTS client
+  hitting `:8003/v1/audio/speech`. The model is fixed; the **voice is per request** (20
+  built-in voices: `fr_male`, `fr_female`, `neutral_female`, ...):
+  `uv run voxtral/query_test.py --input "Bonjour." --voice neutral_female --output-path out.wav`
+- **Tuning env vars** (read by `entrypoint.sh`, surfaced commented in the service's
+  `environment:`): `VLLM_GPU_MEM_UTIL` (shrink GPU memory when sharing the card),
+  `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve` flags).
+  Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
+- **Status:** ported faithfully from the hand-run `install.sh` but not yet verified
+  end-to-end in Docker; the `vllm/vllm-openai:v0.18.1` base tag and the GPU-memory fit may
+  need adjustment on the first `--build`.
+
 ## Layout notes
 
 - **`CrispASR_source/`** (gitignored) — a vendored checkout of the CrispASR source, kept as
@@ -110,6 +138,8 @@ bad model/reference/transcript. See `utils/README.md`.
   (auto-downloaded models land here). `voices/` is a symlink to the reference-clip source.
 - Model/audio binaries are gitignored (`**/*.gguf`, `**/*.mp3`, `**/*.wav`, the `models_*`
   dirs, `cache`, `CrispASR_source`, `voices`), so the tracked repo is just compose + the
-  scripts + `utils/`.
-- `voxtral_test/` is a separate, standalone experiment: serving Voxtral TTS via **vLLM**
-  (not CrispASR). `query_test.py` there overlaps with `tts.py`. Leave it unless asked.
+  scripts + `utils/` + `voxtral/`.
+- `voxtral/` holds the Voxtral TTS experiment (serving Voxtral TTS via **vLLM**, not
+  CrispASR; see "Voxtral TTS" above): `Dockerfile` + `entrypoint.sh` back the `voxtral-tts`
+  compose service, `install.sh` is the original hand-run recipe, `query_test.py` is the
+  client (it overlaps with `tts.py`), and `env.reference` is a captured `pip freeze`.
