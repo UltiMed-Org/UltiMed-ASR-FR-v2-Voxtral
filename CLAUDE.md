@@ -15,8 +15,9 @@ Two moving parts:
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
    - `crispasr` (ASR) on host **:8002** — active backend `parakeet` (auto-downloaded).
      Protected by `CRISPASR_API_KEYS`.
-   - `crispasr-tts` (TTS) on host **:8003** — active backend `tada` (HumeAI TADA 3B
-     multilingual, French). No API key.
+   - `crispasr-tts` (TTS) on host **:8003** — active backend switches often as models
+     get tested (the compose comments mark ACTIVE vs ALT; currently
+     `qwen3-tts-1.7b-voicedesign`, local GGUFs, French output). No API key.
    Both have `pull_policy: always` and a watchtower `autoupdate` label, so new releases
    roll in automatically. A third, optional service `voxtral-tts` (locally built, vLLM,
    not the CrispASR image) offers an alternative TTS on the same :8003; see "Voxtral TTS".

@@ -154,8 +154,9 @@ services:
   crispasr-tts:
     container_name: crispasr-tts
     # OpenAI-compatible TTS server (POST /v1/audio/speech). The active backend
-    # is chosen in `environment:` below (currently Chatterbox); VoxCPM2,
-    # Qwen3-TTS variants and TADA are kept as commented alternatives. See:
+    # is chosen in `environment:` below (currently Qwen3-TTS VoiceDesign);
+    # Chatterbox, VoxCPM2, the other Qwen3-TTS variants and TADA are kept as
+    # commented alternatives. See:
     #   https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
     image: ghcr.io/crispstrobe/crispasr:main-cuda
     # To build from source instead of pulling the image, uncomment:
@@ -211,7 +212,7 @@ services:
       # VOXCPM2_NAN_CHECK=1 reads every tensor back to CPU to locate NaNs (slow),
       # VOXCPM2_USE_GRAPH=0 forces the CPU VAE encoder path.
       #
-      # --- ACTIVE backend: Chatterbox (ResembleAI, multilingual v3) --------
+      # --- ALT backend: Chatterbox (ResembleAI, multilingual v3) -----------
       # Two-GGUF flow-matching pipeline: T3 (AR text -> speech tokens) + S3Gen
       # (flow-matching tokens -> 24kHz audio via HiFTGenerator). Not local, so
       # AUTO_DOWNLOAD=1 fetches BOTH GGUFs (~880MB) into /cache on first boot;
@@ -239,11 +240,11 @@ services:
       #   softmax(QK^T)V -- may dodge a CUDA flash-attn bug, at some speed cost).
       # Avoid CRISPASR_CHATTERBOX_FORCE_GPU=1 (puts everything back on GPU).
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md#chatterbox
-      - CRISPASR_BACKEND=chatterbox
-      - CRISPASR_AUTO_DOWNLOAD=1
-      - CRISPASR_LANGUAGE=fr
-      - CRISPASR_EXTRA_ARGS=--verbose
-      - CRISPASR_CHATTERBOX_FULL_CPU=1    # both T3 and S3Gen on CPU -> no CUDA (stable baseline)
+      # - CRISPASR_BACKEND=chatterbox
+      # - CRISPASR_AUTO_DOWNLOAD=1
+      # - CRISPASR_LANGUAGE=fr
+      # - CRISPASR_EXTRA_ARGS=--verbose
+      # - CRISPASR_CHATTERBOX_FULL_CPU=1  # both T3 and S3Gen on CPU -> no CUDA (stable baseline)
       # - CRISPASR_CHATTERBOX_S3GEN_CPU=1  # T3 on GPU, S3Gen on CPU (crashed: T3-GPU is the culprit)
       # - CRISPASR_CHATTERBOX_NAIVE_ATTN=1 # pair with S3GEN_CPU to try salvaging T3-on-GPU
       # Sibling fine-tunes share the runtime (all AUTO_DOWNLOAD=1); swap the backend:
@@ -271,7 +272,7 @@ services:
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
       # =====================================================================
       #
-      # --- ALT backend: Qwen3-TTS-VoiceDesign 1.7B ------------------------
+      # --- ACTIVE backend: Qwen3-TTS-VoiceDesign 1.7B ----------------------
       # VoiceDesign has no preset voice: it MANDATES an instruct, so bare
       # requests (and `tts.py --check`) would 500 without one. The baked
       # default --instruct below is the startup fallback; per request,
@@ -280,11 +281,11 @@ services:
       # English or French and steers timbre/age/pace/accent, NOT the spoken
       # text (that is the -t input). CRISPASR_LANGUAGE=fr sets the codec OUTPUT
       # language (French); change it to synthesize another language.
-      # - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
-      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
-      # - CRISPASR_AUTO_DOWNLOAD=0
-      # - CRISPASR_LANGUAGE=fr
-      # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-tokenizer-12hz.gguf --verbose --instruct "A warm natural adult female voice, calm and clear, at a moderate pace"
+      - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
+      - CRISPASR_AUTO_DOWNLOAD=0
+      - CRISPASR_LANGUAGE=fr
+      - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-tokenizer-12hz.gguf --verbose --instruct "A warm natural adult female voice, calm and clear, at a moderate pace"
       # Optional: pin the AR sampling seed for reproducible takes (default 42):
       # - QWEN3_TTS_SEED=2
       #
