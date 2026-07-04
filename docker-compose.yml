@@ -151,10 +151,10 @@ services:
 
   crispasr-tts:
     container_name: crispasr-tts
-    # OpenAI-compatible TTS server (POST /v1/audio/speech) backed by
-    # Qwen3-TTS VoiceDesign. See:
-    #   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
-    #   https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF
+    # OpenAI-compatible TTS server (POST /v1/audio/speech). The active backend
+    # is chosen in `environment:` below (currently Chatterbox); Qwen3-TTS
+    # variants and TADA are kept as commented, switchable alternatives. See:
+    #   https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
     image: ghcr.io/crispstrobe/crispasr:main-cuda
     # To build from source instead of pulling the image, uncomment:
     # build:
@@ -181,6 +181,36 @@ services:
       #   ffmpeg -i voices/alicia2.ogg -ar 16000 -ac 1 voices/alicia2.wav
       # - ./voices/:/voices:ro
     environment:
+      # --- ACTIVE backend: Chatterbox (ResembleAI, multilingual v3) --------
+      # Two-GGUF flow-matching pipeline: T3 (AR text -> speech tokens) + S3Gen
+      # (flow-matching tokens -> 24kHz audio via HiFTGenerator). Not local, so
+      # AUTO_DOWNLOAD=1 fetches BOTH GGUFs (~880MB) into /cache on first boot;
+      # the S3Gen companion is auto-resolved (no --codec-model). The default
+      # voice is baked into the T3 GGUF, so it speaks out of the box (no
+      # instruct, no reference) and `tts.py --check` passes. -l fr selects the
+      # French language token (wired into the T3 prompt, not the spoken text;
+      # quality is model-dependent, treat it as a wiring check).
+      # GPU split: on this CUDA image the default already runs T3 on GPU and
+      # S3Gen on CPU (the safe default -- S3Gen drifts on GPU), which matches
+      # the "prefer T3" preference, so no knob is needed. Diagnostics if you
+      # want to A/B: CRISPASR_CHATTERBOX_T3_GPU=1, CRISPASR_CHATTERBOX_FULL_CPU=1
+      # (keep S3Gen on CPU; FORCE_GPU garbles output). Optional
+      # CRISPASR_CHATTERBOX_THREADS=<n> caps the S3Gen CPU threads on a shared host.
+      # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md#chatterbox
+      - CRISPASR_BACKEND=chatterbox
+      - CRISPASR_AUTO_DOWNLOAD=1
+      - CRISPASR_LANGUAGE=fr
+      - CRISPASR_EXTRA_ARGS=--verbose
+      # Sibling fine-tunes share the runtime (all AUTO_DOWNLOAD=1); swap the backend:
+      # - CRISPASR_BACKEND=chatterbox-turbo    # distilled English, faster 2-step S3Gen
+      # - CRISPASR_BACKEND=kartoffelbox-turbo  # German turbo (set CRISPASR_LANGUAGE=de)
+      # - CRISPASR_BACKEND=lahgtna-chatterbox  # Arabic (set CRISPASR_LANGUAGE=ar)
+      # Voice cloning (later): bake a voice GGUF from a reference clip with
+      # CrispASR_source/models/bake-chatterbox-voice-from-wav.py, or pass a
+      # 24kHz mono WAV directly (a 16kHz WAV is NOT a real clone -- re-encode:
+      # ffmpeg -i in -ar 24000 -ac 1 ref.wav). Then `tts.py --voice my_voice.gguf`
+      # (per-request cached, switchable without a restart).
+      #
       # =====================================================================
       # Qwen3-TTS family: three DISTINCT 1.7B variants, selected purely by the
       # GGUF that CRISPASR_MODEL points at (the backend name maps them all to
@@ -196,20 +226,20 @@ services:
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
       # =====================================================================
       #
-      # --- ACTIVE backend: Qwen3-TTS-VoiceDesign 1.7B ----------------------
+      # --- ALT backend: Qwen3-TTS-VoiceDesign 1.7B ------------------------
       # VoiceDesign has no preset voice: it MANDATES an instruct, so bare
-      # requests (and `tts.py --check`) would 500 without one. We bake a
-      # default --instruct here as the startup fallback; per request,
+      # requests (and `tts.py --check`) would 500 without one. The baked
+      # default --instruct below is the startup fallback; per request,
       # `tts.py -i "<description>"` overrides it (the server's usual
       # startup-default / per-request-override contract). The description can be
       # English or French and steers timbre/age/pace/accent, NOT the spoken
       # text (that is the -t input). CRISPASR_LANGUAGE=fr sets the codec OUTPUT
       # language (French); change it to synthesize another language.
-      - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
-      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
-      - CRISPASR_AUTO_DOWNLOAD=0
-      - CRISPASR_LANGUAGE=fr
-      - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-tokenizer-12hz.gguf --verbose --instruct "A warm natural adult female voice, calm and clear, at a moderate pace"
+      # - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
+      # - CRISPASR_AUTO_DOWNLOAD=0
+      # - CRISPASR_LANGUAGE=fr
+      # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-tokenizer-12hz.gguf --verbose --instruct "A warm natural adult female voice, calm and clear, at a moderate pace"
       # Optional: pin the AR sampling seed for reproducible takes (default 42):
       # - QWEN3_TTS_SEED=2
       #
