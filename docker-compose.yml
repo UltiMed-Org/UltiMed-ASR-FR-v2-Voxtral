@@ -88,6 +88,12 @@ services:
     build:
       context: ./voxtral
       dockerfile: Dockerfile
+      # Bake a passwd entry for the runtime uid/gid so vLLM's getpass.getuser()
+      # lookup does not crash ("getpwuid(): uid not found"). Keep these in sync
+      # with the `user:` line below.
+      args:
+        APP_UID: ${CRISPASR_UID:-1000}
+        APP_GID: ${CRISPASR_GID:-1000}
     image: voxtral-tts-local:0.18.1
     ports:
       - "8003:8003"
