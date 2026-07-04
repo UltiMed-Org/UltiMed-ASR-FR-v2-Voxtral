@@ -72,6 +72,63 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.scope=autoupdate"
 
+  # Voxtral TTS (text->audio) via vLLM, NOT CrispASR. Model:
+  # mistralai/Voxtral-4B-TTS-2603, served by vllm-omni. This is a separate
+  # runtime from the crispasr image, so it gets its own image built from
+  # voxtral_test/Dockerfile (which pins vllm==0.18.1 + vllm-omni==0.18.0 to
+  # match voxtral_test/install.sh). Client: voxtral_test/query_test.py, e.g.
+  #   uv run voxtral_test/query_test.py --input "Bonjour." --voice neutral_female
+  # It POSTs to :8003/v1/audio/speech, same as any OpenAI TTS client.
+  #
+  # Start it with:  sudo docker compose up -d --build voxtral-tts
+  # NOTE: it binds host :8003, the SAME port as crispasr-tts (TADA). Only one TTS
+  # service can be up at a time; stop crispasr-tts before starting this one.
+  voxtral-tts:
+    container_name: voxtral-tts
+    build:
+      context: ./voxtral_test
+      dockerfile: Dockerfile
+    image: voxtral-tts-local:0.18.1
+    ports:
+      - "8003:8003"
+    # Run as the host user (matches the crispasr services) and keep every cache
+    # under the mounted ./cache so downloaded weights (~9GB) survive restarts and
+    # stay host-visible/host-owned instead of landing in a root-owned /root.
+    user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./cache:/cache
+    environment:
+      - HOME=/cache
+      - HF_HOME=/cache/huggingface
+      - XDG_CACHE_HOME=/cache
+      # If the model repo is gated on Hugging Face, pass a token:
+      # - HF_TOKEN=TODO
+      # Shrink GPU memory use when sharing the card with crispasr/crispasr-tts
+      # (install.sh used 0.35). Leave unset to keep the packaged default (0.8):
+      # - VLLM_GPU_MEM_UTIL=0.35
+      # Extra vllm-omni serve flags, space-separated (opt-in; do not quote-wrap):
+      # - VLLM_EXTRA_ARGS=--max-model-len 4096
+    # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
+    shm_size: "8gb"
+    healthcheck:
+      # vLLM exposes /health; use python3 (curl may be absent in the vllm image).
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health')\" >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot downloads ~9GB of weights, so allow a long warmup.
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${CRISPASR_GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+
   crispasr-tts:
     container_name: crispasr-tts
     # OpenAI-compatible TTS server (POST /v1/audio/speech) backed by
