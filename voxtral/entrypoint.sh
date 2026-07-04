@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mirrors the serve step of voxtral_test/install.sh, but for the container:
+# Mirrors the serve step of voxtral/install.sh, but for the container:
 # copies the packaged voxtral_tts stage config, optionally tunes GPU memory, then
 # serves mistralai/Voxtral-4B-TTS-2603 on 0.0.0.0 so the host can reach it.
 set -euo pipefail

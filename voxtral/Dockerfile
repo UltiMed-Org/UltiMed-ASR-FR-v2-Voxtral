@@ -2,7 +2,7 @@
 #
 # This is NOT CrispASR: mistralai/Voxtral-4B-TTS-2603 is a vLLM model, so it runs
 # on the official vLLM image plus the vllm-omni extension. Versions are pinned to
-# match voxtral_test/install.sh (the recipe that was validated by hand).
+# match voxtral/install.sh (the recipe that was validated by hand).
 #
 # NOTE: the base tag must match the pinned vllm version below. If Docker Hub does
 # not have vllm/vllm-openai:v0.18.1, bump both to the nearest published tag.
