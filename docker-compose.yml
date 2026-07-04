@@ -223,18 +223,27 @@ services:
       # s3gen_use_gpu=true). S3Gen on CUDA is the fragile half -- its UNet
       # mul_mat accumulates in F16 (wmma), and the HiFTGenerator FFT hit a
       # heap overflow on P100 -- which is the "illegal memory access" you saw.
-      # FIX: CRISPASR_CHATTERBOX_S3GEN_CPU=1 keeps T3 on GPU (fast, the "better"
-      # half) and moves S3Gen to CPU (stable). That is the recommended setting
-      # here and matches the "prefer T3" preference; it is set below.
-      # Bigger hammer if needed: CRISPASR_CHATTERBOX_FULL_CPU=1 (both on CPU).
-      # Avoid CRISPASR_CHATTERBOX_FORCE_GPU=1 (forces S3Gen back onto the GPU).
-      # Optional CRISPASR_CHATTERBOX_THREADS=<n> caps the S3Gen CPU threads.
+      # UPDATE: S3GEN_CPU=1 alone did NOT fix the crash, so it is not the S3Gen
+      # GPU path. With S3Gen on CPU the only remaining GPU compute is T3, so the
+      # illegal-memory-access is in the T3-on-GPU path (its flash-attn / bucketed
+      # KV step-graph on CUDA -- same class as the Vulkan T3 segfault #170). There
+      # is no knob to move just the T3 buckets off GPU, so the stable baseline is
+      # FULL CPU (set below): both halves on CPU, no CUDA at all. This works but
+      # is slower (T3 AR decode is the slow stage; mind the cpus: 2 limit below --
+      # raise it, or set CRISPASR_CHATTERBOX_THREADS, if it drags).
+      # To retry T3-on-GPU (the "prefer T3" setup) once we know the failing op:
+      #   drop FULL_CPU, use CRISPASR_CHATTERBOX_S3GEN_CPU=1, and optionally
+      #   CRISPASR_CHATTERBOX_NAIVE_ATTN=1 (swaps flash_attn_ext for plain
+      #   softmax(QK^T)V -- may dodge a CUDA flash-attn bug, at some speed cost).
+      # Avoid CRISPASR_CHATTERBOX_FORCE_GPU=1 (puts everything back on GPU).
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md#chatterbox
       - CRISPASR_BACKEND=chatterbox
       - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_LANGUAGE=fr
       - CRISPASR_EXTRA_ARGS=--verbose
-      - CRISPASR_CHATTERBOX_S3GEN_CPU=1   # T3 on GPU, S3Gen on CPU -> fixes the CUDA crash
+      - CRISPASR_CHATTERBOX_FULL_CPU=1    # both T3 and S3Gen on CPU -> no CUDA (stable baseline)
+      # - CRISPASR_CHATTERBOX_S3GEN_CPU=1  # T3 on GPU, S3Gen on CPU (crashed: T3-GPU is the culprit)
+      # - CRISPASR_CHATTERBOX_NAIVE_ATTN=1 # pair with S3GEN_CPU to try salvaging T3-on-GPU
       # Sibling fine-tunes share the runtime (all AUTO_DOWNLOAD=1); swap the backend:
       # - CRISPASR_BACKEND=chatterbox-turbo    # distilled English, faster 2-step S3Gen
       # - CRISPASR_BACKEND=kartoffelbox-turbo  # German turbo (set CRISPASR_LANGUAGE=de)
