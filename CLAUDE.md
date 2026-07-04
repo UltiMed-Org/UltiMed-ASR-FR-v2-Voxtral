@@ -127,10 +127,22 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   `SpeechRequest(input, voice|ref_audio)`. So `query_test.py` exposes `--voice`, `--speed`
   and `--response-format` only. Sampling knobs (temperature/seed/top_p) are NOT per
   request either; they live in the startup YAML (see below).
-- **Tuning env vars** (read by `entrypoint.sh`, surfaced commented in the service's
-  `environment:`): `VLLM_GPU_MEM_UTIL` (shrink GPU memory when sharing the card),
-  `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve` flags).
-  Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
+- **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
+  service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
+  **two-stage** pipeline: `audio_generation` (stage 0, the AR LLM, the ~0.8 GPU-memory
+  hog, greedy at temp 0.0) then `audio_tokenizer` (stage 1, the acoustic decoder). At
+  boot `entrypoint.sh` copies the packaged `voxtral_tts.yaml` and patches it per stage
+  with pyyaml:
+  - `VLLM_GPU_MEM_UTIL` -> stage-0 `gpu_memory_utilization` **only** (stage 1's small 0.1
+    is left alone; the earlier blunt global `sed` wrongly inflated it). Lower to share the
+    card with crispasr.
+  - `VOXTRAL_ACOUSTIC_TEMP` -> stage-1 sampling temperature. Entrypoint default **0.7**
+    (lowered from upstream 0.9 for steadier, less artifacty audio; raise toward 0.9 for
+    more expressive/varied output). This is the main audio-quality lever.
+  - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
+    take). Not settable per request.
+  - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve`
+    flags). Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** ported faithfully from the hand-run `install.sh` but not yet verified
   end-to-end in Docker; the `vllm/vllm-openai:v0.18.1` base tag and the GPU-memory fit may
   need adjustment on the first `--build`.
