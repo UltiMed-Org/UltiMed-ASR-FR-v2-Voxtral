@@ -29,8 +29,8 @@ knobs the server exposes. So:
   * Reference *also* produces silence
         -> the model / reference clip / transcript is the problem, not CrispASR.
 
-It is a deliberate sibling to ../clone_voice.py: that script bakes a
-`tada-ref-*.gguf` for the server via the encoder only; this one additionally
+It is a deliberate sibling to clone_voice.py (next to it in utils/): that script
+bakes a `tada-ref-*.gguf` for the server via the encoder only; this one additionally
 runs `TadaForCausalLM.generate(...)` (the part CrispASR re-implements) so we can
 A/B the actual synthesis. The heavy torch/torchaudio/torchvision pins are copied
 verbatim from clone_voice.py, where they were proven to avoid the
@@ -53,17 +53,17 @@ generation it reports peak / RMS / dBFS and an explicit silence verdict so the
 
 Usage
 -----
-    ./tada_test/generate.py \
+    ./utils/tada_reference_engine.py \
         --ref-audio fr.wav \
         --ref-text "Le texte exact prononce dans fr.wav." \
         --text "Bonjour, ceci est un test de la voix clonee." \
         --language fr \
-        --output tada_test/out.wav
+        --output tada_ref_out.wav
 
 Defaults mirror upstream `InferenceOptions` (the same values CrispASR's server
-uses), EXCEPT `--num-acoustic-candidates`, which defaults to the upstream value
-of 1 here; the server runs 4 (env `TADA_NUM_CANDIDATES`). Pass
-`--num-acoustic-candidates 4` to match the container exactly.
+uses), including `--num-acoustic-candidates`, which defaults to 1 both here and
+on the server now (env `TADA_NUM_CANDIDATES`, default 1 since the drop of the
+old =4 override). Raise it on both sides to A/B best-of-N.
 
 Requires: `uv` on PATH. TADA is built on the gated Llama 3.2 tokenizer; either
 accept the license + `huggingface-cli login`, or rely on the unsloth-mirror
@@ -84,8 +84,8 @@ def _install_gated_tokenizer_fallback() -> None:
 
     TADA's encoder/model load the Llama-3.2 tokenizer, which is gated on the Hub.
     Without HF auth that raises a 401 / "gated" error. This mirrors the same
-    fallback in ../convert-tada-ref-to-gguf.py (kept as a small local copy
-    because that file is a standalone script, not an importable module): on a
+    fallback in convert-tada-ref-to-gguf.py (next to it in utils/, kept as a small
+    local copy because that file is a standalone script, not an importable module): on a
     gated failure, retry against `unsloth/Llama-3.2-1B`, whose tokenizer is
     identical across the 1B/3B family. NOTE: this duplicates ~10 lines from the
     converter on purpose; if you touch one, touch the other.
@@ -203,7 +203,7 @@ def _report_audio(wav) -> bool:
               help="Load a previously saved prompt .pt and skip the encoder entirely.")
 # --- generation ---
 @click.option("--text", required=True, help="Target text to synthesize in the cloned voice.")
-@click.option("--output", "-o", default="tada_test/out.wav", show_default=True,
+@click.option("--output", "-o", default="tada_ref_out.wav", show_default=True,
               help="Output WAV path (24 kHz mono).")
 @click.option("--num-transition-steps", type=int, default=5, show_default=True,
               help="Prompt->generation transition frames trimmed from the prompt tail.")
@@ -232,7 +232,8 @@ def _report_audio(wav) -> bool:
               default="logsnr", show_default=True)
 @click.option("--num-acoustic-candidates", type=int, default=1, show_default=True,
               help="Per-frame best-of-N duration/acoustic candidates. Upstream default 1; "
-                   "the crispasr-tts server runs 4 (TADA_NUM_CANDIDATES). Use 4 to match it.")
+                   "the crispasr-tts server also defaults to 1 now (TADA_NUM_CANDIDATES). "
+                   "Raise it on both sides to A/B best-of-N.")
 @click.option("--scorer", type=click.Choice(["likelihood", "spkr_verification", "duration_median"]),
               default="likelihood", show_default=True,
               help="Candidate ranking when --num-acoustic-candidates > 1.")
