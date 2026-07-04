@@ -128,6 +128,7 @@ services:
       # slower). Set 0 to let the AR stage capture CUDA graphs (faster generation,
       # more VRAM + a first-boot capture delay):
       # - VOXTRAL_ENFORCE_EAGER=1
+      - VOXTRAL_ENFORCE_EAGER=0
       # Extra vllm-omni serve flags, space-separated (opt-in; do not quote-wrap):
       # - VLLM_EXTRA_ARGS=--max-model-len 4096
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
