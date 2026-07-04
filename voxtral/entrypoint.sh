@@ -64,12 +64,22 @@ sys.stderr.write(
 )
 PY
 
-# --enforce-eager matches install.sh (skips CUDA-graph capture; lower VRAM, a bit
-# slower). VLLM_EXTRA_ARGS is an opt-in escape hatch for further flags.
+# Eager mode (default ON, matching install.sh): --enforce-eager skips CUDA-graph
+# capture, so it uses less VRAM and starts faster but is a bit slower in steady
+# state. Set VOXTRAL_ENFORCE_EAGER=0 to drop the flag and let the per-stage YAML
+# decide (stage 0 audio_generation captures graphs -> faster generation, at the
+# cost of more VRAM + a first-boot capture delay; stage 1 stays eager).
+EAGER_FLAG="--enforce-eager"
+case "${VOXTRAL_ENFORCE_EAGER:-1}" in
+  0 | false | False | no | off) EAGER_FLAG="" ;;
+esac
+
+# VLLM_EXTRA_ARGS is an opt-in escape hatch for further flags. Both it and
+# EAGER_FLAG are intentionally unquoted so an empty value expands to nothing.
 exec vllm-omni serve "$MODEL" \
   --omni \
   --stage-configs-path "$TUNED_YAML" \
   --host 0.0.0.0 \
   --port "$PORT" \
-  --enforce-eager \
+  ${EAGER_FLAG} \
   ${VLLM_EXTRA_ARGS:-}

@@ -141,6 +141,10 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
     more expressive/varied output). This is the main audio-quality lever.
   - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
     take). Not settable per request.
+  - `VOXTRAL_ENFORCE_EAGER` (serve-flag toggle, not a YAML patch) -> default **1** = pass
+    `--enforce-eager` (less VRAM, faster start, a bit slower steady-state). Set **0** to
+    drop the flag so the per-stage YAML governs: stage 0 captures CUDA graphs (faster
+    generation) at the cost of more VRAM plus a first-boot capture delay.
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve`
     flags). Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** ported faithfully from the hand-run `install.sh` but not yet verified
