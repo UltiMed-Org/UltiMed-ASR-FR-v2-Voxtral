@@ -119,6 +119,14 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   hitting `:8003/v1/audio/speech`. The model is fixed; the **voice is per request** (20
   built-in voices: `fr_male`, `fr_female`, `neutral_female`, ...):
   `uv run voxtral/query_test.py --input "Bonjour." --voice neutral_female --output-path out.wav`
+- **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
+  cloning), `response_format`, and `speed` (post-processing playback rate, non-streaming
+  only). It **ignores** `instructions`, `language`, `task_type` and `max_new_tokens`:
+  those only take effect on the Qwen3-TTS / Fish paths in vllm-omni's
+  `serving_speech.py` (`_build_tts_params`), whereas Voxtral builds its prompt from just
+  `SpeechRequest(input, voice|ref_audio)`. So `query_test.py` exposes `--voice`, `--speed`
+  and `--response-format` only. Sampling knobs (temperature/seed/top_p) are NOT per
+  request either; they live in the startup YAML (see below).
 - **Tuning env vars** (read by `entrypoint.sh`, surfaced commented in the service's
   `environment:`): `VLLM_GPU_MEM_UTIL` (shrink GPU memory when sharing the card),
   `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve` flags).

@@ -39,6 +39,10 @@ AVAILABLE_VOICES = [
 ]
 
 
+# Per-request response_format containers accepted by /v1/audio/speech.
+RESPONSE_FORMATS = ["wav", "flac", "mp3", "aac", "opus", "pcm"]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="Paris is a beautiful city!")
@@ -48,23 +52,52 @@ def main():
         choices=AVAILABLE_VOICES,
         help="Built-in voice embedding name. Choices: " + ", ".join(AVAILABLE_VOICES),
     )
+    # NOTE on Voxtral vs the other vllm-omni TTS backends: Voxtral builds its prompt
+    # from just (input, voice) or (input, ref_audio). The extra OpenAI/vllm-omni
+    # request fields "instructions", "language" and "max_new_tokens" are only honored
+    # by the Qwen3-TTS / Fish paths (serving_speech.py _build_tts_params); Voxtral
+    # silently ignores them, so no flags are exposed for them here. What Voxtral does
+    # honor per request: voice, response_format and speed (speed is post-processing).
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=None,
+        help="Playback speed 0.25-4.0 (post-processing, 1.0 = unchanged). Only sent if set.",
+    )
+    parser.add_argument(
+        "--response-format",
+        default="wav",
+        choices=RESPONSE_FORMATS,
+        help="Audio container the server returns.",
+    )
     parser.add_argument("--output-path", default="output.wav")
     args = parser.parse_args()
 
     payload = {
         "input": args.input,
         "model": "mistralai/Voxtral-4B-TTS-2603",
-        "response_format": "wav",
+        "response_format": args.response_format,
         "voice": args.voice,
     }
+    # Opt-in: only send speed when the user asked for it, so the server keeps its
+    # own default otherwise.
+    if args.speed is not None:
+        payload["speed"] = args.speed
 
     response = httpx.post(f"{BASE_URL}/audio/speech", json=payload, timeout=120.0)
     response.raise_for_status()
 
-    audio_array, sr = sf.read(io.BytesIO(response.content), dtype="float32")
-    print(f"Got audio: {len(audio_array)} samples at {sr} Hz")
-
-    sf.write(args.output_path, audio_array, sr, format="WAV")
+    if args.response_format == "wav":
+        # Decode to report what we got, then re-write as WAV.
+        audio_array, sr = sf.read(io.BytesIO(response.content), dtype="float32")
+        print(f"Got audio: {len(audio_array)} samples at {sr} Hz")
+        sf.write(args.output_path, audio_array, sr, format="WAV")
+    else:
+        # Non-WAV containers (mp3/opus/...) may not be decodable by soundfile, so
+        # write the server's bytes straight through.
+        with open(args.output_path, "wb") as f:
+            f.write(response.content)
+        print(f"Wrote {len(response.content)} bytes ({args.response_format})")
     print(f"Saved to {args.output_path}")
 
 
