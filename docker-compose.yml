@@ -166,63 +166,92 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      # --- Qwen3-TTS (previous): mounted a local model dir at /models ---
-      # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-voicedesign/:/models
-      # - ./models_tts_ignore_backups/qwen3-tts-12hz-1.7b-customvoice/:/models
-      # --- TADA: AUTO_DOWNLOAD=1 fetches model+codec (+ the default English
-      #     tada-ref.gguf) into /cache. We ALSO mount /models to supply a specific
-      #     voice reference GGUF, pinned via --voice in CRISPASR_EXTRA_ARGS below;
-      #     swap in your own baked ref here. (With "-l fr" and no --voice the runtime
-      #     now auto-downloads tada-ref-fr.gguf itself, so the explicit --voice is
-      #     about choosing a voice, not a workaround for a missing French ref.) ---
+      # The whole TTS-models dir is mounted at /models, so every local backend
+      # (each Qwen3-TTS subdir AND the TADA baked refs) is reachable without
+      # changing this line: only the CRISPASR_MODEL path in `environment:`
+      # picks which one loads. /cache holds anything AUTO_DOWNLOAD=1 fetches
+      # (the TADA weights, or the Qwen3-TTS-Base model for cloning).
       - ./models_tts_ignore_backups/:/models
       - ./cache:/cache
+      # For Qwen3-TTS-Base voice CLONING only (see the commented Base block in
+      # environment: below): mount the reference-clip dir so <name>.wav +
+      # <name>.txt sidecars are reachable at /voices, then set --voice-dir
+      # /voices. NOTE: Qwen cloning needs a .wav (the .ogg refs here are NOT
+      # accepted), so transcode first, e.g.
+      #   ffmpeg -i voices/alicia2.ogg -ar 16000 -ac 1 voices/alicia2.wav
+      # - ./voices/:/voices:ro
     environment:
-      # --- Qwen3-TTS (previous) ---
-      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
-      # - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
-      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
-      # - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
-      # - CRISPASR_AUTO_DOWNLOAD=0
-      # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-tokenizer-12hz.gguf --verbose
-      # - QWEN3_TTS_SEED=2
-      # --- Active backend: TADA 3B multilingual (French) ---
-      # Backend MUST be "tada": that is the canonical -m auto registry key for the
-      # 3B multilingual model (HumeAI/tada-3b-ml, supports ar/ch/de/es/fr/it/ja/pl/pt).
-      # The docs also mention "tada-3b-ml", but that string is NOT in the auto-download
-      # registry (src/crispasr_model_registry.cpp), so "-m auto --backend tada-3b-ml"
-      # fails with "failed to resolve model 'auto' for backend 'tada-3b-ml'".
-      # ("tada-1b" / "tada-tts-1b" are the English-only variant.)
-      # AUTO_DOWNLOAD=1 -> entrypoint passes "-m auto --auto-download", fetching
-      # tada-tts-3b-ml-f16.gguf (~8GB) + tada-codec-f16.gguf (~1GB) + the default
-      # English tada-ref.gguf into /cache. No --codec-model needed (auto-discovered,
-      # unlike qwen). For TADA, CRISPASR_LANGUAGE ("-l fr") ONLY selects the voice
-      # reference (it does not otherwise condition synthesis): with no --voice it
-      # makes the runtime auto-download and use tada-ref-fr.gguf. Because we DO pass
-      # an explicit --voice below, that selection is overridden and -l fr is inert
-      # here (the French comes from the pinned reference itself); it only takes
-      # effect if you drop --voice.
+      # =====================================================================
+      # Qwen3-TTS family: three DISTINCT 1.7B variants, selected purely by the
+      # GGUF that CRISPASR_MODEL points at (the backend name maps them all to
+      # the same qwen3-tts adapter; the variant is read from the model's
+      # `qwen3tts.tts_model_type` metadata). All three talker GGUFs + the shared
+      # 12Hz tokenizer are already local, so AUTO_DOWNLOAD=0 (no fetch):
+      #   - VoiceDesign : describe a voice in prose (--instruct / API `instructions`);
+      #                   no reference audio, no preset speaker. -> tts.py -i "..."
+      #   - CustomVoice : 9 baked premium timbres, picked by NAME (--voice <name>),
+      #                   with optional style steering via --instruct. -> tts.py --voice <name>
+      #   - Base        : true voice CLONING from your own audio (WAV + transcript).
+      #                   NOT downloaded here; see the Base block far below.
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
-      - CRISPASR_BACKEND=tada
-      - CRISPASR_AUTO_DOWNLOAD=1
+      # =====================================================================
+      #
+      # --- ACTIVE backend: Qwen3-TTS-VoiceDesign 1.7B ----------------------
+      # VoiceDesign has no preset voice: it MANDATES an instruct, so bare
+      # requests (and `tts.py --check`) would 500 without one. We bake a
+      # default --instruct here as the startup fallback; per request,
+      # `tts.py -i "<description>"` overrides it (the server's usual
+      # startup-default / per-request-override contract). The description can be
+      # English or French and steers timbre/age/pace/accent, NOT the spoken
+      # text (that is the -t input). CRISPASR_LANGUAGE=fr sets the codec OUTPUT
+      # language (French); change it to synthesize another language.
+      - CRISPASR_BACKEND=qwen3-tts-1.7b-voicedesign
+      - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf
+      - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_LANGUAGE=fr
-      # --voice sets the STARTUP-DEFAULT reference (acoustic prompt), pinning a
-      # specific voice and overriding the -l-based selection above. (Drop it and
-      # "-l fr" + auto-download would fetch and use the generic tada-ref-fr.gguf.)
-      # As of CrispASR #201 the voice is also switchable per request: a client can
-      # POST "voice":"tada-ref-de.gguf" (path or cache/registry name) and TADA reloads
-      # it live, so this flag only decides what bare requests (no voice field) get.
-      # Point it at a cloned ref (e.g. /models/tada-ref-custom.gguf) to make your own
-      # voice the default.
-      - CRISPASR_EXTRA_ARGS=--verbose --voice /models/tada-ref-alicia.gguf
-      # num_acoustic_candidates: leave UNSET so the server uses its default of 1
-      # (upstream InferenceOptions). Best-of-N (>1) is opt-in and on the CPU/Q4_K
-      # path the ranker often picks a WORSE flow-matching draw, mangling words
-      # ("four hours" -> "and forth"). Uncomment to A/B a higher count:
+      - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-voicedesign/qwen3-tts-tokenizer-12hz.gguf --verbose --instruct "A warm natural adult female voice, calm and clear, at a moderate pace"
+      # Optional: pin the AR sampling seed for reproducible takes (default 42):
+      # - QWEN3_TTS_SEED=2
+      #
+      # --- ALT backend: Qwen3-TTS-CustomVoice 1.7B (9 preset timbres) ------
+      # Pick a speaker by NAME per request: `tts.py --voice vivian`. The 9 baked
+      # names are: aiden, dylan, eric, ono_anna, ryan, serena, sohee, uncle_fu,
+      # vivian (dylan/eric carry Chinese-dialect overrides). Passing a .wav/.gguf
+      # here does NOT clone; it warns and falls back to the first speaker (use the
+      # Base variant to clone). --instruct is optional style control on 1.7B.
+      # - CRISPASR_BACKEND=qwen3-tts-1.7b-customvoice
+      # - CRISPASR_MODEL=/models/qwen3-tts-12hz-1.7b-customvoice/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
+      # - CRISPASR_AUTO_DOWNLOAD=0
+      # - CRISPASR_LANGUAGE=fr
+      # - CRISPASR_EXTRA_ARGS=--codec-model /models/qwen3-tts-12hz-1.7b-customvoice/qwen3-tts-tokenizer-12hz.gguf --verbose
+      #
+      # --- ALT backend: Qwen3-TTS-Base 1.7B (voice CLONING) ---------------
+      # This is the ONLY Qwen variant that clones your own voice. It is not
+      # local, so AUTO_DOWNLOAD=1 fetches the base talker (~1.9GB) + tokenizer
+      # into /cache. Cloning contract: reference audio must be a .wav (the .ogg
+      # refs are rejected) plus its transcript. Easiest per-request path: mount
+      # ./voices at /voices (see volumes above) and set --voice-dir /voices;
+      # then a bare `tts.py --voice alicia2` resolves /voices/alicia2.wav and
+      # auto-reads /voices/alicia2.txt as the ref-text (no consent field needed).
+      # Prep the wav once:  ffmpeg -i voices/alicia2.ogg -ar 16000 -ac 1 voices/alicia2.wav
+      # - CRISPASR_BACKEND=qwen3-tts-1.7b-base
+      # - CRISPASR_AUTO_DOWNLOAD=1
+      # - CRISPASR_LANGUAGE=fr
+      # - CRISPASR_EXTRA_ARGS=--verbose --voice-dir /voices
+      #
+      # --- ALT backend: TADA 3B multilingual (French) ---------------------
+      # The previous active TTS. Backend MUST be "tada" (the -m auto registry key
+      # for HumeAI/tada-3b-ml; "tada-3b-ml" is NOT a registry key). AUTO_DOWNLOAD=1
+      # fetches tada-tts-3b-ml-f16.gguf (~8GB) + tada-codec-f16.gguf (~1GB) + the
+      # default English tada-ref.gguf into /cache (codec auto-discovered, no
+      # --codec-model). --voice pins the startup-default reference; it is also
+      # switchable per request (#201). For TADA, -l fr only selects the voice ref
+      # when no --voice is given. See the TADA_* acoustic knobs in CLAUDE.md.
+      # - CRISPASR_BACKEND=tada
+      # - CRISPASR_AUTO_DOWNLOAD=1
+      # - CRISPASR_LANGUAGE=fr
+      # - CRISPASR_EXTRA_ARGS=--verbose --voice /models/tada-ref-alicia.gguf
       # - TADA_NUM_CANDIDATES=8
-      # Acoustic flow-matching startup defaults (CrispASR #197); each is also
-      # per-request via the API (num_steps / cfg_scale / noise_temp). num_steps is
-      # the main quick-vs-accurate lever: more ODE steps = crisper but slower.
       # - TADA_NUM_FM_STEPS=10
       # - TADA_ACOUSTIC_CFG=1.6
       # - TADA_NOISE_TEMP=0.9
