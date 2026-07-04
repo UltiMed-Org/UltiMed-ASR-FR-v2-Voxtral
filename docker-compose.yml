@@ -154,9 +154,9 @@ services:
   crispasr-tts:
     container_name: crispasr-tts
     # OpenAI-compatible TTS server (POST /v1/audio/speech). The active backend
-    # is chosen in `environment:` below (currently Qwen3-TTS VoiceDesign);
-    # Chatterbox, VoxCPM2, the other Qwen3-TTS variants and TADA are kept as
-    # commented alternatives. See:
+    # is chosen in `environment:` below (currently Qwen3-TTS VoiceDesign); the
+    # other Qwen3-TTS variants and TADA are kept as commented alternatives
+    # (retired Chatterbox / VoxCPM2 blocks live in git history). See:
     #   https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md
     image: ghcr.io/crispstrobe/crispasr:main-cuda
     # To build from source instead of pulling the image, uncomment:
@@ -184,79 +184,6 @@ services:
       #   ffmpeg -i voices/alicia2.ogg -ar 16000 -ac 1 voices/alicia2.wav
       # - ./voices/:/voices:ro
     environment:
-      # --- ALT backend: VoxCPM2 (openbmb/VoxCPM2, diffusion AR TTS) --------
-      # Qwen2-2B backbone + flow matching + BigVGAN @ 48kHz (decimated to 24kHz),
-      # 30 languages, tokenizer-free. Single GGUF, so AUTO_DOWNLOAD=1 fetches
-      # voxcpm2-q4_k.gguf (~1.6GB) into /cache on first boot (no companion / no
-      # --codec-model). Synthesis is ZERO-SHOT by default (no reference needed,
-      # so `tts.py --check` and bare `-t` work); voice cloning is opt-in per
-      # request with `tts.py --voice /path/ref.wav`.
-      # Runs full GPU by default (the earlier "illegal memory access" was on
-      # Chatterbox, not here, so no CPU-forcing knobs are set). If VoxCPM2
-      # DOES crash on CUDA, uncomment the two #164 workarounds below:
-      #  1) VOXCPM2_NO_BUCKET=1 -- ggml_set_rows corrupts the KV cache on the
-      #     2nd AR step via the bucketed TSLM path. Already AUTO-disabled on
-      #     CUDA in current `main`; this forces it off on every backend as a
-      #     belt-and-suspenders in case backend-name detection misses.
-      #  2) VOXCPM2_FA_CPU=1 -- flash_attn_ext F16 accumulator OVERFLOWS on
-      #     mu-conditioned attention from the 2nd AR step (seen on P100); runs
-      #     LocDiT/LocEnc on CPU to dodge it. NOT auto-handled, so this is the
-      #     one to try first if you hit an illegal-memory-access here.
-      # - CRISPASR_BACKEND=voxcpm2-tts
-      # - CRISPASR_AUTO_DOWNLOAD=1
-      # - CRISPASR_LANGUAGE=fr
-      # - CRISPASR_EXTRA_ARGS=--verbose
-      # - VOXCPM2_FA_CPU=1
-      # - VOXCPM2_NO_BUCKET=1
-      # Diagnostics: VOXCPM2_BUCKET_CUDA=1 re-enables buckets on CUDA (bench),
-      # VOXCPM2_NAN_CHECK=1 reads every tensor back to CPU to locate NaNs (slow),
-      # VOXCPM2_USE_GRAPH=0 forces the CPU VAE encoder path.
-      #
-      # --- ALT backend: Chatterbox (ResembleAI, multilingual v3) -----------
-      # Two-GGUF flow-matching pipeline: T3 (AR text -> speech tokens) + S3Gen
-      # (flow-matching tokens -> 24kHz audio via HiFTGenerator). Not local, so
-      # AUTO_DOWNLOAD=1 fetches BOTH GGUFs (~880MB) into /cache on first boot;
-      # the S3Gen companion is auto-resolved (no --codec-model). The default
-      # voice is baked into the T3 GGUF, so it speaks out of the box (no
-      # instruct, no reference) and `tts.py --check` passes. -l fr selects the
-      # French language token (wired into the T3 prompt, not the spoken text;
-      # quality is model-dependent, treat it as a wiring check).
-      # GPU split (CORRECTION): on this CUDA image the current default runs
-      # BOTH T3 and S3Gen on GPU (chatterbox.cpp: t3_gpu_default=true,
-      # s3gen_use_gpu=true). S3Gen on CUDA is the fragile half -- its UNet
-      # mul_mat accumulates in F16 (wmma), and the HiFTGenerator FFT hit a
-      # heap overflow on P100 -- which is the "illegal memory access" you saw.
-      # UPDATE: S3GEN_CPU=1 alone did NOT fix the crash, so it is not the S3Gen
-      # GPU path. With S3Gen on CPU the only remaining GPU compute is T3, so the
-      # illegal-memory-access is in the T3-on-GPU path (its flash-attn / bucketed
-      # KV step-graph on CUDA -- same class as the Vulkan T3 segfault #170). There
-      # is no knob to move just the T3 buckets off GPU, so the stable baseline is
-      # FULL CPU (set below): both halves on CPU, no CUDA at all. This works but
-      # is slower (T3 AR decode is the slow stage; mind the cpus: 2 limit below --
-      # raise it, or set CRISPASR_CHATTERBOX_THREADS, if it drags).
-      # To retry T3-on-GPU (the "prefer T3" setup) once we know the failing op:
-      #   drop FULL_CPU, use CRISPASR_CHATTERBOX_S3GEN_CPU=1, and optionally
-      #   CRISPASR_CHATTERBOX_NAIVE_ATTN=1 (swaps flash_attn_ext for plain
-      #   softmax(QK^T)V -- may dodge a CUDA flash-attn bug, at some speed cost).
-      # Avoid CRISPASR_CHATTERBOX_FORCE_GPU=1 (puts everything back on GPU).
-      # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md#chatterbox
-      # - CRISPASR_BACKEND=chatterbox
-      # - CRISPASR_AUTO_DOWNLOAD=1
-      # - CRISPASR_LANGUAGE=fr
-      # - CRISPASR_EXTRA_ARGS=--verbose
-      # - CRISPASR_CHATTERBOX_FULL_CPU=1  # both T3 and S3Gen on CPU -> no CUDA (stable baseline)
-      # - CRISPASR_CHATTERBOX_S3GEN_CPU=1  # T3 on GPU, S3Gen on CPU (crashed: T3-GPU is the culprit)
-      # - CRISPASR_CHATTERBOX_NAIVE_ATTN=1 # pair with S3GEN_CPU to try salvaging T3-on-GPU
-      # Sibling fine-tunes share the runtime (all AUTO_DOWNLOAD=1); swap the backend:
-      # - CRISPASR_BACKEND=chatterbox-turbo    # distilled English, faster 2-step S3Gen
-      # - CRISPASR_BACKEND=kartoffelbox-turbo  # German turbo (set CRISPASR_LANGUAGE=de)
-      # - CRISPASR_BACKEND=lahgtna-chatterbox  # Arabic (set CRISPASR_LANGUAGE=ar)
-      # Voice cloning (later): bake a voice GGUF from a reference clip with
-      # CrispASR_source/models/bake-chatterbox-voice-from-wav.py, or pass a
-      # 24kHz mono WAV directly (a 16kHz WAV is NOT a real clone -- re-encode:
-      # ffmpeg -i in -ar 24000 -ac 1 ref.wav). Then `tts.py --voice my_voice.gguf`
-      # (per-request cached, switchable without a restart).
-      #
       # =====================================================================
       # Qwen3-TTS family: three DISTINCT 1.7B variants, selected purely by the
       # GGUF that CRISPASR_MODEL points at (the backend name maps them all to
