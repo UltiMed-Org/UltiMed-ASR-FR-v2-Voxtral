@@ -8,6 +8,8 @@
 # ///
 import argparse
 import io
+import time
+
 import httpx
 import soundfile as sf
 
@@ -84,7 +86,13 @@ def main():
     if args.speed is not None:
         payload["speed"] = args.speed
 
+    # Backend round-trip time: request sent until the full response body is
+    # read (httpx.post is non-streaming, so the body is fully read here). This
+    # is synthesis time only, not decoding or file writing below. Printed
+    # before raise_for_status so a slow HTTP error still reports its timing.
+    t0 = time.perf_counter()
     response = httpx.post(f"{BASE_URL}/audio/speech", json=payload, timeout=120.0)
+    print(f"Backend took {time.perf_counter() - t0:.2f}s (HTTP {response.status_code})")
     response.raise_for_status()
 
     if args.response_format == "wav":
