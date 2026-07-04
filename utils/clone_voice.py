@@ -11,8 +11,9 @@ the upstream encoder. The baked tada-ref-<name>.gguf lands in
 ./models_tts_ignore_backups/ (mounted at /models in the container), ready to use
 as  --voice /models/tada-ref-<name>.gguf  in docker-compose.yml.
 
-It reuses CrispASR's models/convert-tada-ref-to-gguf.py (which wraps
-HumeAI/tada); that script is auto-downloaded next to this one if missing. The
+It reuses convert-tada-ref-to-gguf.py (a pinned copy of CrispASR's
+models/convert-tada-ref-to-gguf.py, which wraps HumeAI/tada) sitting next to
+this script in utils/; it is only re-downloaded if that copy is missing. The
 heavy encoder deps (torch, transformers, the tada package) are installed on
 demand by `uv run --with ...` only when baking, so the menu stays instant.
 
@@ -36,10 +37,13 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent  # utils/
+REPO = HERE.parent                      # repo root (this script lives in utils/)
 VOICES_DIR = REPO / "voices"
 OUT_DIR = REPO / "models_tts_ignore_backups"
-CONVERTER = REPO / "convert-tada-ref-to-gguf.py"
+# Pinned copy sitting next to this script; only re-downloaded if that copy is
+# ever removed (see ensure_converter).
+CONVERTER = HERE / "convert-tada-ref-to-gguf.py"
 CONVERTER_URL = (
     "https://raw.githubusercontent.com/CrispStrobe/CrispASR/main/"
     "models/convert-tada-ref-to-gguf.py"

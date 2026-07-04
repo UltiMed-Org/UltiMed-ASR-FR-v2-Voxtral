@@ -37,7 +37,7 @@ still rejected by TADA: bake a ref offline first (CLI `--make-ref`, or
 convert-tada-ref-to-gguf.py from audio + transcript), then switch to it
 live. On-the-fly ref generation from audio is not wired into the server
 yet. As a convenience, `--voice-name NAME` bakes ./voices/<NAME> into a
-ref on the host (delegating to clone_voice.py, which owns the torch
+ref on the host (delegating to utils/clone_voice.py, which owns the torch
 converter + naming) if it is not already baked, then synthesizes with it
 in one call, no restart.
 
@@ -215,7 +215,7 @@ def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
     """Bake ./voices/<name> into a tada-ref GGUF (if needed) and return the
     container-side voice path to send as the request `voice`.
 
-    The heavy lifting is delegated to the sibling clone_voice.py (the host
+    The heavy lifting is delegated to utils/clone_voice.py (the host
     "torch converter" path): it pins torch, wraps convert-tada-ref-to-gguf.py,
     transcodes the reference audio, writes tada-ref-<slug>.gguf into the /models
     mount, and owns the naming/caching/mount convention. We reuse it rather than
@@ -227,9 +227,9 @@ def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
     voice, ffmpeg + the encoder deps/weights clone_voice.py pulls in. Baking is
     skipped when the gguf already exists unless `force` is set.
     """
-    cloner = Path(__file__).resolve().parent / "clone_voice.py"
+    cloner = Path(__file__).resolve().parent / "utils" / "clone_voice.py"
     if not cloner.exists():
-        raise SystemExit(f"--voice-name needs clone_voice.py next to tts.py, not found at {cloner}")
+        raise SystemExit(f"--voice-name needs utils/clone_voice.py next to tts.py, not found at {cloner}")
 
     def _run(extra: list[str], capture: bool) -> str:
         cmd = ["uv", "run", "--script", str(cloner), "--name", name, *extra]
