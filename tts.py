@@ -54,6 +54,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -70,17 +71,26 @@ def _get(url: str, timeout: float = 10.0) -> tuple[int, bytes, str]:
         return e.code, e.read(), e.headers.get("Content-Type", "")
 
 
-def _post_json(url: str, body: dict, timeout: float) -> tuple[int, bytes, str]:
+def _post_json(url: str, body: dict, timeout: float) -> tuple[int, bytes, str, float]:
+    """POST `body` as JSON and return (status, payload, content-type, elapsed).
+
+    `elapsed` is the wall-clock seconds of the backend round-trip: from the
+    moment the request is sent until the full response body is read (so it
+    covers synthesis time, not client-side arg parsing or file writing).
+    Measured with `time.perf_counter` and reported on HTTP errors too, since a
+    slow 4xx/5xx is still useful timing information.
+    """
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, method="POST",
         headers={"Content-Type": "application/json"},
     )
+    t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read(), r.headers.get("Content-Type", "")
+            return r.status, r.read(), r.headers.get("Content-Type", ""), time.perf_counter() - t0
     except urllib.error.HTTPError as e:
-        return e.code, e.read(), e.headers.get("Content-Type", "")
+        return e.code, e.read(), e.headers.get("Content-Type", ""), time.perf_counter() - t0
 
 
 def build_speech_body(
@@ -275,7 +285,7 @@ def cmd_check(base_url: str) -> int:
     # No sampling knobs are sent, so this exercises exactly the server's
     # configured defaults (the path real requests take when run bare).
     print(f"POST {base_url}/v1/audio/speech (smoke test)", file=sys.stderr)
-    code, body, ctype = _post_json(
+    code, body, ctype, elapsed = _post_json(
         f"{base_url}/v1/audio/speech",
         build_speech_body(text="Test.", response_format="wav", speed=1.0),
         timeout=120.0,
@@ -283,7 +293,8 @@ def cmd_check(base_url: str) -> int:
     if code != 200:
         print(f"  -> {code}: {body[:500].decode('utf-8', 'replace')}", file=sys.stderr)
         return 1
-    print(f"  -> {code}, {len(body)} bytes ({ctype}); model OK", file=sys.stderr)
+    print(f"  -> {code}, {len(body)} bytes ({ctype}); model OK, backend took {elapsed:.2f}s",
+          file=sys.stderr)
     return 0
 
 
@@ -292,17 +303,19 @@ def cmd_synth(base_url: str, body: dict, out: Path, timeout: float) -> int:
     url = f"{base_url}/v1/audio/speech"
     print(f"POST {url}", file=sys.stderr)
     try:
-        code, payload, ctype = _post_json(url, body, timeout=timeout)
+        code, payload, ctype, elapsed = _post_json(url, body, timeout=timeout)
     except urllib.error.URLError as e:
         print(f"unreachable: {e}", file=sys.stderr)
         return 2
     if code != 200:
-        print(f"server returned {code}: {payload[:500].decode('utf-8', 'replace')}",
+        print(f"server returned {code} after {elapsed:.2f}s: "
+              f"{payload[:500].decode('utf-8', 'replace')}",
               file=sys.stderr)
         return 1
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(payload)
-    print(f"  -> {code}, {len(payload)} bytes ({ctype})", file=sys.stderr)
+    print(f"  -> {code}, {len(payload)} bytes ({ctype}), backend took {elapsed:.2f}s",
+          file=sys.stderr)
     print(str(out.resolve()))
     return 0
 
