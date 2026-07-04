@@ -3,11 +3,24 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Query the crispasr-tts OpenAI-compatible server to synthesize speech.
+"""Query the OpenAI-compatible TTS server on :8003 to synthesize speech.
 
 The container exposes `POST /v1/audio/speech` on host port 8003 (see
 docker-compose.yml). Run `tts.py --check` to confirm the server is alive
-and the model loaded.
+and the model loaded. Both TTS services bind :8003 by design (only one up
+at a time), and this single client covers whichever answers: `crispasr-tts`
+(CrispASR, TADA backend) or `voxtral-tts` (vLLM + vllm-omni serving
+mistralai/Voxtral-4B-TTS-2603; it absorbed the former
+voxtral/query_test.py).
+
+Against Voxtral, only `input`, `voice`, `response_format` and `speed` are
+honoured per request. Pass `--voice` explicitly with one of the 20
+built-in embedding names in VOXTRAL_VOICES (e.g. fr_male, neutral_female).
+Leave the TADA knobs below unset: they are only sent when explicitly set,
+and the vllm-omni request schema does not define them. Voxtral's sampling
+is startup-time only (VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in
+docker-compose.yml), not per request. If vLLM rejects a request without a
+model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
 client exposes TADA's per-request knobs. As of CrispASR #197 the talker
@@ -51,15 +64,45 @@ Generated with help from Claude Code.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 DEFAULT_URL = "http://127.0.0.1:8003"
+
+# Built-in voice embeddings shipped with mistralai/Voxtral-4B-TTS-2603 (from
+# voice_embedding/*.pt in the HF repo). Only relevant when the voxtral-tts
+# service is the one on :8003; TADA voices are tada-ref-*.gguf paths instead.
+# Kept as a reference list, not argparse choices, since --voice is
+# backend-dependent free text.
+VOXTRAL_VOICES = [
+    "ar_male",
+    "casual_female",
+    "casual_male",
+    "cheerful_female",
+    "de_female",
+    "de_male",
+    "es_female",
+    "es_male",
+    "fr_female",
+    "fr_male",
+    "hi_female",
+    "hi_male",
+    "it_female",
+    "it_male",
+    "neutral_female",
+    "neutral_male",
+    "nl_female",
+    "nl_male",
+    "pt_female",
+    "pt_male",
+]
 
 
 def _get(url: str, timeout: float = 10.0) -> tuple[int, bytes, str]:
@@ -98,6 +141,7 @@ def build_speech_body(
     text: str,
     response_format: str,
     speed: float,
+    model: str | None = None,
     instruction: str | None = None,
     voice: str | None = None,
     seed: int | None = None,
@@ -130,6 +174,11 @@ def build_speech_body(
         `wav`, `pcm`, or `f32`.
     speed : float
         Tempo multiplier 0.25..4.0 (post-synth resample on the server).
+    model : str or None
+        OpenAI `model` field. CrispASR serves whatever backend it was
+        started with and does not need it; vLLM validates it against the
+        served model, so against voxtral-tts pass
+        `mistralai/Voxtral-4B-TTS-2603` if a modelless request is rejected.
     instruction : str or None
         Voice-direction prose. Only qwen3-tts VoiceDesign honours it; TADA
         silently ignores it, so it is opt-in here rather than always sent.
@@ -202,6 +251,7 @@ def build_speech_body(
     # Server field name -> value; entries that are None are not sent so the
     # server keeps its own startup default for that knob.
     optional = {
+        "model": model,
         "instructions": instruction,
         "voice": voice,
         "seed": seed,
@@ -314,7 +364,20 @@ def cmd_synth(base_url: str, body: dict, out: Path, timeout: float) -> int:
         return 1
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(payload)
-    print(f"  -> {code}, {len(payload)} bytes ({ctype}), backend took {elapsed:.2f}s",
+    # For wav responses, also report duration/rate (the old voxtral client did
+    # this via soundfile; stdlib `wave` keeps us dependency-free). Best-effort:
+    # `wave` cannot parse float32 wavs, so failures just drop the extra info.
+    wav_info = ""
+    if payload[:4] == b"RIFF":
+        try:
+            with wave.open(io.BytesIO(payload)) as w:
+                rate = w.getframerate()
+                if rate:
+                    wav_info = f", {w.getnframes() / rate:.2f}s at {rate} Hz"
+        except (wave.Error, EOFError):
+            pass
+    print(f"  -> {code}, {len(payload)} bytes ({ctype}){wav_info}, "
+          f"backend took {elapsed:.2f}s",
           file=sys.stderr)
     print(str(out.resolve()))
     return 0
@@ -332,8 +395,14 @@ def main() -> int:
     p.add_argument("-t", "--text", help="Text to read aloud.")
     p.add_argument("-o", "--output", default="tts_out.wav",
                    help="Output filename (default: tts_out.wav).")
-    p.add_argument("--format", default="wav", choices=("wav", "pcm", "f32"),
-                   help="Audio response format (default: wav).")
+    p.add_argument("--format", default="wav",
+                   choices=("wav", "pcm", "f32", "flac", "mp3", "aac", "opus"),
+                   help="Audio response format (default: wav). CrispASR accepts "
+                        "wav/pcm/f32; Voxtral (vLLM) accepts wav/flac/mp3/aac/opus/pcm.")
+    p.add_argument("--model", default=None,
+                   help="OpenAI `model` field (default: not sent). CrispASR does not "
+                        "need it; vLLM validates it, so against voxtral-tts pass "
+                        "mistralai/Voxtral-4B-TTS-2603 if a modelless request is rejected.")
     p.add_argument("--speed", type=float, default=1.0,
                    help="Speech speed, 0.25 to 4.0 (default: 1.0).")
     p.add_argument("--timeout", type=float, default=300.0,
@@ -348,10 +417,13 @@ def main() -> int:
         "#201): pass a tada-ref-*.gguf path or a cache/registry name and the "
         "backend reloads it live; 'default'/'auto'/unset keeps the loaded ref. A "
         ".wav is still rejected by TADA (bake a ref offline first). Also honoured "
-        "by qwen3-tts base, vibevoice-1.5b, ...")
+        "by qwen3-tts base, vibevoice-1.5b, ... For voxtral-tts, pass one of its 20 "
+        "built-in embedding names (VOXTRAL_VOICES in this file).")
     voice.add_argument("--voice", default=None,
                        help="Voice name or reference path (TADA reloads it live; "
-                            "'default'/'auto'/unset keeps the server's current voice).")
+                            "'default'/'auto'/unset keeps the server's current voice). "
+                            "For Voxtral: a built-in embedding name, e.g. fr_male, "
+                            "neutral_female.")
     voice.add_argument("--voice-name", default=None,
                        help="Bake ./voices/<NAME> (its <NAME>.txt transcript) into a tada-ref "
                             "gguf via clone_voice.py if not already baked, then synthesize with "
@@ -431,6 +503,7 @@ def main() -> int:
         text=args.text,
         response_format=args.format,
         speed=args.speed,
+        model=args.model,
         instruction=args.instruction,
         voice=args.voice,
         seed=args.seed,

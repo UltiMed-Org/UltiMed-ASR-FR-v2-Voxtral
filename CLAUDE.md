@@ -115,18 +115,22 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   (TADA), so only one TTS can be up at a time. Do NOT `sudo docker compose up` with no
   args (that starts everything and the two collide on :8003); start it explicitly:
   `sudo docker compose up -d --build voxtral-tts`.
-- **Client:** `voxtral/query_test.py` (PEP 723, run via `uv`), a small OpenAI TTS client
-  hitting `:8003/v1/audio/speech`. The model is fixed; the **voice is per request** (20
-  built-in voices: `fr_male`, `fr_female`, `neutral_female`, ...):
-  `uv run voxtral/query_test.py --input "Bonjour." --voice neutral_female --output-path out.wav`
+- **Client:** the root `tts.py`, same as for crispasr-tts (the former
+  `voxtral/query_test.py` was folded into it). The **voice is per request** (20
+  built-in voices, `VOXTRAL_VOICES` in tts.py: `fr_male`, `fr_female`,
+  `neutral_female`, ...) and should be passed explicitly:
+  `./tts.py -t "Bonjour." --voice neutral_female -o out.wav`. If vLLM rejects a
+  request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, and `speed` (post-processing playback rate, non-streaming
   only). It **ignores** `instructions`, `language`, `task_type` and `max_new_tokens`:
   those only take effect on the Qwen3-TTS / Fish paths in vllm-omni's
   `serving_speech.py` (`_build_tts_params`), whereas Voxtral builds its prompt from just
-  `SpeechRequest(input, voice|ref_audio)`. So `query_test.py` exposes `--voice`, `--speed`
-  and `--response-format` only. Sampling knobs (temperature/seed/top_p) are NOT per
-  request either; they live in the startup YAML (see below).
+  `SpeechRequest(input, voice|ref_audio)`. So of tts.py's flags only `--voice`, `--speed`,
+  `--format` (and `--model`) matter here; the TADA knobs must be left unset (they are
+  opt-in, never sent unless given, and vllm-omni's schema does not define them). Sampling
+  knobs (temperature/seed/top_p) are NOT per request either; they live in the startup
+  YAML (see below).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
   service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
   **two-stage** pipeline: `audio_generation` (stage 0, the AR LLM, the ~0.8 GPU-memory
@@ -165,5 +169,6 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   scripts + `utils/` + `voxtral/`.
 - `voxtral/` holds the Voxtral TTS experiment (serving Voxtral TTS via **vLLM**, not
   CrispASR; see "Voxtral TTS" above): `Dockerfile` + `entrypoint.sh` back the `voxtral-tts`
-  compose service, `install.sh` is the original hand-run recipe, `query_test.py` is the
-  client (it overlaps with `tts.py`), and `env.reference` is a captured `pip freeze`.
+  compose service, `install.sh` is the original hand-run recipe, and `env.reference` is a
+  captured `pip freeze`. The client is the root `tts.py` (the old `voxtral/query_test.py`
+  was merged into it).

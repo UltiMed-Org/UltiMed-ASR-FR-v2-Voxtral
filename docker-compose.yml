@@ -76,8 +76,9 @@ services:
   # mistralai/Voxtral-4B-TTS-2603, served by vllm-omni. This is a separate
   # runtime from the crispasr image, so it gets its own image built from
   # voxtral/Dockerfile (which pins vllm==0.18.1 + vllm-omni==0.18.0 to
-  # match voxtral/install.sh). Client: voxtral/query_test.py, e.g.
-  #   uv run voxtral/query_test.py --input "Bonjour." --voice neutral_female
+  # match voxtral/install.sh). Client: root tts.py (absorbed the former
+  # voxtral/query_test.py), e.g.
+  #   ./tts.py -t "Bonjour." --voice neutral_female -o out.wav
   # It POSTs to :8003/v1/audio/speech, same as any OpenAI TTS client.
   #
   # Start it with:  sudo docker compose up -d --build voxtral-tts
