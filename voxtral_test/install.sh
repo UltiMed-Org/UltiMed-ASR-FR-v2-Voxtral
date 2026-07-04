@@ -2,9 +2,9 @@
 
 # # to retry in a fresh env
 # deactivate
-# trash test_voxtral
-# uv venv test_voxtral --python 3.10
-# source test_voxtral/bin/activate
+# trash env_voxtral
+# uv venv env_voxtral --python 3.10
+# source env_voxtral/bin/activate
 
 # to stop if we crash
 set -eu
