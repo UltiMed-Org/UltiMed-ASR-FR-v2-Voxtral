@@ -188,27 +188,23 @@ services:
       # --codec-model). Synthesis is ZERO-SHOT by default (no reference needed,
       # so `tts.py --check` and bare `-t` work); voice cloning is opt-in per
       # request with `tts.py --voice /path/ref.wav`.
-      #
-      # CUDA STABILITY (#164): the "illegal memory access" crash has two known
-      # causes on CUDA, both fixed/worked-around here:
-      #  1) ggml_set_rows corrupts the KV cache on the 2nd AR step via the
-      #     bucketed TSLM path. This is AUTO-disabled on CUDA in current `main`
-      #     (backend name starts with "CUDA"); VOXCPM2_NO_BUCKET=1 forces it off
-      #     on every backend too, as a belt-and-suspenders in case detection misses.
-      #  2) flash_attn_ext F16 accumulator OVERFLOWS on mu-conditioned attention
-      #     from the 2nd AR step (seen on P100). This is NOT auto-handled and is
-      #     the most likely cause of an illegal-memory-access; VOXCPM2_FA_CPU=1
-      #     runs LocDiT/LocEnc on CPU to dodge it.
-      # Both are enabled below (correctness first). Once you confirm it runs,
-      # drop VOXCPM2_FA_CPU (and optionally VOXCPM2_NO_BUCKET) to regain GPU
-      # speed; if it still crashes with both set, it is likely a genuine new
-      # regression (or VRAM pressure) worth reporting upstream with the log.
+      # Runs full GPU by default (the earlier "illegal memory access" was on
+      # Chatterbox, not here, so no CPU-forcing knobs are set). If VoxCPM2
+      # DOES crash on CUDA, uncomment the two #164 workarounds below:
+      #  1) VOXCPM2_NO_BUCKET=1 -- ggml_set_rows corrupts the KV cache on the
+      #     2nd AR step via the bucketed TSLM path. Already AUTO-disabled on
+      #     CUDA in current `main`; this forces it off on every backend as a
+      #     belt-and-suspenders in case backend-name detection misses.
+      #  2) VOXCPM2_FA_CPU=1 -- flash_attn_ext F16 accumulator OVERFLOWS on
+      #     mu-conditioned attention from the 2nd AR step (seen on P100); runs
+      #     LocDiT/LocEnc on CPU to dodge it. NOT auto-handled, so this is the
+      #     one to try first if you hit an illegal-memory-access here.
       - CRISPASR_BACKEND=voxcpm2-tts
       - CRISPASR_AUTO_DOWNLOAD=1
       - CRISPASR_LANGUAGE=fr
       - CRISPASR_EXTRA_ARGS=--verbose
-      - VOXCPM2_FA_CPU=1
-      - VOXCPM2_NO_BUCKET=1
+      # - VOXCPM2_FA_CPU=1
+      # - VOXCPM2_NO_BUCKET=1
       # Diagnostics: VOXCPM2_BUCKET_CUDA=1 re-enables buckets on CUDA (bench),
       # VOXCPM2_NAN_CHECK=1 reads every tensor back to CPU to locate NaNs (slow),
       # VOXCPM2_USE_GRAPH=0 forces the CPU VAE encoder path.
@@ -222,17 +218,23 @@ services:
       # instruct, no reference) and `tts.py --check` passes. -l fr selects the
       # French language token (wired into the T3 prompt, not the spoken text;
       # quality is model-dependent, treat it as a wiring check).
-      # GPU split: on this CUDA image the default already runs T3 on GPU and
-      # S3Gen on CPU (the safe default -- S3Gen drifts on GPU), which matches
-      # the "prefer T3" preference, so no knob is needed. Diagnostics if you
-      # want to A/B: CRISPASR_CHATTERBOX_T3_GPU=1, CRISPASR_CHATTERBOX_FULL_CPU=1
-      # (keep S3Gen on CPU; FORCE_GPU garbles output). Optional
-      # CRISPASR_CHATTERBOX_THREADS=<n> caps the S3Gen CPU threads on a shared host.
+      # GPU split (CORRECTION): on this CUDA image the current default runs
+      # BOTH T3 and S3Gen on GPU (chatterbox.cpp: t3_gpu_default=true,
+      # s3gen_use_gpu=true). S3Gen on CUDA is the fragile half -- its UNet
+      # mul_mat accumulates in F16 (wmma), and the HiFTGenerator FFT hit a
+      # heap overflow on P100 -- which is the "illegal memory access" you saw.
+      # FIX: CRISPASR_CHATTERBOX_S3GEN_CPU=1 keeps T3 on GPU (fast, the "better"
+      # half) and moves S3Gen to CPU (stable). That is the recommended setting
+      # here and matches the "prefer T3" preference; it is set below.
+      # Bigger hammer if needed: CRISPASR_CHATTERBOX_FULL_CPU=1 (both on CPU).
+      # Avoid CRISPASR_CHATTERBOX_FORCE_GPU=1 (forces S3Gen back onto the GPU).
+      # Optional CRISPASR_CHATTERBOX_THREADS=<n> caps the S3Gen CPU threads.
       # Docs: https://github.com/CrispStrobe/CrispASR/blob/main/docs/tts.md#chatterbox
       # - CRISPASR_BACKEND=chatterbox
       # - CRISPASR_AUTO_DOWNLOAD=1
       # - CRISPASR_LANGUAGE=fr
       # - CRISPASR_EXTRA_ARGS=--verbose
+      # - CRISPASR_CHATTERBOX_S3GEN_CPU=1   # T3 on GPU, S3Gen on CPU -> fixes the CUDA crash
       # Sibling fine-tunes share the runtime (all AUTO_DOWNLOAD=1); swap the backend:
       # - CRISPASR_BACKEND=chatterbox-turbo    # distilled English, faster 2-step S3Gen
       # - CRISPASR_BACKEND=kartoffelbox-turbo  # German turbo (set CRISPASR_LANGUAGE=de)
