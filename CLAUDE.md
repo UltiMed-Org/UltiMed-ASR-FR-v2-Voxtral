@@ -108,9 +108,14 @@ bad model/reference/transcript. See `utils/README.md`.
 CrispASR, `voxtral`/`voxtral4b` are ASR, i.e. speech->text; the "multiple voxtral models"
 in `docker-compose.yml` and `models_ignore_backups/` are all ASR.) So this service uses
 none of the `ghcr.io/crispstrobe/crispasr` image or the `CRISPASR_*` env vars. It builds
-its own image from `voxtral/Dockerfile` (base `vllm/vllm-openai` + the `vllm-omni`
-extension, versions pinned to match `voxtral/install.sh`), and `voxtral/entrypoint.sh`
-runs `vllm-omni serve` the same way `install.sh` does by hand.
+its own image from `voxtral/Dockerfile`, a **thin layer on the official
+`vllm/vllm-omni:v0.22.0-x86_64` image** (which already bundles the matching vLLM +
+vllm-omni + deploy YAMLs); the layer just adds a passwd entry for the runtime uid and our
+entrypoint. `voxtral/entrypoint.sh` copies the bundled deploy YAML, patches the tuning
+knobs into it, and runs `vllm serve MODEL --omni --deploy-config <patched>`. (History:
+0.18 built `FROM vllm/vllm-openai` + `pip install vllm-omni==0.18.0` + a hand-built
+flash-attn wheel and ran `vllm-omni serve --stage-configs-path`; `voxtral/install.sh` is
+that older hand-run recipe.)
 
 - **Port clash by design:** it binds host **:8003**, the same port as `crispasr-tts`
   (TADA), so only one TTS can be up at a time. Do NOT `sudo docker compose up` with no
@@ -134,37 +139,30 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   YAML (see below).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
   service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
-  **two-stage** pipeline: `audio_generation` (stage 0, the AR LLM, the ~0.8 GPU-memory
-  hog, greedy at temp 0.0) then `audio_tokenizer` (stage 1, the acoustic decoder). At
-  boot `entrypoint.sh` copies the packaged `voxtral_tts.yaml` and patches it per stage
-  with pyyaml (both stages keep the packaged `gpu_memory_utilization`, stage 0's ~0.8
-  and stage 1's 0.1; there is no env override for it, so give Voxtral its own card or
-  pass `--gpu-memory-utilization` via `VLLM_EXTRA_ARGS` if you must share):
-  - `VOXTRAL_ACOUSTIC_TEMP` -> stage-1 sampling temperature. Entrypoint default **0.7**
+  **two-stage** pipeline: stage 0 (the AR LLM, greedy at temp 0.0, `enforce_eager: false`
+  so already compiled/CUDA-graph'd) then stage 1 (the acoustic decoder). At boot
+  `entrypoint.sh` copies the bundled `deploy/voxtral_tts.yaml`, patches it with pyyaml
+  (0.22 schema: a top-level `stages:` list with flat fields + nested
+  `default_sampling_params`; stages are keyed by `stage_id`), and passes it via
+  `vllm serve --omni --deploy-config`:
+  - `VOXTRAL_ACOUSTIC_TEMP` -> stage_id 1 sampling temperature. Entrypoint default **0.7**
     (lowered from upstream 0.9 for steadier, less artifacty audio; raise toward 0.9 for
     more expressive/varied output). This is the main audio-quality lever.
   - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
     take). Not settable per request.
-  - `VOXTRAL_MAX_INFLIGHT` -> `runtime.defaults.max_inflight` (top-level YAML patch). The
-    packaged value is **1**, meaning the pipeline processes **one request at a time**, so
-    batch-dataset throughput is capped no matter the client `--concurrency` or
-    `max_num_seqs`. **This is the main batch-throughput lever:** raise it (try 8, then 16)
-    to let concurrent requests batch on stage 0 (which is already CUDA-graph'd:
-    `enforce_eager: false` in the YAML). Costs more VRAM and leans on the shared-memory
-    connector; watch the logs for OOM. Unset = packaged default (1).
-  - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `engine_args.max_num_seqs` (packaged **32**).
-    Only worth raising past 32 if `VOXTRAL_MAX_INFLIGHT` goes above it. Unset = 32.
-  - `VOXTRAL_ENFORCE_EAGER` (serve-flag toggle, not a YAML patch) -> default **1** = pass
-    `--enforce-eager`. **Largely a no-op on the stages:** the per-stage YAML already sets
-    stage 0 `enforce_eager: false` (CUDA-graph'd) and stage 1 `true`, and the serve flag
-    does not reliably override per-stage `engine_args` (logs show stage 0 compiled and
-    stage 1 eager regardless). Left at **0**; don't force global eager (it would only slow
-    the AR stage). Real per-stage cudagraph control would need a YAML patch, not this flag.
-  - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve`
-    flags). Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
-- **Status:** ported faithfully from the hand-run `install.sh` but not yet verified
-  end-to-end in Docker; the `vllm/vllm-openai:v0.18.1` base tag and the GPU-memory fit may
-  need adjustment on the first `--build`.
+  - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `max_num_seqs` (packaged **32**). Unset = 32.
+    Note the acoustic stage is `codec-bs=1`, so per the maintainers audio throughput
+    **saturates around client concurrency 4-8**; raising this past that buys little. (The
+    0.18 `runtime.defaults.max_inflight` lever no longer exists in the 0.22 schema, and
+    `gpu_memory_utilization` has no env override, pass `--gpu-memory-utilization` via
+    `VLLM_EXTRA_ARGS` if you must share the card.)
+  - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
+    Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
+- **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
+  schema, statically validated (the YAML patcher runs against the real v0.22.0 deploy
+  config) but not yet run end-to-end in Docker; the first `--build` + smoke call is the
+  real check. The prebuilt image ships no standalone flash-attn, so stage 1 may still log
+  the SDPA-fallback warning (see the Dockerfile note to re-add a matching wheel).
 
 ## Layout notes
 

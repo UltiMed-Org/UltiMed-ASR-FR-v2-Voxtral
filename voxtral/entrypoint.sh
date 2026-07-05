@@ -1,41 +1,56 @@
 #!/usr/bin/env bash
-# Mirrors the serve step of voxtral/install.sh, but for the container: copies the
-# packaged voxtral_tts stage config, patches a few knobs per stage, then serves
-# mistralai/Voxtral-4B-TTS-2603 on 0.0.0.0 so the host can reach it.
+# Serve mistralai/Voxtral-4B-TTS-2603 via vllm-omni (0.22.x) on 0.0.0.0 so the
+# host can reach it. In 0.22 the model is registered, so `vllm serve MODEL --omni`
+# auto-loads the bundled deploy YAML (vllm_omni/deploy/voxtral_tts.yaml); we copy
+# that YAML, patch a few knobs, and hand it back with --deploy-config.
 #
-# Voxtral is a TWO-STAGE pipeline (see the copied YAML):
-#   stage "audio_generation" (stage 0) = AR LLM, text -> audio tokens. It is the
-#     VRAM hog (gpu_memory_utilization ~0.8) and runs greedily (temperature 0.0).
-#   stage "audio_tokenizer"  (stage 1) = acoustic decoder, tokens -> 24 kHz wave.
-#     Its temperature (default 0.9 upstream) is the main audio-quality lever.
+# Voxtral is a TWO-STAGE pipeline (see the deploy YAML, top-level `stages:` list):
+#   stage_id 0 = AR LLM, text -> audio tokens. Compiled (enforce_eager: false),
+#                greedy (temperature 0.0), gpu_memory_utilization ~0.8.
+#   stage_id 1 = acoustic decoder, tokens -> 24 kHz wave. Its temperature
+#                (0.9 upstream) is the main audio-quality lever.
 # Voxtral's sampling params are NOT settable per HTTP request (only voice/speed/
 # response_format are), so we expose them here as startup knobs by editing the
 # copied YAML at boot. No rebuild needed to change them, just `up -d`.
+#
+# NOTE: the 0.22 schema differs from 0.18 (`stages` with flat fields, not
+# `stage_args`+`engine_args`+`runtime`). The old `runtime.defaults.max_inflight`
+# lever is gone; per the maintainers the acoustic stage is `codec-bs=1`, so audio
+# throughput saturates around client concurrency 4-8 regardless.
 set -euo pipefail
 
 MODEL="${VOXTRAL_TTS_MODEL:-mistralai/Voxtral-4B-TTS-2603}"
 PORT="${VOXTRAL_TTS_PORT:-8003}"
 
-# Locate the stage config shipped inside vllm_omni and copy it so we can tune it
-# without mutating the read-only site-packages copy.
-STAGE_YAML="$(python3 -c 'import vllm_omni, os; print(os.path.join(os.path.dirname(vllm_omni.__file__), "model_executor/stage_configs/voxtral_tts.yaml"))')"
+# Locate the bundled deploy YAML inside vllm_omni and copy it so we can tune it
+# without mutating the read-only site-packages copy. Check both the 0.22 path
+# (deploy/) and the legacy 0.18 path so this survives a version bump either way.
+STAGE_YAML="$(python3 - <<'PY'
+import os, vllm_omni
+base = os.path.dirname(vllm_omni.__file__)
+for rel in ("deploy/voxtral_tts.yaml", "model_executor/stage_configs/voxtral_tts.yaml"):
+    p = os.path.join(base, rel)
+    if os.path.exists(p):
+        print(p)
+        break
+PY
+)"
+if [ -z "$STAGE_YAML" ]; then
+  echo "voxtral entrypoint: could not find voxtral_tts.yaml in vllm_omni" >&2
+  exit 1
+fi
 TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 
-# Patch precisely per stage with pyyaml (ships with vllm-omni, which loads these
-# same YAMLs). Only the knobs an env var asks for are touched:
-#   VOXTRAL_ACOUSTIC_TEMP -> stage-1 sampling temperature. Default 0.7 (lowered
+# Patch precisely with pyyaml (ships with vllm-omni). Only the knobs an env var
+# asks for are touched:
+#   VOXTRAL_ACOUSTIC_TEMP -> stage_id 1 sampling temperature. Default 0.7 (lowered
 #                            from upstream 0.9 for steadier, less artifacty audio;
 #                            raise toward 0.9 for more expressive/varied output).
 #   VOXTRAL_SEED          -> seed on BOTH stages (fixed = reproducible; change it
 #                            for a different rendition of the same text+voice).
-#   VOXTRAL_MAX_INFLIGHT  -> runtime.defaults.max_inflight. The packaged YAML pins
-#                            this to 1, so the pipeline processes ONE request at a
-#                            time and batch-dataset throughput is capped no matter
-#                            the client concurrency or max_num_seqs. Raise (try
-#                            8, then 16) to let concurrent requests batch on stage
-#                            0; costs more VRAM and leans on the shm connector.
-#   VOXTRAL_MAX_NUM_SEQS  -> both stages' engine_args.max_num_seqs (packaged 32).
-#                            Only worth raising past 32 if max_inflight goes above it.
+#   VOXTRAL_MAX_NUM_SEQS  -> both stages' max_num_seqs (packaged 32). The acoustic
+#                            stage is codec-bs=1, so raising this past the ~4-8
+#                            concurrency saturation point buys little.
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
 python3 - "$STAGE_YAML" "$TUNED_YAML" <<'PY'
 import os, sys, yaml
@@ -46,53 +61,34 @@ with open(src) as f:
 
 temp = os.environ.get("VOXTRAL_ACOUSTIC_TEMP")  # always set (default injected above)
 seed = os.environ.get("VOXTRAL_SEED")
-max_inflight = os.environ.get("VOXTRAL_MAX_INFLIGHT")
 max_num_seqs = os.environ.get("VOXTRAL_MAX_NUM_SEQS")
 
-for stage in cfg.get("stage_args", []):
-    engine_args = stage.setdefault("engine_args", {})
-    model_stage = engine_args.get("model_stage")
+for stage in cfg.get("stages", []):
     sampling = stage.setdefault("default_sampling_params", {})
-
-    if model_stage == "audio_tokenizer" and temp:
-        sampling["temperature"] = float(temp)
     if seed:
         sampling["seed"] = int(seed)
     if max_num_seqs:
-        engine_args["max_num_seqs"] = int(max_num_seqs)
-
-# max_inflight lives at the top level, not per stage: the packaged value of 1
-# serializes the whole pipeline to one in-flight request, the real cap on batch
-# throughput. Only touch it when asked, preserving window_size/connectors.
-if max_inflight:
-    cfg.setdefault("runtime", {}).setdefault("defaults", {})["max_inflight"] = int(max_inflight)
+        stage["max_num_seqs"] = int(max_num_seqs)
+    # stage_id 1 = acoustic decoder; its temperature is the audio-quality lever.
+    if stage.get("stage_id") == 1 and temp:
+        sampling["temperature"] = float(temp)
 
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
-    "voxtral entrypoint: patched stage config -> %s "
-    "(acoustic_temp=%s seed=%s max_inflight=%s max_num_seqs=%s)\n"
-    % (dst, temp, seed or "default", max_inflight or "default", max_num_seqs or "default")
+    "voxtral entrypoint: patched deploy config -> %s "
+    "(acoustic_temp=%s seed=%s max_num_seqs=%s)\n"
+    % (dst, temp, seed or "default", max_num_seqs or "default")
 )
 PY
 
-# Eager mode (default ON, matching install.sh): --enforce-eager skips CUDA-graph
-# capture, so it uses less VRAM and starts faster but is a bit slower in steady
-# state. Set VOXTRAL_ENFORCE_EAGER=0 to drop the flag and let the per-stage YAML
-# decide (stage 0 audio_generation captures graphs -> faster generation, at the
-# cost of more VRAM + a first-boot capture delay; stage 1 stays eager).
-EAGER_FLAG="--enforce-eager"
-case "${VOXTRAL_ENFORCE_EAGER:-1}" in
-  0 | false | False | no | off) EAGER_FLAG="--no-enforce-eager" ;;
-esac
-
-# VLLM_EXTRA_ARGS is an opt-in escape hatch for further flags. Both it and
-# EAGER_FLAG are intentionally unquoted so an empty value expands to nothing.
-exec vllm-omni serve "$MODEL" \
+# 0.22 serve form: `vllm serve MODEL --omni` (the vllm-omni plugin registers the
+# omni pipeline into vllm). --deploy-config feeds our patched YAML. VLLM_EXTRA_ARGS
+# is an opt-in escape hatch, left unquoted so an empty value expands to nothing.
+exec vllm serve "$MODEL" \
   --omni \
-  --stage-configs-path "$TUNED_YAML" \
+  --deploy-config "$TUNED_YAML" \
   --host 0.0.0.0 \
   --port "$PORT" \
-  ${EAGER_FLAG} \
   ${VLLM_EXTRA_ARGS:-}

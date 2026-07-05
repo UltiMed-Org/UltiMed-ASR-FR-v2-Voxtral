@@ -77,8 +77,8 @@ services:
   # Voxtral TTS (text->audio) via vLLM, NOT CrispASR. Model:
   # mistralai/Voxtral-4B-TTS-2603, served by vllm-omni. This is a separate
   # runtime from the crispasr image, so it gets its own image built from
-  # voxtral/Dockerfile (which pins vllm==0.18.1 + vllm-omni==0.18.0 to
-  # match voxtral/install.sh). Client: root tts.py (absorbed the former
+  # voxtral/Dockerfile (a thin layer on the official vllm/vllm-omni:v0.22.0
+  # image). Client: root tts.py (absorbed the former
   # voxtral/query_test.py), e.g.
   #   ./tts.py -t "Bonjour." --voice neutral_female -o out.wav
   # It POSTs to :8003/v1/audio/speech, same as any OpenAI TTS client.
@@ -97,7 +97,7 @@ services:
       args:
         APP_UID: ${CRISPASR_UID:-1000}
         APP_GID: ${CRISPASR_GID:-1000}
-    image: voxtral-tts-local:0.18.1
+    image: voxtral-tts-local:0.22.0
     ports:
       - "8003:8003"
     # Run as the host user (matches the crispasr services) and keep every cache
@@ -114,31 +114,22 @@ services:
       - XDG_CACHE_HOME=/cache
       # If the model repo is gated on Hugging Face, pass a token:
       # - HF_TOKEN=TODO
-      # entrypoint.sh reads the tuning vars below at boot and patches the copied
-      # stage-config YAML with them (VLLM_EXTRA_ARGS / VOXTRAL_ENFORCE_EAGER go to
-      # the serve command instead). Changing any value needs no rebuild, just
-      # `up -d`. See the Voxtral TTS section in CLAUDE.md for the two-stage story.
-      # Acoustic-decoder sampling temperature (entrypoint default is 0.7, lowered
-      # from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
+      # entrypoint.sh reads the tuning vars below at boot and patches them into a
+      # copy of the bundled deploy YAML, handed to `vllm serve --omni` via
+      # --deploy-config (VLLM_EXTRA_ARGS goes to the serve command instead).
+      # Changing any value needs no rebuild, just `up -d`. See the Voxtral TTS
+      # section in CLAUDE.md for the two-stage story.
+      # Acoustic-decoder (stage 1) sampling temperature (entrypoint default is 0.7,
+      # lowered from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
       # Seed for both stages: fixed = reproducible; change for a different take:
       # - VOXTRAL_SEED=42
-      # BATCH THROUGHPUT. The packaged YAML pins runtime.defaults.max_inflight=1,
-      # so the pipeline handles ONE request at a time and a dataset run is capped
-      # no matter the client --concurrency. Raise it to let requests batch on the
-      # (already CUDA-graph'd) AR stage; start at 8, then try 16. Uses more VRAM
-      # and leans on the shm connector, so watch the logs for OOM:
-      # - VOXTRAL_MAX_INFLIGHT=8
-      # Per-stage max concurrent sequences (packaged 32); only raise past 32 if
-      # max_inflight goes above it:
+      # Per-stage max concurrent sequences (packaged 32). NOTE: the acoustic stage
+      # is codec-bs=1, so audio throughput saturates around client concurrency 4-8;
+      # raising this past that buys little. (The 0.18 runtime.defaults.max_inflight
+      # lever no longer exists in the 0.22 schema.)
       # - VOXTRAL_MAX_NUM_SEQS=32
-      # Eager-mode serve flag. NOTE: the per-stage YAML already sets stage 0 (AR
-      # generation) enforce_eager:false = CUDA-graph'd and stage 1 eager, and the
-      # serve flag does not reliably override per-stage engine_args, so this is
-      # largely a no-op on the stages; left at 0 (do not force global eager):
-      # - VOXTRAL_ENFORCE_EAGER=1
-      - VOXTRAL_ENFORCE_EAGER=0
-      # Extra vllm-omni serve flags, space-separated (opt-in; do not quote-wrap):
+      # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap):
       # - VLLM_EXTRA_ARGS=--max-model-len 4096
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
     shm_size: "8gb"
