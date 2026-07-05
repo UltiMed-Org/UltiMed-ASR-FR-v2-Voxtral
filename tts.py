@@ -54,6 +54,16 @@ ref on the host (delegating to utils/clone_voice.py, which owns the torch
 converter + naming) if it is not already baked, then synthesizes with it
 in one call, no restart.
 
+Batch mode (--batch FILE.jsonl): synthesize every row of a JSONL file
+instead of a single --text. Each row needs an `input` (or `text`) field;
+the output name is the row's `output` field, else `<id>.<format>`, else a
+zero-padded line number, written under --output (a DIRECTORY in this mode).
+All the voice/speed/sampling flags apply to every row. Existing files are
+skipped so an interrupted run resumes on re-run (unless --overwrite); rows
+go out --concurrency at a time (default 4), which a vLLM/Voxtral server
+batches server-side for a big speedup (use 1 for the single-context TADA
+backend).
+
 Refs:
   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
   CrispASR docs/tts.md (TADA talker sampling), docs/server.md (/v1/audio/speech)
@@ -72,6 +82,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 DEFAULT_URL = "http://127.0.0.1:8003"
@@ -271,6 +282,31 @@ def build_speech_body(
     return body
 
 
+def _body_from_args(text: str, args: argparse.Namespace) -> dict:
+    """Build a /v1/audio/speech body from the parsed CLI args for `text`.
+    Single and batch modes share this so their request shapes never drift."""
+    return build_speech_body(
+        text=text,
+        response_format=args.format,
+        speed=args.speed,
+        model=args.model,
+        instruction=args.instruction,
+        voice=args.voice,
+        seed=args.seed,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+        do_sample=args.do_sample,
+        num_candidates=args.num_candidates,
+        num_steps=args.num_steps,
+        cfg_scale=args.cfg_scale,
+        noise_temp=args.noise_temp,
+        consent_attestation=args.consent_attestation,
+        spoken_disclaimer=args.spoken_disclaimer,
+    )
+
+
 def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
     """Bake ./voices/<name> into a tada-ref GGUF (if needed) and return the
     container-side voice path to send as the request `voice`.
@@ -348,39 +384,161 @@ def cmd_check(base_url: str) -> int:
     return 0
 
 
+def wav_seconds(payload: bytes) -> float | None:
+    """Best-effort clip duration in seconds. None for non-RIFF payloads (mp3,
+    opus, flac, ...) and float32 wavs, which stdlib `wave` cannot parse; sticking
+    to `wave` keeps this client dependency-free (no soundfile)."""
+    if payload[:4] != b"RIFF":
+        return None
+    try:
+        with wave.open(io.BytesIO(payload)) as w:
+            rate = w.getframerate()
+            return w.getnframes() / rate if rate else None
+    except (wave.Error, EOFError):
+        return None
+
+
+def _synthesize(base_url: str, body: dict, out: Path,
+                timeout: float) -> tuple[float, int, str, float | None]:
+    """POST `body`, write the audio to `out` atomically, and return
+    (backend elapsed seconds, byte count, content-type, clip seconds or None).
+
+    Raises RuntimeError on a non-200 response and lets URLError propagate (an
+    unreachable server should abort a batch, not fail every row). The bytes go
+    to a `.tmp` sibling then get renamed, so a killed run never leaves a
+    truncated file that a resume would skip as already done.
+    """
+    code, payload, ctype, elapsed = _post_json(
+        f"{base_url}/v1/audio/speech", body, timeout=timeout)
+    if code != 200:
+        raise RuntimeError(f"server returned {code} after {elapsed:.2f}s: "
+                           f"{payload[:500].decode('utf-8', 'replace')}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_bytes(payload)
+    tmp.replace(out)
+    return elapsed, len(payload), ctype, wav_seconds(payload)
+
+
 def cmd_synth(base_url: str, body: dict, out: Path, timeout: float) -> int:
     """POST a prepared speech `body` and write the returned audio to `out`."""
-    url = f"{base_url}/v1/audio/speech"
-    print(f"POST {url}", file=sys.stderr)
+    print(f"POST {base_url}/v1/audio/speech", file=sys.stderr)
     try:
-        code, payload, ctype, elapsed = _post_json(url, body, timeout=timeout)
+        elapsed, nbytes, ctype, dur = _synthesize(base_url, body, out, timeout)
     except urllib.error.URLError as e:
         print(f"unreachable: {e}", file=sys.stderr)
         return 2
-    if code != 200:
-        print(f"server returned {code} after {elapsed:.2f}s: "
-              f"{payload[:500].decode('utf-8', 'replace')}",
-              file=sys.stderr)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
         return 1
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(payload)
-    # For wav responses, also report duration/rate (the old voxtral client did
-    # this via soundfile; stdlib `wave` keeps us dependency-free). Best-effort:
-    # `wave` cannot parse float32 wavs, so failures just drop the extra info.
-    wav_info = ""
-    if payload[:4] == b"RIFF":
-        try:
-            with wave.open(io.BytesIO(payload)) as w:
-                rate = w.getframerate()
-                if rate:
-                    wav_info = f", {w.getnframes() / rate:.2f}s at {rate} Hz"
-        except (wave.Error, EOFError):
-            pass
-    print(f"  -> {code}, {len(payload)} bytes ({ctype}){wav_info}, "
-          f"backend took {elapsed:.2f}s",
+    wav_info = f", {dur:.2f}s" if dur is not None else ""
+    print(f"  -> 200, {nbytes} bytes ({ctype}){wav_info}, backend took {elapsed:.2f}s",
           file=sys.stderr)
     print(str(out.resolve()))
     return 0
+
+
+def _iter_progress(it, total: int):
+    """Yield from `it` while printing an overwriting [n/total] counter to
+    stderr: a stdlib stand-in for tqdm (this client stays dependency-free)."""
+    for n, item in enumerate(it, 1):
+        print(f"\r  [{n}/{total}]", end="", file=sys.stderr, flush=True)
+        yield item
+    print(file=sys.stderr)
+
+
+def cmd_batch(base_url: str, jsonl_path: Path, args: argparse.Namespace) -> int:
+    """Synthesize every row of a JSONL file into the --output directory.
+
+    Row schema is general (not tied to any dataset): each row needs an `input`
+    (or `text`) field; the output filename is the row's `output` field, else
+    `<id>.<format>`, else a zero-padded line number. Existing files are skipped
+    (resume-friendly) unless --overwrite. Rows are fanned out --concurrency at a
+    time so a vLLM/Voxtral server can batch them server-side. Reuses the same
+    _body_from_args + _synthesize path as single mode, so every voice/speed/
+    sampling flag applies identically to each row.
+    """
+    out_dir = Path(args.output or "tts_batch")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    todo: list[tuple[Path, str]] = []
+    planned: set[Path] = set()
+    skipped_existing = bad_rows = 0
+    with jsonl_path.open() as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"{jsonl_path}:{lineno} invalid JSON ({e}), row skipped", file=sys.stderr)
+                bad_rows += 1
+                continue
+            text = row.get("input") or row.get("text")
+            if not text:
+                print(f"{jsonl_path}:{lineno} no 'input'/'text' field, row skipped", file=sys.stderr)
+                bad_rows += 1
+                continue
+            if row.get("output"):
+                name = str(row["output"])
+            elif "id" in row:
+                name = f"{row['id']}.{args.format}"
+            else:
+                name = f"{lineno:06d}.{args.format}"
+            out = out_dir / name
+            if out in planned:
+                print(f"{jsonl_path}:{lineno} duplicate target {out.name}, row skipped",
+                      file=sys.stderr)
+                bad_rows += 1
+                continue
+            planned.add(out)
+            if out.exists() and not args.overwrite:
+                skipped_existing += 1
+                continue
+            todo.append((out, text))
+
+    print(f"{jsonl_path}: {len(planned)} rows planned, {skipped_existing} already done, "
+          f"{len(todo)} to generate, {bad_rows} bad rows", file=sys.stderr)
+    if not todo:
+        return 1 if bad_rows else 0
+
+    failed = generated = 0
+    total_audio = 0.0
+    aborted = False
+    # Fan out: each _synthesize() is an independent request writing its own file,
+    # so it is thread-safe. Concurrency lets vLLM/Voxtral batch requests together;
+    # for the single-context TADA/crispasr backend pass --concurrency 1.
+    pool = ThreadPoolExecutor(max_workers=max(1, args.concurrency))
+    futures = {pool.submit(_synthesize, base_url,
+                           _body_from_args(text, args), out, args.timeout): out
+               for out, text in todo}
+    try:
+        for fut in _iter_progress(as_completed(futures), len(futures)):
+            out = futures[fut]
+            try:
+                elapsed, _nbytes, _ctype, dur = fut.result()
+            except urllib.error.URLError as e:
+                print(f"\nserver unreachable ({e}), aborting; re-run to resume", file=sys.stderr)
+                aborted = True
+                break
+            except RuntimeError as e:
+                print(f"\n{out.name}: {e}", file=sys.stderr)
+                failed += 1
+                continue
+            generated += 1
+            if dur is not None:
+                total_audio += dur
+    finally:
+        # On abort, drop queued-but-unstarted work so an unreachable server fails
+        # fast; in-flight requests finish. On success, wait for the pool normally.
+        pool.shutdown(wait=not aborted, cancel_futures=aborted)
+    if aborted:
+        failed += len(todo) - generated - failed
+
+    audio_info = f", {total_audio / 60:.1f} min of audio" if total_audio else ""
+    print(f"batch: {generated} generated, {failed} failed, {skipped_existing} skipped, "
+          f"{bad_rows} bad rows{audio_info}", file=sys.stderr)
+    return 1 if (failed or bad_rows) else 0
 
 
 def main() -> int:
@@ -392,9 +550,23 @@ def main() -> int:
     p.add_argument("-i", "--instruction", default=None,
                    help="Voice-direction prose (qwen3-tts VoiceDesign only; TADA ignores it). "
                         "Opt-in: not sent unless given.")
-    p.add_argument("-t", "--text", help="Text to read aloud.")
-    p.add_argument("-o", "--output", default="tts_out.wav",
-                   help="Output filename (default: tts_out.wav).")
+    p.add_argument("-t", "--text", help="Text to read aloud (single mode).")
+    p.add_argument("--batch", default=None, metavar="FILE.jsonl",
+                   help="Batch mode: synthesize every row of a JSONL file instead of "
+                        "a single --text. Each row needs an 'input' (or 'text') field; "
+                        "the output name comes from the row's 'output' field, else "
+                        "'<id>.<format>', else a zero-padded line number. All the "
+                        "voice/speed/sampling flags apply to every row.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Batch mode: regenerate rows whose output file already exists "
+                        "(default: skip them, so a killed run resumes on re-run).")
+    p.add_argument("--concurrency", type=int, default=4,
+                   help="Batch mode: requests in flight at once (default: 4). A "
+                        "vLLM/Voxtral server batches concurrent requests server-side "
+                        "(big speedup); use 1 for the single-context TADA/crispasr backend.")
+    p.add_argument("-o", "--output", default=None,
+                   help="Single mode: output audio file (default: tts_out.wav). "
+                        "Batch mode: output DIRECTORY (default: tts_batch/).")
     p.add_argument("--format", default="wav",
                    choices=("wav", "pcm", "f32", "flac", "mp3", "aac", "opus"),
                    help="Audio response format (default: wav). CrispASR accepts "
@@ -491,41 +663,19 @@ def main() -> int:
         if args.voice:
             p.error("--voice and --voice-name are mutually exclusive")
         args.voice = ensure_baked_voice(args.voice_name, args.voice_language, args.force_bake)
-        if not args.text:
+        if not args.text and not args.batch:
             # Bake-only: emit the resolved container voice path on stdout.
             print(args.voice)
             return 0
 
+    if args.batch:
+        return cmd_batch(base_url, Path(args.batch), args)
+
     if not args.text:
-        p.error("--text is required unless --check or --voice-name is given")
+        p.error("--text is required unless --check, --batch or --voice-name is given")
 
-    body = build_speech_body(
-        text=args.text,
-        response_format=args.format,
-        speed=args.speed,
-        model=args.model,
-        instruction=args.instruction,
-        voice=args.voice,
-        seed=args.seed,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        repetition_penalty=args.repetition_penalty,
-        do_sample=args.do_sample,
-        num_candidates=args.num_candidates,
-        num_steps=args.num_steps,
-        cfg_scale=args.cfg_scale,
-        noise_temp=args.noise_temp,
-        consent_attestation=args.consent_attestation,
-        spoken_disclaimer=args.spoken_disclaimer,
-    )
-
-    return cmd_synth(
-        base_url=base_url,
-        body=body,
-        out=Path(args.output),
-        timeout=args.timeout,
-    )
+    return cmd_synth(base_url, _body_from_args(args.text, args),
+                     Path(args.output or "tts_out.wav"), args.timeout)
 
 
 if __name__ == "__main__":
