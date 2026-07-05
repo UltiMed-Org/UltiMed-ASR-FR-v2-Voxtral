@@ -137,10 +137,9 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
   **two-stage** pipeline: `audio_generation` (stage 0, the AR LLM, the ~0.8 GPU-memory
   hog, greedy at temp 0.0) then `audio_tokenizer` (stage 1, the acoustic decoder). At
   boot `entrypoint.sh` copies the packaged `voxtral_tts.yaml` and patches it per stage
-  with pyyaml:
-  - `VLLM_GPU_MEM_UTIL` -> stage-0 `gpu_memory_utilization` **only** (stage 1's small 0.1
-    is left alone; the earlier blunt global `sed` wrongly inflated it). Lower to share the
-    card with crispasr.
+  with pyyaml (both stages keep the packaged `gpu_memory_utilization`, stage 0's ~0.8
+  and stage 1's 0.1; there is no env override for it, so give Voxtral its own card or
+  pass `--gpu-memory-utilization` via `VLLM_EXTRA_ARGS` if you must share):
   - `VOXTRAL_ACOUSTIC_TEMP` -> stage-1 sampling temperature. Entrypoint default **0.7**
     (lowered from upstream 0.9 for steadier, less artifacty audio; raise toward 0.9 for
     more expressive/varied output). This is the main audio-quality lever.

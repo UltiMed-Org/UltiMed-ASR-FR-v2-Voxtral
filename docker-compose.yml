@@ -118,10 +118,6 @@ services:
       # copied stage-config YAML, the last two toggle/append serve flags. Changing
       # any value needs no rebuild, just `up -d`. See the Voxtral TTS section in
       # CLAUDE.md for the two-stage explanation.
-      # Shrink GPU memory use when sharing the card with crispasr/crispasr-tts
-      # (install.sh used 0.35). Only affects the AR stage (the ~0.8 hog); leave
-      # unset to keep the packaged default (0.8):
-      # - VLLM_GPU_MEM_UTIL=0.35
       # Acoustic-decoder sampling temperature (entrypoint default is 0.7, lowered
       # from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
@@ -129,8 +125,8 @@ services:
       # - VOXTRAL_SEED=42
       # Eager mode (default 1 = on, --enforce-eager: less VRAM, faster start, a bit
       # slower). Set 0 to let the AR stage capture CUDA graphs (faster generation,
-      # more VRAM + a first-boot capture delay). If it OOMs after enabling, lower
-      # VLLM_GPU_MEM_UTIL above to leave headroom for the captured graph buffers:
+      # more VRAM + a first-boot capture delay). If it OOMs after enabling, set
+      # this back to 1:
       # - VOXTRAL_ENFORCE_EAGER=1
       - VOXTRAL_ENFORCE_EAGER=0
       # Extra vllm-omni serve flags, space-separated (opt-in; do not quote-wrap):

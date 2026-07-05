@@ -23,9 +23,6 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 
 # Patch precisely per stage with pyyaml (ships with vllm-omni, which loads these
 # same YAMLs). Only the knobs an env var asks for are touched:
-#   VLLM_GPU_MEM_UTIL     -> stage-0 gpu_memory_utilization ONLY (leave stage 1's
-#                            small 0.1 reservation alone; a blunt global replace
-#                            would wrongly inflate it).
 #   VOXTRAL_ACOUSTIC_TEMP -> stage-1 sampling temperature. Default 0.7 (lowered
 #                            from upstream 0.9 for steadier, less artifacty audio;
 #                            raise toward 0.9 for more expressive/varied output).
@@ -39,7 +36,6 @@ src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
     cfg = yaml.safe_load(f)
 
-gpu = os.environ.get("VLLM_GPU_MEM_UTIL")
 temp = os.environ.get("VOXTRAL_ACOUSTIC_TEMP")  # always set (default injected above)
 seed = os.environ.get("VOXTRAL_SEED")
 
@@ -48,8 +44,6 @@ for stage in cfg.get("stage_args", []):
     model_stage = engine_args.get("model_stage")
     sampling = stage.setdefault("default_sampling_params", {})
 
-    if model_stage == "audio_generation" and gpu:
-        engine_args["gpu_memory_utilization"] = float(gpu)
     if model_stage == "audio_tokenizer" and temp:
         sampling["temperature"] = float(temp)
     if seed:
@@ -59,8 +53,8 @@ with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
-    "voxtral entrypoint: patched stage config -> %s (gpu=%s acoustic_temp=%s seed=%s)\n"
-    % (dst, gpu or "default", temp, seed or "default")
+    "voxtral entrypoint: patched stage config -> %s (acoustic_temp=%s seed=%s)\n"
+    % (dst, temp, seed or "default")
 )
 PY
 
