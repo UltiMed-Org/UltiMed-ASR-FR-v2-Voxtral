@@ -71,7 +71,7 @@ PY
 # cost of more VRAM + a first-boot capture delay; stage 1 stays eager).
 EAGER_FLAG="--enforce-eager"
 case "${VOXTRAL_ENFORCE_EAGER:-1}" in
-  0 | false | False | no | off) EAGER_FLAG="" ;;
+  0 | false | False | no | off) EAGER_FLAG="--no-enforce-eager" ;;
 esac
 
 # VLLM_EXTRA_ARGS is an opt-in escape hatch for further flags. Both it and
