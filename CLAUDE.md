@@ -161,8 +161,10 @@ that older hand-run recipe.)
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
   schema, statically validated (the YAML patcher runs against the real v0.22.0 deploy
   config) but not yet run end-to-end in Docker; the first `--build` + smoke call is the
-  real check. The prebuilt image ships no standalone flash-attn, so stage 1 may still log
-  the SDPA-fallback warning (see the Dockerfile note to re-add a matching wheel).
+  real check. The prebuilt image ships no standalone flash-attn; the Dockerfile re-adds it
+  from a prebuilt wheel (the torch2.10 cu13 one, ABI-compatible with the image's torch2.11
+  and verified in-image, since no torch2.11 wheel exists yet) so stage 1 uses flash-attn
+  instead of the SDPA fallback.
 
 ## Layout notes
 

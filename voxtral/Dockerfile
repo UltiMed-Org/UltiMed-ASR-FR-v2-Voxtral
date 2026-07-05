@@ -19,13 +19,20 @@ ARG APP_GID=1000
 RUN groupadd -g "${APP_GID}" voxtral 2>/dev/null || true \
  && useradd -u "${APP_UID}" -g "${APP_GID}" -M -d /cache -s /usr/sbin/nologin voxtral 2>/dev/null || true
 
+# The prebuilt image does NOT ship the standalone flash-attn package, so without
+# this the stage-1 acoustic decoder logs "flash_attn is not installed. Falling
+# back to PyTorch SDPA". Restore it with a matching prebuilt wheel (no slow source
+# build). This image is cp312 / cu13 / cxx11abi TRUE with torch 2.11.0; flash-attn
+# has no torch2.11 wheel yet (2.8.3.post1 tops out at torch2.9, 2.8.1 at torch2.10),
+# but the torch2.10 cu13 wheel is ABI-compatible here (only the torch minor differs;
+# Python/CUDA-major/ABI all match) and was verified in-image: install + import + a
+# GPU flash_attn_func forward pass all pass with finite output. Bump to a real
+# torch2.11 wheel once Dao-AILab ships one. %2B is the URL-encoded '+' in the tag.
+RUN pip install --no-cache-dir \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+
 # The entrypoint copies the bundled voxtral_tts deploy config, patches the tuning
 # knobs into it, and runs `vllm serve MODEL --omni --deploy-config <patched>`.
-# NOTE: the prebuilt image does NOT ship the standalone flash-attn package, so the
-# stage-1 acoustic decoder may still log "flash_attn is not installed. Falling
-# back to PyTorch SDPA". To restore it, add a prebuilt-wheel install matching this
-# image's torch/CUDA/Python/ABI (read them from the image; see git history for the
-# 0.18 wheel line). Left out here to keep the upgrade minimal.
 COPY entrypoint.sh /usr/local/bin/voxtral-tts-entrypoint.sh
 RUN chmod +x /usr/local/bin/voxtral-tts-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/voxtral-tts-entrypoint.sh"]
