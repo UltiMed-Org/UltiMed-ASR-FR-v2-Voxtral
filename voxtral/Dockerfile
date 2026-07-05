@@ -12,6 +12,16 @@ FROM vllm/vllm-openai:v0.18.1
 # prebuilt image, so install the exact version install.sh used.
 RUN pip install --no-cache-dir vllm-omni==0.18.0
 
+# Without flash-attn the stage-1 audio_tokenizer (acoustic decoder) logs
+# "flash_attn is not installed. Falling back to PyTorch SDPA ..." and runs its
+# attention on the slower SDPA path. Build it against the torch already in the
+# base image (--no-build-isolation); if no matching prebuilt wheel exists this
+# compiles from source and the build gets slow. The version is pinned so the
+# wheel matches the base image's torch/CUDA; bump it if the base tag changes.
+# TODO: confirm 2.7.4 has a prebuilt wheel for vllm/vllm-openai:v0.18.1's torch;
+# if the build stalls compiling from source, pin to whatever wheel matches.
+RUN pip install --no-cache-dir --no-build-isolation flash-attn==2.7.4.post1
+
 # compose runs this container as a non-root uid (default 1000) so ./cache stays
 # host-owned, but the base image has no /etc/passwd entry for that uid. vLLM
 # startup calls getpass.getuser() -> pwd.getpwuid(), which then dies with
