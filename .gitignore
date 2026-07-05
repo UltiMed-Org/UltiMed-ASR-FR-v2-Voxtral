@@ -101,5 +101,6 @@ original_repo_for_quantization/
 **/*.mp3
 **/*.wav
 .serena
+.tokensave
 CrispASR_source
 voices
