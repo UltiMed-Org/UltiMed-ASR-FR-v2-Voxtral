@@ -47,15 +47,17 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    # Resource limits - all tunable via environment variables with sensible defaults.
-    # CPU limits are expressed as number of cores (float), memory as Docker size strings (e.g. 8G).
+    # Resource caps. The cpus/memory limits below are commented out so the
+    # container can use all host cores/RAM (faster bulk ASR/TTS dataset runs);
+    # uncomment and tune to cap it again. GPU access is granted separately via
+    # the reservations.devices block, which stays active.
     deploy:
       resources:
-        limits:
-          # Hard cap on CPU cores the container may consume
-          cpus: 2
-          # Hard cap on RAM
-          memory: 8G
+        # limits:
+        #   # Hard cap on CPU cores the container may consume
+        #   cpus: 2
+        #   # Hard cap on RAM
+        #   memory: 8G
         reservations:
           # Minimum CPU cores guaranteed to the container
           # cpus: 1
@@ -267,9 +269,9 @@ services:
       start_period: 30s
     deploy:
       resources:
-        limits:
-          cpus: 2
-          memory: 8G
+        # limits:
+        #   cpus: 2
+        #   memory: 8G
         reservations:
           devices:
             - driver: nvidia
