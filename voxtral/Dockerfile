@@ -14,13 +14,19 @@ RUN pip install --no-cache-dir vllm-omni==0.18.0
 
 # Without flash-attn the stage-1 audio_tokenizer (acoustic decoder) logs
 # "flash_attn is not installed. Falling back to PyTorch SDPA ..." and runs its
-# attention on the slower SDPA path. Build it against the torch already in the
-# base image (--no-build-isolation); if no matching prebuilt wheel exists this
-# compiles from source and the build gets slow. The version is pinned so the
-# wheel matches the base image's torch/CUDA; bump it if the base tag changes.
-# TODO: confirm 2.7.4 has a prebuilt wheel for vllm/vllm-openai:v0.18.1's torch;
-# if the build stalls compiling from source, pin to whatever wheel matches.
-RUN pip install --no-cache-dir --no-build-isolation flash-attn==2.7.4.post1
+# attention on the slower SDPA path. Install a PREBUILT wheel (~7s) rather than
+# `pip install flash-attn` (which compiles from source for many minutes). The
+# wheel must match the base image's Python / torch / CUDA / C++ABI: for
+# vllm/vllm-openai:v0.18.1 that is cp312 / torch2.10 / cu12 / cxx11abi=TRUE, so
+# we use flash-attn 2.8.1, the newest release carrying a torch2.10 wheel (2.8.3
+# tops out at torch2.9). If the base image is bumped, read the new quadruple:
+#   docker run --rm --entrypoint bash <img> -lc 'python3 -c "import sys, torch; \
+#     print(sys.version_info[:2], torch.__version__, torch.version.cuda, \
+#     torch._C._GLIBCXX_USE_CXX11_ABI)"'
+# then pick the matching asset from github.com/Dao-AILab/flash-attention/releases
+# (%2B is the URL-encoded + in the wheel's local-version tag).
+RUN pip install --no-cache-dir \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # compose runs this container as a non-root uid (default 1000) so ./cache stays
 # host-owned, but the base image has no /etc/passwd entry for that uid. vLLM
