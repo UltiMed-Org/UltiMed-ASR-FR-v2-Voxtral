@@ -114,19 +114,28 @@ services:
       - XDG_CACHE_HOME=/cache
       # If the model repo is gated on Hugging Face, pass a token:
       # - HF_TOKEN=TODO
-      # entrypoint.sh reads the tuning vars below at boot; the first three patch the
-      # copied stage-config YAML, the last two toggle/append serve flags. Changing
-      # any value needs no rebuild, just `up -d`. See the Voxtral TTS section in
-      # CLAUDE.md for the two-stage explanation.
+      # entrypoint.sh reads the tuning vars below at boot and patches the copied
+      # stage-config YAML with them (VLLM_EXTRA_ARGS / VOXTRAL_ENFORCE_EAGER go to
+      # the serve command instead). Changing any value needs no rebuild, just
+      # `up -d`. See the Voxtral TTS section in CLAUDE.md for the two-stage story.
       # Acoustic-decoder sampling temperature (entrypoint default is 0.7, lowered
       # from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
       # Seed for both stages: fixed = reproducible; change for a different take:
       # - VOXTRAL_SEED=42
-      # Eager mode (default 1 = on, --enforce-eager: less VRAM, faster start, a bit
-      # slower). Set 0 to let the AR stage capture CUDA graphs (faster generation,
-      # more VRAM + a first-boot capture delay). If it OOMs after enabling, set
-      # this back to 1:
+      # BATCH THROUGHPUT. The packaged YAML pins runtime.defaults.max_inflight=1,
+      # so the pipeline handles ONE request at a time and a dataset run is capped
+      # no matter the client --concurrency. Raise it to let requests batch on the
+      # (already CUDA-graph'd) AR stage; start at 8, then try 16. Uses more VRAM
+      # and leans on the shm connector, so watch the logs for OOM:
+      # - VOXTRAL_MAX_INFLIGHT=8
+      # Per-stage max concurrent sequences (packaged 32); only raise past 32 if
+      # max_inflight goes above it:
+      # - VOXTRAL_MAX_NUM_SEQS=32
+      # Eager-mode serve flag. NOTE: the per-stage YAML already sets stage 0 (AR
+      # generation) enforce_eager:false = CUDA-graph'd and stage 1 eager, and the
+      # serve flag does not reliably override per-stage engine_args, so this is
+      # largely a no-op on the stages; left at 0 (do not force global eager):
       # - VOXTRAL_ENFORCE_EAGER=1
       - VOXTRAL_ENFORCE_EAGER=0
       # Extra vllm-omni serve flags, space-separated (opt-in; do not quote-wrap):

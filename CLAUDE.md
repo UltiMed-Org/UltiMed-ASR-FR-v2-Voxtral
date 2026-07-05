@@ -145,10 +145,21 @@ runs `vllm-omni serve` the same way `install.sh` does by hand.
     more expressive/varied output). This is the main audio-quality lever.
   - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
     take). Not settable per request.
+  - `VOXTRAL_MAX_INFLIGHT` -> `runtime.defaults.max_inflight` (top-level YAML patch). The
+    packaged value is **1**, meaning the pipeline processes **one request at a time**, so
+    batch-dataset throughput is capped no matter the client `--concurrency` or
+    `max_num_seqs`. **This is the main batch-throughput lever:** raise it (try 8, then 16)
+    to let concurrent requests batch on stage 0 (which is already CUDA-graph'd:
+    `enforce_eager: false` in the YAML). Costs more VRAM and leans on the shared-memory
+    connector; watch the logs for OOM. Unset = packaged default (1).
+  - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `engine_args.max_num_seqs` (packaged **32**).
+    Only worth raising past 32 if `VOXTRAL_MAX_INFLIGHT` goes above it. Unset = 32.
   - `VOXTRAL_ENFORCE_EAGER` (serve-flag toggle, not a YAML patch) -> default **1** = pass
-    `--enforce-eager` (less VRAM, faster start, a bit slower steady-state). Set **0** to
-    drop the flag so the per-stage YAML governs: stage 0 captures CUDA graphs (faster
-    generation) at the cost of more VRAM plus a first-boot capture delay.
+    `--enforce-eager`. **Largely a no-op on the stages:** the per-stage YAML already sets
+    stage 0 `enforce_eager: false` (CUDA-graph'd) and stage 1 `true`, and the serve flag
+    does not reliably override per-stage `engine_args` (logs show stage 0 compiled and
+    stage 1 eager regardless). Left at **0**; don't force global eager (it would only slow
+    the AR stage). Real per-stage cudagraph control would need a YAML patch, not this flag.
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm-omni serve`
     flags). Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** ported faithfully from the hand-run `install.sh` but not yet verified

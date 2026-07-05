@@ -28,6 +28,14 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            raise toward 0.9 for more expressive/varied output).
 #   VOXTRAL_SEED          -> seed on BOTH stages (fixed = reproducible; change it
 #                            for a different rendition of the same text+voice).
+#   VOXTRAL_MAX_INFLIGHT  -> runtime.defaults.max_inflight. The packaged YAML pins
+#                            this to 1, so the pipeline processes ONE request at a
+#                            time and batch-dataset throughput is capped no matter
+#                            the client concurrency or max_num_seqs. Raise (try
+#                            8, then 16) to let concurrent requests batch on stage
+#                            0; costs more VRAM and leans on the shm connector.
+#   VOXTRAL_MAX_NUM_SEQS  -> both stages' engine_args.max_num_seqs (packaged 32).
+#                            Only worth raising past 32 if max_inflight goes above it.
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
 python3 - "$STAGE_YAML" "$TUNED_YAML" <<'PY'
 import os, sys, yaml
@@ -38,6 +46,8 @@ with open(src) as f:
 
 temp = os.environ.get("VOXTRAL_ACOUSTIC_TEMP")  # always set (default injected above)
 seed = os.environ.get("VOXTRAL_SEED")
+max_inflight = os.environ.get("VOXTRAL_MAX_INFLIGHT")
+max_num_seqs = os.environ.get("VOXTRAL_MAX_NUM_SEQS")
 
 for stage in cfg.get("stage_args", []):
     engine_args = stage.setdefault("engine_args", {})
@@ -48,13 +58,22 @@ for stage in cfg.get("stage_args", []):
         sampling["temperature"] = float(temp)
     if seed:
         sampling["seed"] = int(seed)
+    if max_num_seqs:
+        engine_args["max_num_seqs"] = int(max_num_seqs)
+
+# max_inflight lives at the top level, not per stage: the packaged value of 1
+# serializes the whole pipeline to one in-flight request, the real cap on batch
+# throughput. Only touch it when asked, preserving window_size/connectors.
+if max_inflight:
+    cfg.setdefault("runtime", {}).setdefault("defaults", {})["max_inflight"] = int(max_inflight)
 
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
-    "voxtral entrypoint: patched stage config -> %s (acoustic_temp=%s seed=%s)\n"
-    % (dst, temp, seed or "default")
+    "voxtral entrypoint: patched stage config -> %s "
+    "(acoustic_temp=%s seed=%s max_inflight=%s max_num_seqs=%s)\n"
+    % (dst, temp, seed or "default", max_inflight or "default", max_num_seqs or "default")
 )
 PY
 
