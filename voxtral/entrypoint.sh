@@ -22,27 +22,14 @@ set -euo pipefail
 MODEL="${VOXTRAL_TTS_MODEL:-mistralai/Voxtral-4B-TTS-2603}"
 PORT="${VOXTRAL_TTS_PORT:-8003}"
 
-# Locate the bundled deploy YAML inside vllm_omni and copy it so we can tune it
-# without mutating the read-only site-packages copy. Check both the 0.22 path
-# (deploy/) and the legacy 0.18 path so this survives a version bump either way.
-STAGE_YAML="$(python3 - <<'PY'
-import os, vllm_omni
-base = os.path.dirname(vllm_omni.__file__)
-for rel in ("deploy/voxtral_tts.yaml", "model_executor/stage_configs/voxtral_tts.yaml"):
-    p = os.path.join(base, rel)
-    if os.path.exists(p):
-        print(p)
-        break
-PY
-)"
-if [ -z "$STAGE_YAML" ]; then
-  echo "voxtral entrypoint: could not find voxtral_tts.yaml in vllm_omni" >&2
-  exit 1
-fi
 TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 
-# Patch precisely with pyyaml (ships with vllm-omni). Only the knobs an env var
-# asks for are touched:
+# Locate the bundled deploy YAML AND patch a copy of it in ONE python process, so
+# there is no `$(python3 ...)` capture to pollute. (Capturing the path separately
+# broke: `import vllm_omni` prints a monkey-patch WARNING to stdout, which got
+# concatenated onto the path.) Check both the 0.22 path (deploy/) and the legacy
+# 0.18 path so this survives a version bump. Only the knobs an env var asks for
+# are touched:
 #   VOXTRAL_ACOUSTIC_TEMP -> stage_id 1 sampling temperature. Default 0.7 (lowered
 #                            from upstream 0.9 for steadier, less artifacty audio;
 #                            raise toward 0.9 for more expressive/varied output).
@@ -52,10 +39,18 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            stage is codec-bs=1, so raising this past the ~4-8
 #                            concurrency saturation point buys little.
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
-python3 - "$STAGE_YAML" "$TUNED_YAML" <<'PY'
-import os, sys, yaml
+python3 - "$TUNED_YAML" <<'PY'
+import os, sys, vllm_omni, yaml
 
-src, dst = sys.argv[1], sys.argv[2]
+dst = sys.argv[1]
+base = os.path.dirname(vllm_omni.__file__)
+src = next((p for p in (
+    os.path.join(base, "deploy/voxtral_tts.yaml"),
+    os.path.join(base, "model_executor/stage_configs/voxtral_tts.yaml"),
+) if os.path.exists(p)), None)
+if src is None:
+    sys.exit("voxtral entrypoint: could not find voxtral_tts.yaml under %s" % base)
+
 with open(src) as f:
     cfg = yaml.safe_load(f)
 
@@ -77,9 +72,9 @@ with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
-    "voxtral entrypoint: patched deploy config -> %s "
+    "voxtral entrypoint: patched %s -> %s "
     "(acoustic_temp=%s seed=%s max_num_seqs=%s)\n"
-    % (dst, temp, seed or "default", max_num_seqs or "default")
+    % (src, dst, temp, seed or "default", max_num_seqs or "default")
 )
 PY
 
