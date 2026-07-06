@@ -134,7 +134,7 @@ services:
       # more compute; fewer = faster. vllm-omni reads this only from the model's
       # params.json (not this YAML), so entrypoint.sh patches it in. Unset =
       # vllm-omni default of 7 (raise toward 8-16 for quality, drop to 3-4 for speed):
-      # - VOXTRAL_EULER_STEPS=8
+      - VOXTRAL_EULER_STEPS=10
       # Stage-0 classifier-free guidance scale (default 1.2). Raise slightly for
       # tighter text adherence. NEVER set 1.0: it disables CFG and yields garbled/
       # off-text audio (entrypoint refuses that value):
