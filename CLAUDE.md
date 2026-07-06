@@ -156,6 +156,23 @@ that older hand-run recipe.)
     0.18 `runtime.defaults.max_inflight` lever no longer exists in the 0.22 schema, and
     `gpu_memory_utilization` has no env override, pass `--gpu-memory-utilization` via
     `VLLM_EXTRA_ARGS` if you must share the card.)
+  - `VOXTRAL_CFG_ALPHA` -> stage_id 0 classifier-free-guidance scale, patched into that
+    stage's `default_sampling_params.extra_args.cfg_alpha` (the same field vllm-omni reads
+    per-request cfg_alpha from). Deploy default **1.2**. Nudge up for tighter text
+    adherence. The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
+    decoder hallucinate phonetically-plausible-but-wrong audio (stops following the text).
+  - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the stage-1 flow-matching
+    acoustic decoder (`n_decoding_steps`): the primary compute<->quality lever (more steps =
+    steadier, higher-fidelity audio for more compute; CFG doubles each step's cost, so this
+    is the pricey one). Unlike the knobs above it is **not** a deploy-YAML field, env var, or
+    per-request param in vllm-omni: the value is read **only** from the model's `params.json`
+    at `multimodal.audio_model_args.acoustic_transformer_args.n_decoding_steps`, and this
+    model doesn't ship the key, so vllm-omni's mistral parser (`parsers/voxtral_tts.py`)
+    **warns and falls back to 7**. So `entrypoint.sh` does exactly what that warning asks:
+    when the var is set it `hf_hub_download`s just `params.json` (works on first boot before
+    the ~9GB weights land; uses `HF_TOKEN` if gated), injects `n_decoding_steps`, and
+    re-patches idempotently every boot (surviving HF restoring the file). Unset = the
+    vllm-omni default **7** (raise toward 8-16 for quality, drop to 3-4 for speed/latency).
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
     Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy

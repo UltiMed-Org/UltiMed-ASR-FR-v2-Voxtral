@@ -129,6 +129,16 @@ services:
       # raising this past that buys little. (The 0.18 runtime.defaults.max_inflight
       # lever no longer exists in the 0.22 schema.)
       # - VOXTRAL_MAX_NUM_SEQS=32
+      # Euler ODE steps for the stage-1 flow-matching acoustic decoder: the main
+      # compute<->quality lever. More steps = steadier/higher-fidelity audio for
+      # more compute; fewer = faster. vllm-omni reads this only from the model's
+      # params.json (not this YAML), so entrypoint.sh patches it in. Unset =
+      # vllm-omni default of 7 (raise toward 8-16 for quality, drop to 3-4 for speed):
+      # - VOXTRAL_EULER_STEPS=8
+      # Stage-0 classifier-free guidance scale (default 1.2). Raise slightly for
+      # tighter text adherence. NEVER set 1.0: it disables CFG and yields garbled/
+      # off-text audio (entrypoint refuses that value):
+      # - VOXTRAL_CFG_ALPHA=1.2
       # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap):
       # - VLLM_EXTRA_ARGS=--max-model-len 4096
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
