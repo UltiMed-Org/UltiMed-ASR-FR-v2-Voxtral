@@ -142,6 +142,7 @@ services:
       #   ~1.3-1.7   = stronger text adherence; may sound flatter/harsher.
       #   >~2.0      = over-guided, tends to introduce artifacts/distortion.
       # - VOXTRAL_CFG_ALPHA=1.2
+      - VOXTRAL_CFG_ALPHA=1.3
       # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap):
       # - VLLM_EXTRA_ARGS=--max-model-len 4096
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
