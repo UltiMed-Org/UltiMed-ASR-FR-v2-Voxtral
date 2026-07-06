@@ -143,6 +143,11 @@ services:
       #   >~2.0      = over-guided, tends to introduce artifacts/distortion.
       # - VOXTRAL_CFG_ALPHA=1.2
       - VOXTRAL_CFG_ALPHA=1.3
+      # Stage-0 GPU memory fraction (packaged 0.8). Stage 0 (0.8) + stage 1 (0.1)
+      # + CUDA contexts + desktop usage overflow a 24GB card shared with a display
+      # (stage 1 then fails with "Free memory ... less than desired GPU memory
+      # utilization"). Lower stage 0 to ~0.7 to make both stages fit:
+      - VOXTRAL_GPU_MEM_UTIL=0.7
       # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap):
       # - VLLM_EXTRA_ARGS=--max-model-len 4096
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.

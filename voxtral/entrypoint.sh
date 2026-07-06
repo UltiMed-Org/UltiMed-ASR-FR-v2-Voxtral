@@ -41,6 +41,9 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #   VOXTRAL_CFG_ALPHA     -> stage_id 0 classifier-free guidance scale (default
 #                            1.2). Nudge up for tighter text adherence; NEVER 1.0
 #                            (disables CFG -> garbled/off-text audio; refused).
+#   VOXTRAL_GPU_MEM_UTIL  -> stage_id 0 gpu_memory_utilization (packaged 0.8).
+#                            Lower it (e.g. 0.7) so stage 0 + stage 1's 0.1 fit on
+#                            a 24GB card shared with a desktop; unset = 0.8.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
 #  params.json, not this deploy YAML.)
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
@@ -62,6 +65,7 @@ with open(src) as f:
 temp = os.environ.get("VOXTRAL_ACOUSTIC_TEMP")  # always set (default injected above)
 seed = os.environ.get("VOXTRAL_SEED")
 max_num_seqs = os.environ.get("VOXTRAL_MAX_NUM_SEQS")
+gpu_mem_util = os.environ.get("VOXTRAL_GPU_MEM_UTIL")  # stage 0 GPU memory fraction
 cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # stage 0 classifier-free guidance
 # Guardrail: cfg_alpha=1.0 disables CFG, which makes the flow-matching decoder
 # hallucinate phonetically-plausible-but-wrong audio (it stops following the
@@ -86,15 +90,20 @@ for stage in cfg.get("stages", []):
     # where vllm-omni's voxtral model reads per-request cfg_alpha from too).
     if stage.get("stage_id") == 0 and cfg_alpha:
         sampling.setdefault("extra_args", {})["cfg_alpha"] = float(cfg_alpha)
+    # stage_id 0 grabs gpu_memory_utilization: 0.8 by default, which leaves too
+    # little for stage 1's 0.1 (+ CUDA-context + desktop usage) on a 24GB card
+    # shared with a display. Lower it (e.g. 0.7) to make the two stages fit.
+    if stage.get("stage_id") == 0 and gpu_mem_util:
+        stage["gpu_memory_utilization"] = float(gpu_mem_util)
 
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
     "voxtral entrypoint: patched %s -> %s "
-    "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s)\n"
+    "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s gpu_mem_util=%s)\n"
     % (src, dst, temp, seed or "default", max_num_seqs or "default",
-       cfg_alpha or "default")
+       cfg_alpha or "default", gpu_mem_util or "default")
 )
 PY
 

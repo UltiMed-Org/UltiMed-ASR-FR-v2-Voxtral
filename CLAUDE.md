@@ -153,9 +153,14 @@ that older hand-run recipe.)
   - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `max_num_seqs` (packaged **32**). Unset = 32.
     Note the acoustic stage is `codec-bs=1`, so per the maintainers audio throughput
     **saturates around client concurrency 4-8**; raising this past that buys little. (The
-    0.18 `runtime.defaults.max_inflight` lever no longer exists in the 0.22 schema, and
-    `gpu_memory_utilization` has no env override, pass `--gpu-memory-utilization` via
-    `VLLM_EXTRA_ARGS` if you must share the card.)
+    0.18 `runtime.defaults.max_inflight` lever no longer exists in the 0.22 schema.)
+  - `VOXTRAL_GPU_MEM_UTIL` -> stage_id 0's `gpu_memory_utilization`, patched into the YAML
+    (packaged **0.8**; unset = 0.8). Stage 0 (0.8) + stage 1 (0.1) + each engine's CUDA
+    context + any desktop GPU usage overflow a 24GB card shared with a display, and stage 1
+    then dies at boot with *"Free memory on device cuda:0 ... less than desired GPU memory
+    utilization"*. Lower stage 0 to ~**0.7** to make both stages fit (the AR LLM weights are
+    ~8GB, so you only give up unused KV-cache headroom). The packaged 0.8/0.1 split is tuned
+    for 80GB H100/H200 cards.
   - `VOXTRAL_CFG_ALPHA` -> stage_id 0 classifier-free-guidance scale, patched into that
     stage's `default_sampling_params.extra_args.cfg_alpha` (the same field vllm-omni reads
     per-request cfg_alpha from). Deploy default **1.2**. Nudge up for tighter text
