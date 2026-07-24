@@ -17,29 +17,40 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
-      # --- Active backend: parakeet ---
+      # --- Active backend: voxtral4b (local f16, speech->text / STT) ---
+      # Voxtral ASR served as an OpenAI-compatible /v1/audio/transcriptions
+      # endpoint on host :8002 (use asr.py, or any OpenAI transcription client).
+      # The realtime 4B GGUF needs the voxtral4b backend; plain "voxtral" is the
+      # smaller 2.5GB 3B variant (cstr/voxtral-mini-3b-2507). AUTO_DOWNLOAD=0 uses
+      # the local full-precision f16 file in CRISPASR_MODEL (~8.5GB, best quality,
+      # most VRAM) instead of downloading the registry model.
+      - CRISPASR_BACKEND=voxtral4b
+      - CRISPASR_MODEL=/models/voxtral-mini-4b-realtime.gguf
+      - CRISPASR_AUTO_DOWNLOAD=0
+      # --- Alternative: parakeet (comment out the voxtral4b block above first) ---
       # No local parakeet.gguf here, so AUTO_DOWNLOAD=1 makes the entrypoint pass
       # "-m auto" and fetch cstr/parakeet-tdt-0.6b-v3-GGUF (~467MB) on first run.
       # CRISPASR_MODEL is ignored while AUTO_DOWNLOAD=1.
-      - CRISPASR_BACKEND=parakeet
-      - CRISPASR_AUTO_DOWNLOAD=1
-      # --- Alternative: local voxtral 4B (uncomment both, and set AUTO_DOWNLOAD=0) ---
-      # The 4B GGUF needs the voxtral4b backend; plain "voxtral" is the smaller
-      # 2.5GB standard variant. With AUTO_DOWNLOAD=0 the entrypoint uses the local
-      # file in CRISPASR_MODEL instead of downloading the registry model.
-      # - CRISPASR_BACKEND=voxtral4b
-      # - CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
+      # - CRISPASR_BACKEND=parakeet
+      # - CRISPASR_AUTO_DOWNLOAD=1
+      # --- Alternative voxtral variants (swap the MODEL / BACKEND lines above) ---
+      #   voxtral4b local q2_K (smallest, ~1.4GB, lowest quality):
+      #     CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
+      #   voxtral 3B q4_k (already in ./cache, ~2.5GB): set BACKEND=voxtral and
+      #     AUTO_DOWNLOAD=1 (registry cstr/voxtral-mini-3b-2507-GGUF).
       - CRISPASR_LANGUAGE=auto
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
-      # Pyannote diarization: https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization
+      # Plain transcription only (no diarization). To diarize, append to EXTRA_ARGS:
+      #   --diarize --diarize-method pyannote --sherpa-segment-model auto
+      # (https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization)
       # No surrounding quotes: the entrypoint runs eval "args+=($CRISPASR_EXTRA_ARGS)",
       # so quotes collapse the whole string into one argument (that broke startup).
-      - CRISPASR_EXTRA_ARGS=--verbose --diarize --diarize-method pyannote --sherpa-segment-model auto
+      - CRISPASR_EXTRA_ARGS=--verbose
       - CRISPASR_DIAGNOSTICS=0
-      # KV-cache quant is transformer-only (voxtral); parakeet is CTC/TDT with no
-      # KV cache, so these are no-ops here. Re-enable when switching to voxtral.
-      # - CRISPASR_KV_QUANT_V=q8_0
-      # - CRISPASR_KV_QUANT_K=q8_0
+      # KV-cache quant is transformer-only, and voxtral4b is a transformer LLM
+      # backend, so these now apply (they were no-ops under parakeet's CTC/TDT).
+      - CRISPASR_KV_QUANT_V=q8_0
+      - CRISPASR_KV_QUANT_K=q8_0
       - CRISPASR_GGUF_PRELOAD=1
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
