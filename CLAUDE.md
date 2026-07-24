@@ -13,11 +13,11 @@ Two moving parts:
 
 1. **`docker-compose.yml`** runs two containers from the prebuilt image
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
-   - `crispasr` (ASR) on host **:8002**, active backend `whisper` (registry default
-     `ggml-base.bin`, multilingual base, `AUTO_DOWNLOAD=1`, transcribe-only, `-fa`
-     flash-attn) as a fast speed baseline. The compose comments mark ACTIVE vs ALT
-     and keep `parakeet` (quality: Q8_0 + MAES) and `voxtral4b` as alternatives.
-     Protected by `CRISPASR_API_KEYS`.
+   - `crispasr` (ASR) on host **:8002**, active backend `whisper`
+     (`ggml-large-v3-turbo.bin`, pinned via `--hf-repo`, multilingual, `-fa`
+     flash-attn, transcribe-only). The compose comments mark ACTIVE vs ALT and keep
+     lighter whisper models (`base`/`small`), `parakeet` (quality: Q8_0 + MAES), and
+     `voxtral4b` as alternatives. Protected by `CRISPASR_API_KEYS`.
    - `crispasr-tts` (TTS) on host **:8003** — active backend switches often as models
      get tested (the compose comments mark ACTIVE vs ALT; currently
      `qwen3-tts-1.7b-voicedesign`, local GGUFs, French output). No API key.
