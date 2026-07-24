@@ -17,24 +17,27 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
-      # --- Active backend: parakeet (good-quality config, speech->text / STT) ---
-      # Parakeet-TDT-0.6b-v3 ASR served as an OpenAI-compatible
-      # /v1/audio/transcriptions endpoint on host :8002 (use asr.py, or any OpenAI
-      # transcription client). AUTO_DOWNLOAD=1 fetches from the registry
-      # (cstr/parakeet-tdt-0.6b-v3-GGUF); CRISPASR_MODEL is ignored while it's on.
-      # Quality is pushed above the ~467MB Q4_K default two ways, both in EXTRA_ARGS
-      # below: --model-quant q8_0 pulls the higher-fidelity Q8_0 weights (near-
-      # lossless for a 0.6B model), and --parakeet-decoder maes --beam-size 4 swaps
-      # greedy TDT decoding for MAES beam search (the main accuracy lever).
-      - CRISPASR_BACKEND=parakeet
+      # --- Active backend: whisper (speed baseline, speech->text / STT) ---
+      # whisper.cpp served as an OpenAI-compatible /v1/audio/transcriptions endpoint
+      # on host :8002 (use asr.py, or any OpenAI transcription client).
+      # AUTO_DOWNLOAD=1 fetches the registry default ggml-base.bin (MULTILINGUAL
+      # base, ~147MB: the docs TABLE lists base.en, but the registry code actually
+      # ships the multilingual base, so French works). It is whisper's fastest tier,
+      # i.e. a good raw-speed reference. CRISPASR_MODEL is ignored while it's on.
+      - CRISPASR_BACKEND=whisper
       - CRISPASR_AUTO_DOWNLOAD=1
-      # --- Alternative: voxtral4b local f16 STT (comment out parakeet above first) ---
-      # The realtime 4B GGUF needs the voxtral4b backend; plain "voxtral" is the
-      # smaller 2.5GB 3B variant (cstr/voxtral-mini-3b-2507). AUTO_DOWNLOAD=0 uses
-      # the local full-precision f16 file in CRISPASR_MODEL (~8.5GB, best quality,
-      # most VRAM); the local q2_K (~1.4GB, /models/voxtral_4b_q2_K.gguf) and the
-      # 3B q4_k in ./cache (set BACKEND=voxtral, AUTO_DOWNLOAD=1) are cheaper swaps.
-      # NOTE: voxtral4b is a transformer LLM, so re-enable the KV_QUANT knobs below.
+      # Want a bigger/better (slower) whisper? Fetch a specific ggml model by adding
+      # it to EXTRA_ARGS below, e.g.:
+      #   --hf-repo ggerganov/whisper.cpp:ggml-large-v3-turbo.bin  (fast, near-large
+      #     quality, multilingual, ~1.6GB), or  :ggml-small.bin  (~500MB, balanced).
+      # --- Alternative: parakeet (quality; comment out whisper above first) ------
+      # Parakeet-TDT-0.6b-v3 tuned for quality: Q8_0 weights + MAES beam search.
+      # - CRISPASR_BACKEND=parakeet
+      # - CRISPASR_AUTO_DOWNLOAD=1
+      #   with EXTRA_ARGS: --verbose --model-quant q8_0 --parakeet-decoder maes --beam-size 4
+      # --- Alternative: voxtral4b local f16 STT ---------------------------------
+      # Realtime 4B transformer LLM; AUTO_DOWNLOAD=0 uses the local f16 file (~8.5GB,
+      # best quality, most VRAM). Re-enable the KV_QUANT knobs below when using it.
       # - CRISPASR_BACKEND=voxtral4b
       # - CRISPASR_MODEL=/models/voxtral-mini-4b-realtime.gguf
       # - CRISPASR_AUTO_DOWNLOAD=0
@@ -45,19 +48,20 @@ services:
       # (https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization)
       # No surrounding quotes: the entrypoint runs eval "args+=($CRISPASR_EXTRA_ARGS)",
       # so quotes collapse the whole string into one argument (that broke startup).
-      # For MAX SPEED over max quality: drop the --parakeet-decoder/--beam-size flags
-      # (fall back to greedy) and/or lower --model-quant to q4_k. Parakeet is a tiny
-      # CTC/TDT model, already well faster than real time. MAES search tuning
-      # (defaults are fine) lives in CRISPASR_MAES_NUM_STEPS / _GAMMA / _BETA.
-      - CRISPASR_EXTRA_ARGS=--verbose --model-quant q8_0 --parakeet-decoder maes --beam-size 4
+      # Whisper speed levers: -fa forces flash-attn (CUDA speed win, on below); -p N
+      # runs N parallel decoder states (whisper-ONLY, whisper_full_parallel) for a
+      # within-request long-audio speedup at higher RAM; -t N sets CPU threads
+      # (minor on GPU). NOTE: -p is intra-request only; the server itself is still
+      # single-model and mutex-serialized (no cross-request batching, any backend).
+      - CRISPASR_EXTRA_ARGS=--verbose -fa
       - CRISPASR_DIAGNOSTICS=0
-      # KV-cache quant is transformer-only; parakeet is CTC/TDT with no KV cache, so
-      # these are no-ops here (re-enable them for an LLM backend like voxtral4b):
+      # The whisper path does NOT honor CRISPASR_KV_QUANT (it uses whisper.cpp's own
+      # KV handling; --type-k / --type-v are the CLI knobs there). These apply to the
+      # LLM backends (voxtral4b etc.), so they stay commented for whisper:
       # - CRISPASR_KV_QUANT_V=q8_0
       # - CRISPASR_KV_QUANT_K=q8_0
-      # GGUF_PRELOAD=1: page-walk the mmap'd weights at load so the FIRST request
-      # doesn't eat the page-fault tax (GGUF_MMAP is default-on, zero-copy load).
-      # Warmup transcribe is on by default too, so the first real request is fast;
+      # GGUF_PRELOAD warms the mmap'd weights at load (mainly a gguf-backend lever;
+      # harmless for whisper's ggml .bin). Warmup transcribe is on by default too;
       # set NO_WARMUP=1 only if a GPU driver hangs in warmup (CrispASR #165):
       # - CRISPASR_NO_WARMUP=1
       - CRISPASR_GGUF_PRELOAD=1
