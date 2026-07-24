@@ -1,14 +1,15 @@
 services:
   crispasr:
-    container_name: crispasr
+    # No container_name / host ports: this service is REPLICATED (deploy.replicas
+    # below) and fronted by the crispasr-lb Caddy load balancer, which owns host
+    # :8002 and least_conn-balances across the replicas. The replicas are reached
+    # internally as crispasr:8080 over the compose network (never published).
     # image: ${CRISPASR_IMAGE:-crispasr-local:main}
     image: ghcr.io/crispstrobe/crispasr:main-cuda
     # build:
     #   context: .
     #   # dockerfile: .devops/main.Dockerfile
     #   dockerfile: .devops/main-cuda.Dockerfile
-    ports:
-      - "8002:8080"
     user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"
     security_opt:
       - no-new-privileges:true
@@ -75,6 +76,13 @@ services:
     # uncomment and tune to cap it again. GPU access is granted separately via
     # the reservations.devices block, which stays active.
     deploy:
+      # Run N identical replicas that share the GPU (whisper turbo is ~3GB VRAM
+      # each, so 4 fits with lots of room on a 24GB card). The crispasr-lb service
+      # least_conn-balances across them. Override live without editing this file:
+      #   sudo docker compose up -d --scale crispasr=N crispasr-lb
+      # NOTE: single-GPU scaling is sublinear (replicas time-slice the same SMs),
+      # but whisper underutilizes the GPU per request, so 2-4 lifts real throughput.
+      replicas: 4
       resources:
         # limits:
         #   # Hard cap on CPU cores the container may consume
@@ -96,6 +104,24 @@ services:
     pull_policy: always
     labels:
       - "com.centurylinklabs.watchtower.scope=autoupdate"
+
+  # Load balancer for the replicated `crispasr` service above. Owns host :8002
+  # (the ASR endpoint clients hit) and reverse-proxies to crispasr:8080. Caddy
+  # discovers all replica IPs from Docker's embedded DNS (dynamic upstreams) and
+  # refreshes as you scale, so `--scale crispasr=N` needs no change here. Policy
+  # is least_conn (not round-robin) because each CrispASR instance serializes one
+  # request at a time. Config + rationale live in ./Caddyfile.
+  # Start it alongside the ASR service: sudo docker compose up -d crispasr crispasr-lb
+  crispasr-lb:
+    container_name: crispasr-lb
+    image: caddy:2-alpine
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - crispasr
+    restart: unless-stopped
 
   # Voxtral TTS (text->audio) via vLLM, NOT CrispASR. Model:
   # mistralai/Voxtral-4B-TTS-2603, served by vllm-omni. This is a separate

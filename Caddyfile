@@ -1,0 +1,49 @@
+# CrispASR ASR load balancer (fronts the replicated `crispasr` compose service).
+#
+# Host :8002 -> N crispasr replicas on :8080. Clients (asr.py, any OpenAI
+# transcription client) keep hitting :8002 exactly as before; they never see the
+# replicas. Managed by the `crispasr-lb` service in docker-compose.yml.
+#
+# Why least_conn (not plain round-robin): each CrispASR instance is single-model
+# and mutex-serialized (one request in flight at a time), so we route each request
+# to the least-busy replica instead of blindly rotating. Generated with help from
+# Claude Code.
+
+{
+	admin off
+	auto_https off
+}
+
+:8002 {
+	log {
+		output stdout
+		format console
+	}
+
+	reverse_proxy {
+		# Discover all crispasr replica IPs via Docker's embedded DNS
+		# (127.0.0.11) and refresh every 10s, so scaling the crispasr service
+		# (`docker compose up -d --scale crispasr=N crispasr-lb`) needs no
+		# change here.
+		dynamic a {
+			name crispasr
+			port 8080
+			refresh 10s
+			resolvers 127.0.0.11
+		}
+
+		# One request per instance (see header) -> prefer the least-busy replica.
+		lb_policy least_conn
+
+		# If the chosen replica is still loading its model or briefly down, keep
+		# trying other replicas for up to 10s instead of failing the client.
+		lb_try_duration 10s
+		lb_try_interval 250ms
+
+		# Passive health: bench a replica for 30s after a failed request. Active
+		# /health checks are intentionally not used: they don't apply to dynamic
+		# upstreams in Caddy, so passive + retries covers the model-load startup
+		# window (a replica that 502s while warming is skipped, then re-added).
+		fail_duration 30s
+	}
+}

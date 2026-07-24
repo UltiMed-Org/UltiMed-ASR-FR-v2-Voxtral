@@ -13,11 +13,19 @@ Two moving parts:
 
 1. **`docker-compose.yml`** runs two containers from the prebuilt image
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
-   - `crispasr` (ASR) on host **:8002**, active backend `whisper`
-     (`ggml-large-v3-turbo.bin`, pinned via `--hf-repo`, multilingual, `-fa`
-     flash-attn, transcribe-only). The compose comments mark ACTIVE vs ALT and keep
-     lighter whisper models (`base`/`small`), `parakeet` (quality: Q8_0 + MAES), and
-     `voxtral4b` as alternatives. Protected by `CRISPASR_API_KEYS`.
+   - `crispasr` (ASR), active backend `whisper` (`ggml-large-v3-turbo.bin`, pinned
+     via `--hf-repo`, multilingual, `-fa` flash-attn, transcribe-only). The compose
+     comments mark ACTIVE vs ALT and keep lighter whisper models (`base`/`small`),
+     `parakeet` (quality: Q8_0 + MAES), and `voxtral4b` as alternatives. Protected by
+     `CRISPASR_API_KEYS`. This service is **replicated** (`deploy.replicas: 4`, no
+     `container_name`/host ports) and fronted by `crispasr-lb`, a small `caddy:2-alpine`
+     load balancer that owns host **:8002** and `least_conn`-balances across the
+     replicas (they underutilize the GPU per request, so replicas lift throughput;
+     each is still mutex-serialized, one request at a time). Scale live with
+     `docker compose up -d --scale crispasr=N crispasr-lb`; config in `./Caddyfile`.
+   - `crispasr-lb` (`caddy:2-alpine`) on host **:8002**: the ASR load balancer above.
+     Clients (`asr.py`, any OpenAI client) hit :8002 unchanged; it discovers the
+     `crispasr` replicas via Docker DNS (`dynamic a`, so `--scale` needs no LB edit).
    - `crispasr-tts` (TTS) on host **:8003** — active backend switches often as models
      get tested (the compose comments mark ACTIVE vs ALT; currently
      `qwen3-tts-1.7b-voicedesign`, local GGUFs, French output). No API key.
@@ -31,9 +39,10 @@ Two moving parts:
 
 ```bash
 # Bring up / restart a service after editing compose:
-sudo docker compose up -d crispasr        # ASR
-sudo docker compose up -d crispasr-tts    # TTS
-sudo docker compose logs -f crispasr-tts  # follow logs (backends log verbosely)
+sudo docker compose up -d crispasr crispasr-lb   # ASR (4 replicas) + its load balancer
+sudo docker compose up -d --scale crispasr=6 crispasr-lb  # rescale ASR replicas live
+sudo docker compose up -d crispasr-tts           # TTS
+sudo docker compose logs -f crispasr-tts         # follow logs (backends log verbosely)
 
 # Confirm a server is alive and the model actually loads (health + a real smoke call):
 ./tts.py --check
@@ -202,7 +211,7 @@ that older hand-run recipe.)
   (auto-downloaded models land here). `voices/` is a symlink to the reference-clip source.
 - Model/audio binaries are gitignored (`**/*.gguf`, `**/*.mp3`, `**/*.wav`, the `models_*`
   dirs, `cache`, `CrispASR_source`, `voices`), so the tracked repo is just compose + the
-  scripts + `utils/` + `voxtral/`.
+  scripts + `Caddyfile` (the `crispasr-lb` ASR load-balancer config) + `utils/` + `voxtral/`.
 - `voxtral/` holds the Voxtral TTS experiment (serving Voxtral TTS via **vLLM**, not
   CrispASR; see "Voxtral TTS" above): `Dockerfile` + `entrypoint.sh` back the `voxtral-tts`
   compose service, `install.sh` is the original hand-run recipe, and `env.reference` is a
