@@ -13,10 +13,11 @@ Two moving parts:
 
 1. **`docker-compose.yml`** runs two containers from the prebuilt image
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
-   - `crispasr` (ASR) on host **:8002**, active backend `voxtral4b` (local f16 GGUF
-     `voxtral-mini-4b-realtime.gguf`, `AUTO_DOWNLOAD=0`, transcribe-only). The compose
-     comments mark ACTIVE vs ALT and keep `parakeet` / other voxtral variants as
-     alternatives. Protected by `CRISPASR_API_KEYS`.
+   - `crispasr` (ASR) on host **:8002**, active backend `parakeet`
+     (`parakeet-tdt-0.6b-v3`, `AUTO_DOWNLOAD=1`, transcribe-only) tuned for quality:
+     `--model-quant q8_0` weights + MAES beam-search decoding (`--parakeet-decoder maes
+     --beam-size 4`). The compose comments mark ACTIVE vs ALT and keep `voxtral4b` /
+     other variants as alternatives. Protected by `CRISPASR_API_KEYS`.
    - `crispasr-tts` (TTS) on host **:8003** — active backend switches often as models
      get tested (the compose comments mark ACTIVE vs ALT; currently
      `qwen3-tts-1.7b-voicedesign`, local GGUFs, French output). No API key.

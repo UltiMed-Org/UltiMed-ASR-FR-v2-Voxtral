@@ -17,27 +17,27 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
-      # --- Active backend: voxtral4b (local f16, speech->text / STT) ---
-      # Voxtral ASR served as an OpenAI-compatible /v1/audio/transcriptions
-      # endpoint on host :8002 (use asr.py, or any OpenAI transcription client).
+      # --- Active backend: parakeet (good-quality config, speech->text / STT) ---
+      # Parakeet-TDT-0.6b-v3 ASR served as an OpenAI-compatible
+      # /v1/audio/transcriptions endpoint on host :8002 (use asr.py, or any OpenAI
+      # transcription client). AUTO_DOWNLOAD=1 fetches from the registry
+      # (cstr/parakeet-tdt-0.6b-v3-GGUF); CRISPASR_MODEL is ignored while it's on.
+      # Quality is pushed above the ~467MB Q4_K default two ways, both in EXTRA_ARGS
+      # below: --model-quant q8_0 pulls the higher-fidelity Q8_0 weights (near-
+      # lossless for a 0.6B model), and --parakeet-decoder maes --beam-size 4 swaps
+      # greedy TDT decoding for MAES beam search (the main accuracy lever).
+      - CRISPASR_BACKEND=parakeet
+      - CRISPASR_AUTO_DOWNLOAD=1
+      # --- Alternative: voxtral4b local f16 STT (comment out parakeet above first) ---
       # The realtime 4B GGUF needs the voxtral4b backend; plain "voxtral" is the
       # smaller 2.5GB 3B variant (cstr/voxtral-mini-3b-2507). AUTO_DOWNLOAD=0 uses
       # the local full-precision f16 file in CRISPASR_MODEL (~8.5GB, best quality,
-      # most VRAM) instead of downloading the registry model.
-      - CRISPASR_BACKEND=voxtral4b
-      - CRISPASR_MODEL=/models/voxtral-mini-4b-realtime.gguf
-      - CRISPASR_AUTO_DOWNLOAD=0
-      # --- Alternative: parakeet (comment out the voxtral4b block above first) ---
-      # No local parakeet.gguf here, so AUTO_DOWNLOAD=1 makes the entrypoint pass
-      # "-m auto" and fetch cstr/parakeet-tdt-0.6b-v3-GGUF (~467MB) on first run.
-      # CRISPASR_MODEL is ignored while AUTO_DOWNLOAD=1.
-      # - CRISPASR_BACKEND=parakeet
-      # - CRISPASR_AUTO_DOWNLOAD=1
-      # --- Alternative voxtral variants (swap the MODEL / BACKEND lines above) ---
-      #   voxtral4b local q2_K (smallest, ~1.4GB, lowest quality):
-      #     CRISPASR_MODEL=/models/voxtral_4b_q2_K.gguf
-      #   voxtral 3B q4_k (already in ./cache, ~2.5GB): set BACKEND=voxtral and
-      #     AUTO_DOWNLOAD=1 (registry cstr/voxtral-mini-3b-2507-GGUF).
+      # most VRAM); the local q2_K (~1.4GB, /models/voxtral_4b_q2_K.gguf) and the
+      # 3B q4_k in ./cache (set BACKEND=voxtral, AUTO_DOWNLOAD=1) are cheaper swaps.
+      # NOTE: voxtral4b is a transformer LLM, so re-enable the KV_QUANT knobs below.
+      # - CRISPASR_BACKEND=voxtral4b
+      # - CRISPASR_MODEL=/models/voxtral-mini-4b-realtime.gguf
+      # - CRISPASR_AUTO_DOWNLOAD=0
       - CRISPASR_LANGUAGE=auto
       - CRISPASR_API_KEYS=CHANGE_ME_set_your_own_key
       # Plain transcription only (no diarization). To diarize, append to EXTRA_ARGS:
@@ -45,37 +45,22 @@ services:
       # (https://github.com/CrispStrobe/CrispASR/blob/main/docs/cli.md#diarization)
       # No surrounding quotes: the entrypoint runs eval "args+=($CRISPASR_EXTRA_ARGS)",
       # so quotes collapse the whole string into one argument (that broke startup).
-      - CRISPASR_EXTRA_ARGS=--verbose
+      # For MAX SPEED over max quality: drop the --parakeet-decoder/--beam-size flags
+      # (fall back to greedy) and/or lower --model-quant to q4_k. Parakeet is a tiny
+      # CTC/TDT model, already well faster than real time. MAES search tuning
+      # (defaults are fine) lives in CRISPASR_MAES_NUM_STEPS / _GAMMA / _BETA.
+      - CRISPASR_EXTRA_ARGS=--verbose --model-quant q8_0 --parakeet-decoder maes --beam-size 4
       - CRISPASR_DIAGNOSTICS=0
-      # KV-cache quant is transformer-only, and voxtral4b is a transformer LLM
-      # backend, so these now apply (they were no-ops under parakeet's CTC/TDT).
-      # This is a MEMORY knob, not a speed one: q8_0 halves KV VRAM at ~0.05% WER
-      # drift (q4_0 quarters it at ~0.2%). On a 24GB card the f16 model (~8.5GB) +
-      # this KV (voxtral4b KV is tiny, ~170 MiB) fit easily, so q8_0 is essentially
-      # free headroom; set both to f16 if you'd rather keep KV at full precision.
-      - CRISPASR_KV_QUANT_V=q8_0
-      - CRISPASR_KV_QUANT_K=q8_0
-      # --- Performance / latency (already tuned for a long-lived server) ---
+      # KV-cache quant is transformer-only; parakeet is CTC/TDT with no KV cache, so
+      # these are no-ops here (re-enable them for an LLM backend like voxtral4b):
+      # - CRISPASR_KV_QUANT_V=q8_0
+      # - CRISPASR_KV_QUANT_K=q8_0
       # GGUF_PRELOAD=1: page-walk the mmap'd weights at load so the FIRST request
-      # doesn't eat the page-fault tax (trades a bit of boot time for steady
-      # first-token latency; ideal for a persistent server). GGUF_MMAP is default
-      # ON (zero-copy load of the 8.5GB f16, no double-alloc), so it isn't set here.
-      - CRISPASR_GGUF_PRELOAD=1
-      # Startup warmup transcribe is ON by default and compiles/warms the GPU
-      # decode path, so the first real request is fast. Only set NO_WARMUP=1 if a
-      # GPU driver hangs during warmup (CrispASR #165):
+      # doesn't eat the page-fault tax (GGUF_MMAP is default-on, zero-copy load).
+      # Warmup transcribe is on by default too, so the first real request is fast;
+      # set NO_WARMUP=1 only if a GPU driver hangs in warmup (CrispASR #165):
       # - CRISPASR_NO_WARMUP=1
-      # Flash-attn is applied automatically where the backend declares support
-      # (no knob). Threads (-t, default min(4,nproc)) barely matter here because
-      # all layers run on the GPU.
-      # VRAM FALLBACKS ONLY (these trade SPEED for FIT; do NOT enable for perf).
-      # Reach for them only if boot OOMs. Cheapest first: drop KV to q4_0 (above),
-      # then spill transformer blocks to CPU, then spill the KV cache to CPU:
-      # - CRISPASR_N_GPU_LAYERS=13   # of 26 voxtral4b blocks on GPU, rest on CPU
-      # - CRISPASR_KV_ON_CPU=1       # KV cache in system RAM (PCIe traffic; slow)
-      # SPEED vs QUALITY: f16 is the highest-quality but slowest / most-VRAM option.
-      # For faster decode + more free VRAM at a small quality cost, point
-      # CRISPASR_MODEL at a q8_0/q4_k GGUF of the same model (see the ALT block above).
+      - CRISPASR_GGUF_PRELOAD=1
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
