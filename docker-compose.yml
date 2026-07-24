@@ -18,7 +18,7 @@ services:
       - ./cache:/cache
     environment:
       # - CRISPASR_PORT=8002
-      # --- Active backend: whisper large-v3-turbo (speech->text / STT) ----------
+      # --- ALT backend: whisper large-v3-turbo (speech->text / STT) -------------
       # whisper.cpp served as an OpenAI-compatible /v1/audio/transcriptions endpoint
       # on host :8002 (use asr.py, or any OpenAI transcription client). The model is
       # pinned via --hf-repo in EXTRA_ARGS below to ggml-large-v3-turbo.bin (fast,
@@ -28,12 +28,12 @@ services:
       # so -m auto is overridden. Drop the --hf-repo flag to fall back to the
       # registry default ggml-base.bin (multilingual base, ~147MB, fastest tier);
       # swap the file for :ggml-small.bin (~500MB) for a middle ground.
-      - CRISPASR_BACKEND=whisper
-      - CRISPASR_AUTO_DOWNLOAD=1
-      # --- Alternative: parakeet (quality; comment out whisper above first) ------
-      # Parakeet-TDT-0.6b-v3 tuned for quality: Q8_0 weights + MAES beam search.
-      # - CRISPASR_BACKEND=parakeet
+      # - CRISPASR_BACKEND=whisper
       # - CRISPASR_AUTO_DOWNLOAD=1
+      # --- Active backend: parakeet (quality; comment out whisper above first) ---
+      # Parakeet-TDT-0.6b-v3 tuned for quality: Q8_0 weights + MAES beam search.
+      - CRISPASR_BACKEND=parakeet
+      - CRISPASR_AUTO_DOWNLOAD=1
       #   with EXTRA_ARGS: --verbose --model-quant q8_0 --parakeet-decoder maes --beam-size 4
       # --- Alternative: voxtral4b local f16 STT ---------------------------------
       # Realtime 4B transformer LLM; AUTO_DOWNLOAD=0 uses the local f16 file (~8.5GB,
@@ -53,7 +53,7 @@ services:
       # within-request long-audio speedup at higher RAM; -t N sets CPU threads
       # (minor on GPU). NOTE: -p is intra-request only; the server itself is still
       # single-model and mutex-serialized (no cross-request batching, any backend).
-      - CRISPASR_EXTRA_ARGS=--verbose -fa --hf-repo ggerganov/whisper.cpp:ggml-large-v3-turbo.bin
+      - CRISPASR_EXTRA_ARGS=--verbose --model-quant q8_0 --parakeet-decoder maes --beam-size 4
       - CRISPASR_DIAGNOSTICS=0
       # The whisper path does NOT honor CRISPASR_KV_QUANT (it uses whisper.cpp's own
       # KV handling; --type-k / --type-v are the CLI knobs there). These apply to the
