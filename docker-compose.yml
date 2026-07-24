@@ -49,9 +49,33 @@ services:
       - CRISPASR_DIAGNOSTICS=0
       # KV-cache quant is transformer-only, and voxtral4b is a transformer LLM
       # backend, so these now apply (they were no-ops under parakeet's CTC/TDT).
+      # This is a MEMORY knob, not a speed one: q8_0 halves KV VRAM at ~0.05% WER
+      # drift (q4_0 quarters it at ~0.2%). On a 24GB card the f16 model (~8.5GB) +
+      # this KV (voxtral4b KV is tiny, ~170 MiB) fit easily, so q8_0 is essentially
+      # free headroom; set both to f16 if you'd rather keep KV at full precision.
       - CRISPASR_KV_QUANT_V=q8_0
       - CRISPASR_KV_QUANT_K=q8_0
+      # --- Performance / latency (already tuned for a long-lived server) ---
+      # GGUF_PRELOAD=1: page-walk the mmap'd weights at load so the FIRST request
+      # doesn't eat the page-fault tax (trades a bit of boot time for steady
+      # first-token latency; ideal for a persistent server). GGUF_MMAP is default
+      # ON (zero-copy load of the 8.5GB f16, no double-alloc), so it isn't set here.
       - CRISPASR_GGUF_PRELOAD=1
+      # Startup warmup transcribe is ON by default and compiles/warms the GPU
+      # decode path, so the first real request is fast. Only set NO_WARMUP=1 if a
+      # GPU driver hangs during warmup (CrispASR #165):
+      # - CRISPASR_NO_WARMUP=1
+      # Flash-attn is applied automatically where the backend declares support
+      # (no knob). Threads (-t, default min(4,nproc)) barely matter here because
+      # all layers run on the GPU.
+      # VRAM FALLBACKS ONLY (these trade SPEED for FIT; do NOT enable for perf).
+      # Reach for them only if boot OOMs. Cheapest first: drop KV to q4_0 (above),
+      # then spill transformer blocks to CPU, then spill the KV cache to CPU:
+      # - CRISPASR_N_GPU_LAYERS=13   # of 26 voxtral4b blocks on GPU, rest on CPU
+      # - CRISPASR_KV_ON_CPU=1       # KV cache in system RAM (PCIe traffic; slow)
+      # SPEED vs QUALITY: f16 is the highest-quality but slowest / most-VRAM option.
+      # For faster decode + more free VRAM at a small quality cost, point
+      # CRISPASR_MODEL at a q8_0/q4_k GGUF of the same model (see the ALT block above).
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
       interval: 30s
