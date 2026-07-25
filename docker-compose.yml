@@ -82,7 +82,7 @@ services:
       #   sudo docker compose up -d --scale crispasr=N crispasr-lb
       # NOTE: single-GPU scaling is sublinear (replicas time-slice the same SMs),
       # but whisper underutilizes the GPU per request, so 2-4 lifts real throughput.
-      replicas: 4
+      replicas: 1
       resources:
         # limits:
         #   # Hard cap on CPU cores the container may consume
