@@ -13,13 +13,15 @@ at a time), and this single client covers whichever answers: `crispasr-tts`
 mistralai/Voxtral-4B-TTS-2603; it absorbed the former
 voxtral/query_test.py).
 
-Against Voxtral, only `input`, `voice`, `response_format` and `speed` are
-honoured per request. Pass `--voice` explicitly with one of the 20
-built-in embedding names in VOXTRAL_VOICES (e.g. fr_male, neutral_female).
-Leave the TADA knobs below unset: they are only sent when explicitly set,
-and the vllm-omni request schema does not define them. Voxtral's sampling
-is startup-time only (VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in
-docker-compose.yml), not per request. If vLLM rejects a request without a
+Against Voxtral, only `input`, `voice`, `response_format`, `speed` and
+`extra_params` are honoured per request. Pass `--voice` explicitly with one
+of the 20 built-in embedding names in VOXTRAL_VOICES (e.g. fr_male,
+neutral_female), and `--cfg-alpha` to override the classifier-free guidance
+scale for that one call. Leave the TADA knobs below unset: they are only
+sent when explicitly set, and the vllm-omni request schema does not define
+them. Voxtral's *sampling* (temperature, seed) really is startup-time only
+(VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in docker-compose.yml); cfg_alpha is
+the exception that is also per request. If vLLM rejects a request without a
 model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
@@ -164,6 +166,7 @@ def build_speech_body(
     num_candidates: int | None = None,
     num_steps: int | None = None,
     cfg_scale: float | None = None,
+    cfg_alpha: float | None = None,
     noise_temp: float | None = None,
     consent_attestation: str | None = None,
     spoken_disclaimer: bool | None = None,
@@ -235,6 +238,12 @@ def build_speech_body(
     cfg_scale : float or None
         TADA acoustic classifier-free guidance (server field `cfg_scale`,
         mapping to `acoustic_cfg`, default 1.6). Env `TADA_ACOUSTIC_CFG`.
+    cfg_alpha : float or None
+        Voxtral classifier-free guidance scale (deploy default 1.2), sent
+        nested inside `extra_params` rather than as a flat field. Unrelated
+        to `cfg_scale` above: different backend, different server field,
+        different default. Unset = the value the server booted with
+        (`VOXTRAL_CFG_ALPHA` in docker-compose.yml).
     noise_temp : float or None
         TADA acoustic noise temperature (server field `noise_temp`, default
         0.9). Env `TADA_NOISE_TEMP`.
@@ -279,6 +288,15 @@ def build_speech_body(
         "spoken_disclaimer": spoken_disclaimer,
     }
     body.update({k: v for k, v in optional.items() if v is not None})
+    # Voxtral takes its model-specific knobs through a nested `extra_params`
+    # object instead of flat fields, which is why cfg_alpha cannot join the map
+    # above. Server side (vllm-omni 0.22) `serving_speech.py` merges that object
+    # into stage 0's SamplingParams.extra_args, and the model then reads one
+    # cfg_alpha per request from it (`voxtral_tts.py::_extract_cfg_alpha`,
+    # falling back to 1.2). Still opt-in like everything else here: omitted
+    # entirely when unset, so the server keeps its deploy-YAML default.
+    if cfg_alpha is not None:
+        body["extra_params"] = {"cfg_alpha": cfg_alpha}
     return body
 
 
@@ -301,6 +319,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         num_candidates=args.num_candidates,
         num_steps=args.num_steps,
         cfg_scale=args.cfg_scale,
+        cfg_alpha=args.cfg_alpha,
         noise_temp=args.noise_temp,
         consent_attestation=args.consent_attestation,
         spoken_disclaimer=args.spoken_disclaimer,
@@ -652,7 +671,33 @@ def main() -> int:
                           help="Acoustic classifier-free guidance weight. Server default 1.6.")
     acoustic.add_argument("--noise-temp", type=float, default=None,
                           help="Acoustic noise temperature. Server default 0.9.")
+
+    # Voxtral (vllm-omni) knob. Unlike every group above, this one does not map
+    # to a flat server field: it rides inside the request's `extra_params`
+    # object (see build_speech_body). It is the *only* Voxtral quality lever
+    # that is per request; temperature/seed/Euler-steps are startup-only there
+    # (VOXTRAL_* env vars in docker-compose.yml).
+    voxtral = p.add_argument_group(
+        "Voxtral (vLLM)",
+        "Per-request knob the voxtral-tts service honours, sent inside `extra_params`. "
+        "Unset = the value the server booted with (VOXTRAL_CFG_ALPHA in "
+        "docker-compose.yml; vllm-omni deploy default 1.2).")
+    voxtral.add_argument("--cfg-alpha", type=float, default=None,
+                         help="Voxtral classifier-free guidance scale for THIS request "
+                              "(deploy default 1.2; higher = tighter text adherence). "
+                              "Distinct from TADA's --cfg-scale. 1.0 disables CFG and "
+                              "yields garbled, off-text audio.")
     args = p.parse_args()
+
+    # Mirrors the startup guardrail in voxtral/entrypoint.sh, but warns instead
+    # of refusing: cfg_alpha=1.0 turns CFG off and the flow-matching decoder
+    # then hallucinates phonetically-plausible-but-wrong audio. Per request that
+    # is recoverable (the next call is unaffected) and sweeping the knob is what
+    # this client exists for, so it is allowed through, loudly.
+    if args.cfg_alpha is not None and abs(args.cfg_alpha - 1.0) < 1e-9:
+        print("warning: --cfg-alpha 1.0 disables classifier-free guidance; expect "
+              "garbled, off-text audio (voxtral/entrypoint.sh refuses this value at "
+              "startup for that reason)", file=sys.stderr)
 
     base_url = args.url.rstrip("/")
 

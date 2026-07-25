@@ -140,15 +140,25 @@ that older hand-run recipe.)
   `./tts.py -t "Bonjour." --voice neutral_female -o out.wav`. If vLLM rejects a
   request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
-  cloning), `response_format`, and `speed` (post-processing playback rate, non-streaming
-  only). It **ignores** `instructions`, `language`, `task_type` and `max_new_tokens`:
-  those only take effect on the Qwen3-TTS / Fish paths in vllm-omni's
-  `serving_speech.py` (`_build_tts_params`), whereas Voxtral builds its prompt from just
-  `SpeechRequest(input, voice|ref_audio)`. So of tts.py's flags only `--voice`, `--speed`,
-  `--format` (and `--model`) matter here; the TADA knobs must be left unset (they are
-  opt-in, never sent unless given, and vllm-omni's schema does not define them). Sampling
-  knobs (temperature/seed/top_p) are NOT per request either; they live in the startup
-  YAML (see below).
+  cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
+  only), and `extra_params` (see `--cfg-alpha` below). It **ignores** `instructions`,
+  `language`, `task_type` and `max_new_tokens`: those only take effect on the
+  Qwen3-TTS / Fish paths in vllm-omni's `serving_speech.py` (`_build_tts_params`),
+  whereas Voxtral builds its prompt from just `SpeechRequest(input, voice|ref_audio)`.
+  So of tts.py's flags only `--voice`, `--speed`, `--cfg-alpha`, `--format` (and
+  `--model`) matter here; the TADA knobs must be left unset (they are opt-in, never
+  sent unless given, and vllm-omni's schema does not define them). Sampling knobs
+  (temperature/seed/top_p) are NOT per request; they live in the startup YAML (below).
+- **`--cfg-alpha`, the one per-request quality lever:** `serving_speech.py` merges a
+  request's `extra_params` dict into stage 0's `SamplingParams.extra_args`, and the
+  model reads one cfg_alpha per request out of it
+  (`model_executor/models/voxtral_tts/voxtral_tts.py::_extract_cfg_alpha`, falling back
+  to 1.2). So `./tts.py -t "..." --voice fr_male --cfg-alpha 1.5` overrides
+  `VOXTRAL_CFG_ALPHA` for that one call, no restart, and sweeps need no `up -d` between
+  values. tts.py keeps it opt-in like every other knob (omitted when unset, server keeps
+  its deploy default) and only **warns** on the known-bad `1.0` rather than refusing it
+  the way `entrypoint.sh` does at startup: per request the damage stops at that call.
+  Do not confuse it with TADA's `--cfg-scale` (different backend, field and default).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
   service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
   **two-stage** pipeline: stage 0 (the AR LLM, greedy at temp 0.0, `enforce_eager: false`
@@ -175,7 +185,8 @@ that older hand-run recipe.)
     for 80GB H100/H200 cards.
   - `VOXTRAL_CFG_ALPHA` -> stage_id 0 classifier-free-guidance scale, patched into that
     stage's `default_sampling_params.extra_args.cfg_alpha` (the same field vllm-omni reads
-    per-request cfg_alpha from). Deploy default **1.2**. Nudge up for tighter text
+    per-request cfg_alpha from, so this only sets the **default**: `tts.py --cfg-alpha`
+    overrides it per call, see above). Deploy default **1.2**. Nudge up for tighter text
     adherence. The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
     decoder hallucinate phonetically-plausible-but-wrong audio (stops following the text).
   - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the stage-1 flow-matching
