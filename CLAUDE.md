@@ -13,14 +13,10 @@ Two moving parts:
 
 1. **`docker-compose.yml`** runs two containers from the prebuilt image
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
-   - `crispasr` (ASR), active backend `whisper` (`ggml-large-v3-turbo-q8_0.bin`, pinned
+   - `crispasr` (ASR), active backend `whisper` (`ggml-large-v3-turbo.bin`, pinned
      via `--hf-repo`, multilingual, `-fa` flash-attn, transcribe-only). The compose
      comments mark ACTIVE vs ALT and keep lighter whisper models (`base`/`small`),
-     `parakeet` (quality: Q8_0 + MAES), and `voxtral4b` as alternatives. The turbo
-     f16 / q8_0 / q5_0 files all sit in `./cache` and the `--hf-repo` resolve reuses
-     any of them by filename, so switching tier is a one-token edit with no download.
-     Quantization tier buys VRAM headroom (more replicas), **not** latency: turbo here
-     is encoder-bound, and the encoder is where f16 is fastest. Protected by
+     `parakeet` (quality: Q8_0 + MAES), and `voxtral4b` as alternatives. Protected by
      `CRISPASR_API_KEYS`. This service is **replicated** (`deploy.replicas: 4`, no
      `container_name`/host ports) and fronted by `crispasr-lb`, a small `caddy:2-alpine`
      load balancer that owns host **:8002** and `least_conn`-balances across the
