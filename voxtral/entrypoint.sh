@@ -6,13 +6,19 @@
 #
 # Voxtral is a TWO-STAGE pipeline (see the deploy YAML, top-level `stages:` list):
 #   stage_id 0 = AR LLM, text -> audio tokens. Compiled (enforce_eager: false),
-#                greedy (temperature 0.0), gpu_memory_utilization ~0.8.
-#   stage_id 1 = acoustic decoder, tokens -> 24 kHz wave. Its temperature
-#                (0.9 upstream) is the main audio-quality lever.
+#                greedy (temperature 0.0), gpu_memory_utilization ~0.8. It also
+#                owns the flow-matching acoustic transformer, so the real quality
+#                levers (VOXTRAL_EULER_STEPS, VOXTRAL_CFG_ALPHA) are stage-0 costs.
+#   stage_id 1 = audio tokenizer, tokens -> 24 kHz wave. A deterministic codec
+#                decoder with no sampling path, so its temperature is very likely
+#                a no-op (see the VOXTRAL_ACOUSTIC_TEMP note below).
 # Most of Voxtral's sampling params are NOT settable per HTTP request (only
 # voice/speed/response_format, plus cfg_alpha via extra_params and max_new_tokens),
-# so we expose them here as startup knobs by editing the copied YAML at boot. No
-# rebuild needed to change them, just `up -d`.
+# so we expose them here as startup knobs by editing the copied YAML at boot.
+# Changing a knob's VALUE needs no rebuild, just `up -d`. Changing THIS FILE does:
+# the Dockerfile COPYs it into the image, so a newly added knob is invisible until
+# `up -d --build`. The "patched ... -> ..." summary line this script logs at boot
+# lists every knob it knows about, which is how you tell the two apart.
 #
 # NOTE: the 0.22 schema differs from 0.18 (`stages` with flat fields, not
 # `stage_args`+`engine_args`+`runtime`). The old `runtime.defaults.max_inflight`
@@ -193,7 +199,9 @@ sys.stderr.write(
 PY
 
 # VOXTRAL_EULER_STEPS -> n_decoding_steps: the number of Euler ODE steps the
-# stage-1 flow-matching acoustic decoder runs per frame. THIS is the compute<->
+# flow-matching acoustic transformer runs per frame. That transformer lives in
+# STAGE 0 (voxtral_tts_audio_generation.py), not stage 1, so this is a stage-0
+# cost even though it shapes the waveform. THIS is the compute<->
 # quality lever the user asked for: more steps = steadier/higher-fidelity audio
 # for more compute, fewer = faster/rougher. Unlike temp/seed/cfg_alpha it is NOT
 # a deploy-YAML field, env var, or per-request knob in vllm-omni. vllm-omni reads
