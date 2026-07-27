@@ -13,14 +13,19 @@
 #     advances that one global stream,
 #   - duration usually survives that variation (the semantic head is a
 #     high-margin argmax) but can occasionally jump.
-# This script tries to falsify all four.
+# Tests A to C try to falsify all four.
 #
 # THE CONTROL THAT MATTERS: a comparison is only meaningful between requests at
 # the same RNG position, which in practice means "first request after a restart".
-# So this script restarts the service between takes and NEVER sends a warmup
-# call. In particular it does not use `tts.py --check`, which would synthesize
+# So tests A to C restart the service between takes and NEVER send a warmup
+# call. In particular they do not use `tts.py --check`, which would synthesize
 # and thereby advance the RNG before the measurement. Readiness is polled on
 # /health only.
+#
+# Test D is the odd one out: it checks the optional monkeypatch that lifts that
+# whole restriction (VOXTRAL_PER_REQUEST_SEED, voxtral/patches/sitecustomize.py),
+# so it needs no restart and deliberately sends traffic between its measurements.
+# It skips itself when the patch is not loaded.
 #
 # It owns the container lifecycle: brings voxtral-tts up if it is down, stops
 # crispasr-tts first if that one is holding :8003 (both TTS services bind that
@@ -64,12 +69,13 @@ SUDO_KEEPALIVE_PID=""
 
 usage() {
   cat <<'EOF'
-Usage: ./voxtral/test_seed_determinism.sh [A|B|C|all|up|down]
+Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|all|up|down]
 
   A     Does the request `seed` field change anything?   (2 restarts)
   B     Is output reproducible per process?              (2 restarts)
   C     Does duration ever move within one process?      (1 restart, N calls)
-  all   A then B then C (default)
+  D     Does --noise-seed reproduce one request?         (no restart)
+  all   A then B then C then D (default)
   up    Just bring voxtral-tts up and leave it running
   down  Just stop voxtral-tts
 
@@ -85,7 +91,7 @@ EOF
 
 WHICH="${1:-all}"
 case "$WHICH" in
-  A|B|C|all|up|down) ;;
+  A|B|C|D|all|up|down) ;;
   -h|--help|help) usage; exit 0 ;;
   *) echo "unknown mode '$WHICH'" >&2; usage >&2; exit 2 ;;
 esac
@@ -343,6 +349,51 @@ test_C() {
   fi
 }
 
+# Reading the log, not the env, on purpose: the env var only says what was asked
+# for, while this line proves the patch really loaded inside the stage-0 engine
+# process (the one that owns the RNG).
+patch_active() {
+  $DOCKER compose logs "$SERVICE" 2>/dev/null | grep -q 'voxtral-seed-patch\] active'
+}
+
+test_D() {
+  head1 "TEST D: does --noise-seed reproduce one request, with no restart?"
+  say "  This one tests our own monkeypatch rather than stock behaviour: it needs"
+  say "  VOXTRAL_PER_REQUEST_SEED=1 on the service, which injects"
+  say "  voxtral/patches/sitecustomize.py into the stage-0 engine process."
+
+  if ! patch_active; then
+    verdict SKIP "patch not loaded (no '[voxtral-seed-patch] active' line in the log)."
+    say "     Uncomment VOXTRAL_PER_REQUEST_SEED=1 in docker-compose.yml, then:"
+    say "       $DOCKER compose up -d $SERVICE && ./voxtral/test_seed_determinism.sh D"
+    return 0
+  fi
+
+  # No restart anywhere here, which is the entire claim. The unseeded call in the
+  # middle deliberately advances the global RNG, so a pass means the seed pins the
+  # take irrespective of RNG position, not merely that nothing moved.
+  local d1 dx d2 d3
+  d1="$(synth D_seed7_first --noise-seed 7)"; report "seed 7, call 1" "$d1"
+  dx="$(synth D_unseeded)";                   report "no seed (RNG moves)" "$dx"
+  d2="$(synth D_seed7_again --noise-seed 7)"; report "seed 7, call 2" "$d2"
+  d3="$(synth D_seed8 --noise-seed 8)";       report "seed 8" "$d3"
+
+  if cmp -s "$d1" "$d2"; then
+    verdict PASS "same seed, same audio, across intervening traffic and with no restart."
+  else
+    verdict FAIL "the same seed gave different audio."
+    say "     Check the log for '[voxtral-seed-patch] WARNING' lines: 'shared a step'"
+    say "     means requests overlapped (serialize them), 'no sampling_extra_args' means"
+    say "     stage 0 lost its extra_args (keep VOXTRAL_CFG_ALPHA set). $d1 vs $d2"
+  fi
+
+  if cmp -s "$d1" "$d3"; then
+    verdict FAIL "seeds 7 and 8 gave identical audio, so the value is being ignored."
+  else
+    verdict PASS "a different seed gives a different take, so the value picks the stream."
+  fi
+}
+
 # ---------------------------------------------------------------- main
 
 say "Voxtral TTS determinism probe"
@@ -384,9 +435,10 @@ fi
 
 case "$WHICH" in
   A)   test_A ;;
+  D)   test_D ;;
   B)   test_B ;;
   C)   test_C ;;
-  all) test_A; test_B; test_C ;;
+  all) test_A; test_B; test_C; test_D ;;
 esac
 
 say ""
