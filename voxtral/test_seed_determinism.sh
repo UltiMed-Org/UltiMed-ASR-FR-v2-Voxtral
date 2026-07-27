@@ -30,6 +30,13 @@
 
 set -euo pipefail
 
+# Durations come out of Python as "0.500", so bash printf must read them with a
+# dot. Under a comma locale (LC_NUMERIC=fr_FR here) `printf %8.3f 0.500` fails
+# with "invalid number" and prints 0,000, which silently zeroed the whole
+# duration column. Verdicts were unaffected (they compare secs_of output, which
+# never goes through printf), but the numbers on screen were wrong.
+export LC_NUMERIC=C
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
