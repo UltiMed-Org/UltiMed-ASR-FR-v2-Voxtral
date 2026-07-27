@@ -13,16 +13,19 @@ at a time), and this single client covers whichever answers: `crispasr-tts`
 mistralai/Voxtral-4B-TTS-2603; it absorbed the former
 voxtral/query_test.py).
 
-Against Voxtral, only `input`, `voice`, `response_format`, `speed` and
-`extra_params` are honoured per request. Pass `--voice` explicitly with one
-of the 20 built-in embedding names in VOXTRAL_VOICES (e.g. fr_male,
-neutral_female), and `--cfg-alpha` to override the classifier-free guidance
-scale for that one call. Leave the TADA knobs below unset: they are only
-sent when explicitly set, and the vllm-omni request schema does not define
-them. Voxtral's *sampling* (temperature, seed) really is startup-time only
-(VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in docker-compose.yml); cfg_alpha is
-the exception that is also per request. If vLLM rejects a request without a
-model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
+Against Voxtral, only `input`, `voice`, `response_format`, `speed`,
+`max_new_tokens` and `extra_params` are honoured per request. Pass `--voice`
+explicitly with one of the 20 built-in embedding names in VOXTRAL_VOICES
+(e.g. fr_male, neutral_female), `--cfg-alpha` to override the
+classifier-free guidance scale for that one call, and `--max-new-tokens` to
+raise the audio-length cap (frames at 12.5 Hz, so seconds x 12.5; the deploy
+default 2048 truncates at 163.84 s). Leave the TADA knobs below unset: they
+are only sent when explicitly set, and the vllm-omni request schema does not
+define them. Voxtral's *sampling* (temperature, seed) really is startup-time
+only (VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in docker-compose.yml); cfg_alpha
+and max_new_tokens are the exceptions that are also per request. If vLLM
+rejects a request without a model name, add
+`--model mistralai/Voxtral-4B-TTS-2603`.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
 client exposes TADA's per-request knobs. As of CrispASR #197 the talker
@@ -117,6 +120,15 @@ VOXTRAL_VOICES = [
     "pt_male",
 ]
 
+# Voxtral's audio-token rate: stage 0 (the AR LLM) emits exactly one frame per
+# decode step at this rate, so tokens / 12.5 = seconds of audio. From the
+# checkpoint's own params.json
+# (multimodal.audio_model_args.audio_encoding_args.frame_rate).
+VOXTRAL_FRAME_RATE_HZ = 12.5
+# Hard server-side ceiling on the per-request `max_new_tokens` field
+# (vllm-omni 0.22 serving_speech.py `_TTS_MAX_NEW_TOKENS_MAX`), i.e. 327.68 s.
+VOXTRAL_MAX_NEW_TOKENS_CAP = 4096
+
 
 def _get(url: str, timeout: float = 10.0) -> tuple[int, bytes, str]:
     req = urllib.request.Request(url, method="GET")
@@ -168,6 +180,7 @@ def build_speech_body(
     cfg_scale: float | None = None,
     cfg_alpha: float | None = None,
     noise_temp: float | None = None,
+    max_new_tokens: int | None = None,
     consent_attestation: str | None = None,
     spoken_disclaimer: bool | None = None,
 ) -> dict:
@@ -247,6 +260,16 @@ def build_speech_body(
     noise_temp : float or None
         TADA acoustic noise temperature (server field `noise_temp`, default
         0.9). Env `TADA_NOISE_TEMP`.
+    max_new_tokens : int or None
+        Longest utterance THIS request may produce, in stage-0 decode steps.
+        Voxtral emits one 12.5 Hz audio frame per step, so this is seconds x
+        12.5 (the deploy default 2048 = 163.84 s, past which audio is cut off
+        mid-sentence with finish_reason "length" and no error). vllm-omni
+        rejects anything above 4096 (`_TTS_MAX_NEW_TOKENS_MAX`, = 327.68 s) and
+        stage 0's `max_model_len` caps it further, since the prompt's text
+        tokens share that context: to actually use a large value, raise
+        `VOXTRAL_MAX_MODEL_LEN` in docker-compose.yml. Unset = the server's
+        startup value (`VOXTRAL_MAX_TOKENS`).
     consent_attestation : str or None
         Required by the server when `voice` ends in `.wav` (runtime voice
         cloning): a free-text speaker-consent statement, logged for audit.
@@ -284,6 +307,7 @@ def build_speech_body(
         "num_steps": num_steps,
         "cfg_scale": cfg_scale,
         "noise_temp": noise_temp,
+        "max_new_tokens": max_new_tokens,
         "consent_attestation": consent_attestation,
         "spoken_disclaimer": spoken_disclaimer,
     }
@@ -321,6 +345,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         cfg_scale=args.cfg_scale,
         cfg_alpha=args.cfg_alpha,
         noise_temp=args.noise_temp,
+        max_new_tokens=args.max_new_tokens,
         consent_attestation=args.consent_attestation,
         spoken_disclaimer=args.spoken_disclaimer,
     )
@@ -672,21 +697,28 @@ def main() -> int:
     acoustic.add_argument("--noise-temp", type=float, default=None,
                           help="Acoustic noise temperature. Server default 0.9.")
 
-    # Voxtral (vllm-omni) knob. Unlike every group above, this one does not map
-    # to a flat server field: it rides inside the request's `extra_params`
-    # object (see build_speech_body). It is the *only* Voxtral quality lever
-    # that is per request; temperature/seed/Euler-steps are startup-only there
-    # (VOXTRAL_* env vars in docker-compose.yml).
+    # Voxtral (vllm-omni) knobs. --cfg-alpha is the odd one out: unlike every
+    # group above it does not map to a flat server field but rides inside the
+    # request's `extra_params` object (see build_speech_body), while
+    # --max-new-tokens is a plain field. These two are the whole per-request
+    # surface for Voxtral quality/length; temperature/seed/Euler-steps are
+    # startup-only there (VOXTRAL_* env vars in docker-compose.yml).
     voxtral = p.add_argument_group(
         "Voxtral (vLLM)",
-        "Per-request knob the voxtral-tts service honours, sent inside `extra_params`. "
-        "Unset = the value the server booted with (VOXTRAL_CFG_ALPHA in "
-        "docker-compose.yml; vllm-omni deploy default 1.2).")
+        "Per-request knobs the voxtral-tts service honours. Unset = the value the "
+        "server booted with (VOXTRAL_CFG_ALPHA / VOXTRAL_MAX_TOKENS in "
+        "docker-compose.yml; vllm-omni deploy defaults 1.2 and 2048).")
     voxtral.add_argument("--cfg-alpha", type=float, default=None,
                          help="Voxtral classifier-free guidance scale for THIS request "
                               "(deploy default 1.2; higher = tighter text adherence). "
                               "Distinct from TADA's --cfg-scale. 1.0 disables CFG and "
                               "yields garbled, off-text audio.")
+    voxtral.add_argument("--max-new-tokens", type=int, default=None,
+                         help="Max audio frames for THIS request, i.e. seconds x 12.5 "
+                              "(deploy default 2048 = 163.84 s, server hard cap 4096 = "
+                              "327.68 s). Longer text is cut off mid-sentence. Also "
+                              "bounded by stage 0's max_model_len, shared with the "
+                              "prompt: see VOXTRAL_MAX_MODEL_LEN.")
     args = p.parse_args()
 
     # Mirrors the startup guardrail in voxtral/entrypoint.sh, but warns instead
@@ -698,6 +730,20 @@ def main() -> int:
         print("warning: --cfg-alpha 1.0 disables classifier-free guidance; expect "
               "garbled, off-text audio (voxtral/entrypoint.sh refuses this value at "
               "startup for that reason)", file=sys.stderr)
+
+    # vllm-omni validates this field against _TTS_MAX_NEW_TOKENS_MIN/MAX (1..4096)
+    # and answers 400, so catch both ends here rather than spend a round trip.
+    # Above 4096 the only route to longer audio is raising VOXTRAL_MAX_TOKENS *and*
+    # VOXTRAL_MAX_MODEL_LEN at startup, since 4096 is hardcoded server-side.
+    if args.max_new_tokens is not None:
+        if args.max_new_tokens < 1:
+            p.error("--max-new-tokens must be at least 1")
+        if args.max_new_tokens > VOXTRAL_MAX_NEW_TOKENS_CAP:
+            p.error(
+                f"--max-new-tokens cannot exceed {VOXTRAL_MAX_NEW_TOKENS_CAP} "
+                f"({VOXTRAL_MAX_NEW_TOKENS_CAP / VOXTRAL_FRAME_RATE_HZ:.2f} s of audio); "
+                "vllm-omni rejects more. For longer utterances raise VOXTRAL_MAX_TOKENS "
+                "and VOXTRAL_MAX_MODEL_LEN in docker-compose.yml instead")
 
     base_url = args.url.rstrip("/")
 
