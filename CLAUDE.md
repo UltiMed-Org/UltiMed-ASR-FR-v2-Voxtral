@@ -261,7 +261,9 @@ that older hand-run recipe.)
     logged when a seeded request shares a step); it also depends on stage 0 keeping a
     non-empty `default_sampling_params.extra_args`, which is what makes vllm-omni pass
     per-request extras at all (`has_sampling_extra_args`), so keep `VOXTRAL_CFG_ALPHA` set.
-    Test with `./voxtral/test_seed_determinism.sh D` (no restarts). Nothing is imported when
+    Test with `./voxtral/test_seed_determinism.sh D` (no restarts), and diagnose with
+    `... doctor` when it skips. The patch logs `armed` (hook installed) before
+    `active` (patch applied) precisely so a silent failure can be located. Nothing is imported when
     the var is unset. Note there is **no** built-in alternative: `/v1/omni/sleep` +
     `/v1/omni/wakeup` only move weights (neither calls `set_random_seed`), and vLLM's
     `collective_rpc`, whose `compile_or_warm_up_model` *would* re-seed, has no HTTP route in
@@ -348,7 +350,9 @@ that older hand-run recipe.)
   compose service, `install.sh` is the original hand-run recipe, and `env.reference` is a
   captured `pip freeze`. The client is the root `tts.py` (the old `voxtral/query_test.py`
   was merged into it). Also here: `test_seed_determinism.sh`, which owns the container
-  lifecycle and probes what actually makes the output vary (modes `A|B|C|D|all|up|down`),
+  lifecycle and probes what actually makes the output vary (modes `A|B|C|D|all|up|down|doctor`;
+  `doctor` checks the per-request-seeding chain inside the running container and is
+  the first thing to run when seeding looks dead),
   and `patches/sitecustomize.py`, the opt-in per-request seeding monkeypatch behind
   `VOXTRAL_PER_REQUEST_SEED` (mounted read-only at `/opt/voxtral-patches`, so editing it
   needs no rebuild).
