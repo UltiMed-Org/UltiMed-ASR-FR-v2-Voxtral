@@ -21,11 +21,13 @@ classifier-free guidance scale for that one call, and `--max-new-tokens` to
 raise the audio-length cap (frames at 12.5 Hz, so seconds x 12.5; the deploy
 default 2048 truncates at 163.84 s). Leave the TADA knobs below unset: they
 are only sent when explicitly set, and the vllm-omni request schema does not
-define them. Voxtral's *sampling* (temperature, seed) really is startup-time
-only (VOXTRAL_ACOUSTIC_TEMP / VOXTRAL_SEED in docker-compose.yml); cfg_alpha
-and max_new_tokens are the exceptions that are also per request. If vLLM
-rejects a request without a model name, add
-`--model mistralai/Voxtral-4B-TTS-2603`.
+define them. Voxtral's *sampling* knobs are not per request, and `--seed` in
+particular does nothing there: stage 0's sampler is handed logits with a single
+finite entry, so its result is forced. The one random draw in that pipeline
+(each frame's flow-matching noise) comes from the global RNG, which vLLM
+already pins, so takes are deterministic per process and reproducing a specific
+one needs a restart. See the Voxtral seed notes in CLAUDE.md. If vLLM rejects a
+request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
 client exposes TADA's per-request knobs. As of CrispASR #197 the talker
@@ -625,7 +627,10 @@ def main() -> int:
                    help="HTTP timeout in seconds (default: 300).")
     p.add_argument("--seed", type=int, default=None,
                    help="Integer seed for reproducible synthesis (default: not sent). "
-                        "With sampling on, different seeds change the wording.")
+                        "With sampling on, different seeds change the wording. NOTE: this "
+                        "is a TADA/CrispASR knob; against voxtral-tts it lands in stage 0's "
+                        "sampling params, which are forced by construction there, so it "
+                        "does nothing (see the Voxtral seed notes in CLAUDE.md).")
 
     voice = p.add_argument_group(
         "voice / cloning",
