@@ -154,6 +154,8 @@ that older hand-run recipe.)
   them). Sampling knobs (temperature/top_p) are NOT per request; they live in the startup
   YAML (below). `seed` is accepted by the schema but pointless: the override only touches
   stage 0, which is greedy at temp 0.0, so use `VOXTRAL_SEED` to change stage 1's take.
+  For per-request reproducibility use `--noise-seed` instead, which rides `extra_params`
+  and needs `VOXTRAL_PER_REQUEST_SEED=1` on the service (see that env var below).
 - **`--cfg-alpha`, the one per-request quality lever:** `serving_speech.py` merges a
   request's `extra_params` dict into stage 0's `SamplingParams.extra_args`, and the
   model reads one cfg_alpha per request out of it
@@ -226,8 +228,35 @@ that older hand-run recipe.)
     reproducible if requests 1..N-1 were identical), `VOXTRAL_SEED` picks a *different*
     deterministic stream rather than switching determinism on, and reproducing one specific
     request needs a **restart** because every generated frame advances that RNG. Concurrency
-    destroys it outright (interleaved draws). Per-request reproducibility would need the
-    noise drawn from a seeded `torch.Generator`, i.e. an upstream vllm-omni change.
+    destroys it outright (interleaved draws). All three were **confirmed empirically** on
+    2026-07-27 with tests A to C of `voxtral/test_seed_determinism.sh`: the request `seed`
+    field changed nothing, both request positions reproduced across boots, and waveforms
+    varied call to call inside one process. `VOXTRAL_PER_REQUEST_SEED` below lifts the
+    restart requirement.
+  - `VOXTRAL_PER_REQUEST_SEED=1` -> make a take reproducible **per request**, no restart.
+    This is the one knob here that is **not** upstream behaviour: it puts
+    `/opt/voxtral-patches` (compose-mounted from `voxtral/patches/`) on `PYTHONPATH`, whose
+    `sitecustomize.py` monkeypatches `VoxtralTTSForConditionalGeneration.make_omni_output`
+    to re-pin the global torch RNG just before each frame's noise draw, from a seed the
+    request carries plus that request's own frame counter. Clients send it as
+    `extra_params: {"voxtral_noise_seed": N}` (`tts.py --noise-seed N`), the same route
+    `cfg_alpha` travels; stock servers merge the key and ignore it, so sending it is always
+    safe. This mirrors what vllm-omni already does for Qwen3-TTS
+    (`extra_args["qwen3_tts_request_seed"]`, read in `worker/gpu_model_runner.py:1725`,
+    which keeps a per-request `torch.Generator`); Voxtral simply has no such hookup.
+    `PYTHONPATH` is the mechanism because vLLM spawns each stage as its own interpreter
+    (`StageEngineCoreProc_stage0` owns the model and the RNG), so a patch applied in the API
+    server process would reach the wrong one. Caveats, in `sitecustomize.py` in full: one
+    global RNG cannot feed several streams, so reproducibility holds **per batch
+    composition**, i.e. send reproducible work one request at a time (a one-time WARNING is
+    logged when a seeded request shares a step); it also depends on stage 0 keeping a
+    non-empty `default_sampling_params.extra_args`, which is what makes vllm-omni pass
+    per-request extras at all (`has_sampling_extra_args`), so keep `VOXTRAL_CFG_ALPHA` set.
+    Test with `./voxtral/test_seed_determinism.sh D` (no restarts). Nothing is imported when
+    the var is unset. Note there is **no** built-in alternative: `/v1/omni/sleep` +
+    `/v1/omni/wakeup` only move weights (neither calls `set_random_seed`), and vLLM's
+    `collective_rpc`, whose `compile_or_warm_up_model` *would* re-seed, has no HTTP route in
+    0.22.1.
   - `VLLM_BATCH_INVARIANT=1` (a vLLM env var, not read by `entrypoint.sh`; surfaced
     commented in the compose service) forces batch-invariant kernels so results stop
     depending on how requests happen to batch together. Needed for *bitwise* determinism on
@@ -307,4 +336,8 @@ that older hand-run recipe.)
   CrispASR; see "Voxtral TTS" above): `Dockerfile` + `entrypoint.sh` back the `voxtral-tts`
   compose service, `install.sh` is the original hand-run recipe, and `env.reference` is a
   captured `pip freeze`. The client is the root `tts.py` (the old `voxtral/query_test.py`
-  was merged into it).
+  was merged into it). Also here: `test_seed_determinism.sh`, which owns the container
+  lifecycle and probes what actually makes the output vary (modes `A|B|C|D|all|up|down`),
+  and `patches/sitecustomize.py`, the opt-in per-request seeding monkeypatch behind
+  `VOXTRAL_PER_REQUEST_SEED` (mounted read-only at `/opt/voxtral-patches`, so editing it
+  needs no rebuild).
