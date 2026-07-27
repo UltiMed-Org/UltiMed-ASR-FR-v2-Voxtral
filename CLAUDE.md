@@ -26,7 +26,7 @@ Two moving parts:
    - `crispasr-lb` (`caddy:2-alpine`) on host **:8002**: the ASR load balancer above.
      Clients (`asr.py`, any OpenAI client) hit :8002 unchanged; it discovers the
      `crispasr` replicas via Docker DNS (`dynamic a`, so `--scale` needs no LB edit).
-   - `crispasr-tts` (TTS) on host **:8003** — active backend switches often as models
+   - `crispasr-tts` (TTS) on host **:8003**: active backend switches often as models
      get tested (the compose comments mark ACTIVE vs ALT; currently
      `qwen3-tts-1.7b-voicedesign`, local GGUFs, French output). No API key.
    Both have `pull_policy: always` and a watchtower `autoupdate` label, so new releases
@@ -71,12 +71,12 @@ a prebuilt image). Verify changes by running the script against a live server, o
 backend-agnostic OpenAI clients. To swap a model, edit the service's `environment:` block
 in `docker-compose.yml` and restart that service:
 
-- `CRISPASR_BACKEND` — e.g. `parakeet`, `whisper`, `voxtral4b` (ASR); `tada`, `qwen3-tts-*`,
+- `CRISPASR_BACKEND`: e.g. `parakeet`, `whisper`, `voxtral4b` (ASR); `tada`, `qwen3-tts-*`,
   `vibevoice`, `orpheus` (TTS). Registry keys are exact; see the long comments in
   `docker-compose.yml` (e.g. `tada` works but `tada-3b-ml` is not a registry key).
 - `CRISPASR_AUTO_DOWNLOAD=1` fetches the model into `/cache`; `=0` uses the local file in
   `CRISPASR_MODEL` (a `/models/*.gguf` path).
-- `CRISPASR_EXTRA_ARGS` — extra CLI flags (e.g. `--verbose --voice /models/tada-ref-x.gguf`,
+- `CRISPASR_EXTRA_ARGS`: extra CLI flags (e.g. `--verbose --voice /models/tada-ref-x.gguf`,
   diarization flags). **Do not quote-wrap this value**: the entrypoint runs
   `eval "args+=($CRISPASR_EXTRA_ARGS)"`, so surrounding quotes collapse it into one arg and
   break startup.
@@ -107,7 +107,7 @@ Voice cloning currently means TADA. Flow: `tts.py --voice-name X` shells out to
 `utils/convert-tada-ref-to-gguf.py`. `clone_voice.py` owns the naming/mount convention;
 `tts.py` never duplicates it (it calls `--print-path`). The voice is switchable per request
 (CrispASR #201): `--voice tada-ref-x.gguf` reloads live; `default`/`auto`/omitted keeps the
-loaded one. A raw `.wav` is **not** accepted by TADA — bake a ref first.
+loaded one. A raw `.wav` is **not** accepted by TADA, so bake a ref first.
 
 `utils/tada_reference_engine.py` runs the **upstream** HumeAI TADA model directly (bypassing
 CrispASR's C++ port) to decide whether silent/garbled output is a CrispASR port bug vs a
@@ -322,7 +322,7 @@ that older hand-run recipe.)
 
 ## Layout notes
 
-- **`CrispASR_source/`** (gitignored) — a vendored checkout of the CrispASR source, kept as
+- **`CrispASR_source/`** (gitignored): a vendored checkout of the CrispASR source, kept as
   the **API contract reference** and an optional build context. When unsure about a
   server field or flag, read `CrispASR_source/docs/server.md` (endpoints + every form/body
   field), `docs/tts.md`, `docs/cli.md` instead of guessing.
