@@ -185,15 +185,29 @@ that older hand-run recipe.)
   bad take costs seconds not minutes).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
   service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
-  **two-stage** pipeline: stage 0 (the AR LLM, greedy at temp 0.0, `enforce_eager: false`
-  so already compiled/CUDA-graph'd) then stage 1 (the acoustic decoder). At boot
+  **two-stage** pipeline (topology frozen in `model_executor/models/voxtral_tts/pipeline.py`):
+  stage 0 = `audio_generation`, the 4B AR LLM, text -> acoustic latents, greedy at temp 0.0,
+  `enforce_eager: false` so already compiled/CUDA-graph'd; stage 1 = `audio_tokenizer`,
+  latents -> 24 kHz waveform. Note stage 0 also owns the small (3-layer) flow-matching
+  **acoustic transformer** that emits the 36 acoustic codebooks per frame, so the Euler-step
+  knob below is a stage-0 cost, not a stage-1 one. At boot
   `entrypoint.sh` copies the bundled `deploy/voxtral_tts.yaml`, patches it with pyyaml
   (0.22 schema: a top-level `stages:` list with flat fields + nested
   `default_sampling_params`; stages are keyed by `stage_id`), and passes it via
   `vllm serve --omni --deploy-config`:
   - `VOXTRAL_ACOUSTIC_TEMP` -> stage_id 1 sampling temperature. Entrypoint default **0.7**
-    (lowered from upstream 0.9 for steadier, less artifacty audio; raise toward 0.9 for
-    more expressive/varied output). This is the main audio-quality lever.
+    (packaged 0.9). **Suspected no-op, do not tune blind:** stage 1 is `audio_tokenizer`, a
+    deterministic codec decoder, and its model file
+    (`models/voxtral_tts/voxtral_tts_audio_tokenizer.py`) contains no sampling path at all
+    (no `temperature`, `logits`, `argmax` or `multinomial`); its `engine_output_type` is
+    `audio`, so there are no logits to temper. Meanwhile stage 0's semantic head is a hard
+    `argmax` (`voxtral_tts_audio_generation.py:605`) and its acoustic head is deterministic
+    flow matching, so **the only stochasticity in the output is the fresh Gaussian the ODE
+    starts from each frame** (`static_noise.normal_()` in
+    `cuda_graph_acoustic_transformer_wrapper.py`), which draws from ambient CUDA RNG and is
+    therefore not covered by `VOXTRAL_SEED` either. Confirm with one A/B before trusting
+    either knob; the real quality levers appear to be `VOXTRAL_EULER_STEPS` and
+    `VOXTRAL_CFG_ALPHA`.
   - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
     take). Not settable per request.
   - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `max_num_seqs` (packaged **32**). Unset = 32.
@@ -213,10 +227,17 @@ that older hand-run recipe.)
     overrides it per call, see above). Deploy default **1.2**. Nudge up for tighter text
     adherence. The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
     decoder hallucinate phonetically-plausible-but-wrong audio (stops following the text).
-  - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the stage-1 flow-matching
-    acoustic decoder (`n_decoding_steps`): the primary compute<->quality lever (more steps =
-    steadier, higher-fidelity audio for more compute; CFG doubles each step's cost, so this
-    is the pricey one). Unlike the knobs above it is **not** a deploy-YAML field, env var, or
+  - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the **stage-0**
+    flow-matching acoustic transformer (`n_decoding_steps`): the primary compute<->quality
+    lever (more steps = steadier, higher-fidelity audio for more compute; CFG batches a
+    conditional + unconditional pass into each step, so it is 2x wide, and this is the pricey
+    knob). The loop runs **once per 12.5 Hz frame**, starting from fresh noise each time with
+    nothing carried between frames, so its per-frame quality effect is the same at second 1
+    and second 160 while its **cost scales linearly with audio length**. It costs essentially
+    **no extra VRAM**: the only `n_steps`-sized allocation is a `linspace` of `n_steps + 1`
+    scalars, the ODE reuses one buffer under `no_grad`, and peak activation is set by the 2x
+    CFG batching, not the step count (only the CUDA-graph capture pool grows, marginally).
+    Unlike the knobs above it is **not** a deploy-YAML field, env var, or
     per-request param in vllm-omni: the value is read **only** from the model's `params.json`
     at `multimodal.audio_model_args.acoustic_transformer_args.n_decoding_steps`, and this
     model doesn't ship the key, so vllm-omni's mistral parser (`parsers/voxtral_tts.py`)
