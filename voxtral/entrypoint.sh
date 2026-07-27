@@ -9,9 +9,10 @@
 #                greedy (temperature 0.0), gpu_memory_utilization ~0.8.
 #   stage_id 1 = acoustic decoder, tokens -> 24 kHz wave. Its temperature
 #                (0.9 upstream) is the main audio-quality lever.
-# Voxtral's sampling params are NOT settable per HTTP request (only voice/speed/
-# response_format are), so we expose them here as startup knobs by editing the
-# copied YAML at boot. No rebuild needed to change them, just `up -d`.
+# Most of Voxtral's sampling params are NOT settable per HTTP request (only
+# voice/speed/response_format, plus cfg_alpha via extra_params and max_new_tokens),
+# so we expose them here as startup knobs by editing the copied YAML at boot. No
+# rebuild needed to change them, just `up -d`.
 #
 # NOTE: the 0.22 schema differs from 0.18 (`stages` with flat fields, not
 # `stage_args`+`engine_args`+`runtime`). The old `runtime.defaults.max_inflight`
@@ -44,6 +45,24 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #   VOXTRAL_GPU_MEM_UTIL  -> stage_id 0 gpu_memory_utilization (packaged 0.8).
 #                            Lower it (e.g. 0.7) so stage 0 + stage 1's 0.1 fit on
 #                            a 24GB card shared with a desktop; unset = 0.8.
+#   VOXTRAL_MAX_TOKENS    -> stage_id 0's default_sampling_params.max_tokens, i.e.
+#                            the longest utterance one request can produce (packaged
+#                            2048). Stage 0 emits exactly one 12.5 Hz audio frame
+#                            per decode step, so 2048 frames = 163.84 s and longer
+#                            texts are cut off mid-sentence (finish_reason
+#                            "length", no error). Raise it together with
+#                            VOXTRAL_MAX_MODEL_LEN below. Note tts.py
+#                            --max-new-tokens overrides this per request (up to
+#                            vllm-omni's _TTS_MAX_NEW_TOKENS_MAX = 4096).
+#   VOXTRAL_MAX_MODEL_LEN -> stage_id 0's max_model_len (packaged 4096). Prompt text
+#                            tokens and generated frames SHARE it, so it is the
+#                            real ceiling: any max_tokens beyond it is unreachable
+#                            because vLLM stops the request at the context limit.
+#                            Not a model limit (the checkpoint's params.json says
+#                            max_seq_len 65536), but each token of context costs
+#                            ~104 KiB of KV cache (2 x 26 layers x 8 kv heads x 128
+#                            head_dim x 2 bytes), so raising it trades concurrency
+#                            for length within the same gpu_memory_utilization pool.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
 #  params.json, not this deploy YAML.)
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
@@ -67,6 +86,22 @@ seed = os.environ.get("VOXTRAL_SEED")
 max_num_seqs = os.environ.get("VOXTRAL_MAX_NUM_SEQS")
 gpu_mem_util = os.environ.get("VOXTRAL_GPU_MEM_UTIL")  # stage 0 GPU memory fraction
 cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # stage 0 classifier-free guidance
+max_tokens = os.environ.get("VOXTRAL_MAX_TOKENS")  # stage 0 output-length cap
+max_model_len = os.environ.get("VOXTRAL_MAX_MODEL_LEN")  # stage 0 total context
+
+
+def _positive_int(name, raw):
+    """Parse a length knob, refusing junk at boot instead of letting pyyaml write a
+    string into a field vLLM will later reject with a much less obvious error."""
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit("voxtral entrypoint: %s must be an integer, got %r" % (name, raw))
+    if value < 1:
+        sys.exit("voxtral entrypoint: %s must be >= 1, got %d" % (name, value))
+    return value
+
+
 # Guardrail: cfg_alpha=1.0 disables CFG, which makes the flow-matching decoder
 # hallucinate phonetically-plausible-but-wrong audio (it stops following the
 # text). The paper/default is 1.2; refuse the known-broken value outright.
@@ -95,15 +130,41 @@ for stage in cfg.get("stages", []):
     # shared with a display. Lower it (e.g. 0.7) to make the two stages fit.
     if stage.get("stage_id") == 0 and gpu_mem_util:
         stage["gpu_memory_utilization"] = float(gpu_mem_util)
+    # stage_id 0 also owns audio LENGTH: one decode step = one 12.5 Hz frame, so
+    # max_tokens/12.5 is the longest single utterance (packaged 2048 -> 163.84 s),
+    # and max_model_len bounds prompt tokens + frames together. Only stage 0: stage
+    # 1 is fed 50-frame chunks by generator2tokenizer_async_chunk and never sees the
+    # whole utterance, so its own max_tokens does not cap duration.
+    if stage.get("stage_id") == 0 and max_tokens:
+        sampling["max_tokens"] = _positive_int("VOXTRAL_MAX_TOKENS", max_tokens)
+    if stage.get("stage_id") == 0 and max_model_len:
+        stage["max_model_len"] = _positive_int("VOXTRAL_MAX_MODEL_LEN", max_model_len)
+
+# The prompt always costs tokens, so a max_tokens that reaches max_model_len can
+# never be spent in full: vLLM stops the request at the context limit instead
+# (finish_reason "length"). Warn rather than refuse, since the packaged 2048/4096
+# pair is deliberately in that shape and short texts never notice.
+stage0 = next((s for s in cfg.get("stages", []) if s.get("stage_id") == 0), {})
+eff_tokens = stage0.get("default_sampling_params", {}).get("max_tokens")
+eff_ctx = stage0.get("max_model_len")
+if eff_tokens and eff_ctx and eff_tokens >= eff_ctx:
+    sys.stderr.write(
+        "voxtral entrypoint: WARNING stage 0 max_tokens=%d >= max_model_len=%d, so "
+        "audio length is capped by the context (under %.1f s at 12.5 Hz, minus the "
+        "prompt), not by max_tokens. Raise VOXTRAL_MAX_MODEL_LEN to use it all.\n"
+        % (eff_tokens, eff_ctx, eff_ctx / 12.5)
+    )
 
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
 sys.stderr.write(
     "voxtral entrypoint: patched %s -> %s "
-    "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s gpu_mem_util=%s)\n"
+    "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s gpu_mem_util=%s "
+    "max_tokens=%s [%.2f s of audio] max_model_len=%s)\n"
     % (src, dst, temp, seed or "default", max_num_seqs or "default",
-       cfg_alpha or "default", gpu_mem_util or "default")
+       cfg_alpha or "default", gpu_mem_util or "default",
+       max_tokens or "default", (eff_tokens or 0) / 12.5, max_model_len or "default")
 )
 PY
 

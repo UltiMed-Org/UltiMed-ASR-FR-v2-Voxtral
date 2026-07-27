@@ -197,8 +197,23 @@ services:
       # (stage 1 then fails with "Free memory ... less than desired GPU memory
       # utilization"). Lower stage 0 to ~0.7 to make both stages fit:
       - VOXTRAL_GPU_MEM_UTIL=0.7
-      # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap):
-      # - VLLM_EXTRA_ARGS=--max-model-len 4096
+      # Longest utterance ONE request can produce. Stage 0 emits exactly one
+      # 12.5 Hz audio frame per decode step, so the packaged max_tokens of 2048
+      # means 163.84 s; past that the audio is cut off mid-sentence with
+      # finish_reason "length" and no error. 12.5 frames = 1 second, so
+      # seconds x 12.5 = the value to set (4096 = 327.68 s, 7500 = 600 s):
+      # - VOXTRAL_MAX_TOKENS=2048
+      # Stage-0 context (packaged 4096). Prompt text tokens and generated frames
+      # SHARE it, so this is the real ceiling and VOXTRAL_MAX_TOKENS above is
+      # unreachable beyond it. Not a model limit (the checkpoint's params.json
+      # says max_seq_len 65536), but every token of context costs ~104 KiB of KV
+      # cache, so raising it trades concurrency for length inside the same
+      # VOXTRAL_GPU_MEM_UTIL pool. Keep it above VOXTRAL_MAX_TOKENS + the prompt:
+      # - VOXTRAL_MAX_MODEL_LEN=4096
+      # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap).
+      # NOTE: --max-model-len is NOT the lever here, the per-stage YAML field is
+      # (use VOXTRAL_MAX_MODEL_LEN above):
+      # - VLLM_EXTRA_ARGS=--enable-log-requests
     # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
     shm_size: "8gb"
     healthcheck:
