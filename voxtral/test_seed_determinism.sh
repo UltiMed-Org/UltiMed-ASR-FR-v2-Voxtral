@@ -22,15 +22,11 @@
 # and thereby advance the RNG before the measurement. Readiness is polled on
 # /health only.
 #
-# Usage:
-#   ./voxtral/test_seed_determinism.sh [A|B|C|all]     (default: all)
-#
-#     A  Does the request `seed` field change anything?  (2 restarts)
-#     B  Is output reproducible per process?             (2 restarts)
-#     C  Does duration ever move within one process?     (1 restart, N calls)
-#
-# Every restart reloads ~9GB of weights, so `all` takes a while. Env overrides:
-#   TEXT VOICE MODEL BASE SERVICE DOCKER TTS_CMD READY_TIMEOUT REPEATS OUTDIR
+# It owns the container lifecycle: brings voxtral-tts up if it is down, stops
+# crispasr-tts first if that one is holding :8003 (both TTS services bind that
+# port by design), and puts everything back the way it found it on exit. Every
+# docker call goes through sudo, and sudo is primed up front and kept warm, so a
+# password prompt cannot land in the middle of a run.
 
 set -euo pipefail
 
@@ -41,41 +37,143 @@ TEXT="${TEXT:-Le patient présente une créatinine à 120 micromoles par litre, 
 VOICE="${VOICE:-fr_male}"
 BASE="${BASE:-http://127.0.0.1:8003}"
 SERVICE="${SERVICE:-voxtral-tts}"
-DOCKER="${DOCKER:-sudo docker}"
+RIVAL="${RIVAL:-crispasr-tts}"          # the other TTS service on :8003
+DOCKER="${DOCKER:-sudo docker}"         # no docker group here, so sudo always
 TTS_CMD="${TTS_CMD:-./tts.py}"
-READY_TIMEOUT="${READY_TIMEOUT:-600}"
+READY_TIMEOUT="${READY_TIMEOUT:-1800}"  # first boot may download ~9GB of weights
 REPEATS="${REPEATS:-6}"
+KEEP_UP="${KEEP_UP:-0}"                 # 1 = skip teardown, leave the service up
 OUTDIR="${OUTDIR:-$(mktemp -d "${TMPDIR:-/tmp}/voxtral-seed-XXXXXX")}"
 
 MODEL="${MODEL:-}"   # auto-detected from /v1/models when empty
 
+# Word-split TTS_CMD so multi-word launchers work too (e.g. TTS_CMD="uv run tts.py").
+read -ra TTS_ARGV <<< "$TTS_CMD"
+
+# Lifecycle bookkeeping, so cleanup can restore the state we found.
+STARTED_BY_US=0
+RIVAL_WAS_UP=0
+SUDO_KEEPALIVE_PID=""
+
+usage() {
+  cat <<'EOF'
+Usage: ./voxtral/test_seed_determinism.sh [A|B|C|all|up|down]
+
+  A     Does the request `seed` field change anything?   (2 restarts)
+  B     Is output reproducible per process?              (2 restarts)
+  C     Does duration ever move within one process?      (1 restart, N calls)
+  all   A then B then C (default)
+  up    Just bring voxtral-tts up and leave it running
+  down  Just stop voxtral-tts
+
+Every restart reloads ~9GB of weights, so `all` takes a while. The service is
+started if needed and restored to its original state on exit (KEEP_UP=1 to keep
+it running instead).
+
+Env overrides:
+  TEXT VOICE MODEL BASE SERVICE RIVAL DOCKER TTS_CMD READY_TIMEOUT REPEATS
+  KEEP_UP OUTDIR
+EOF
+}
+
 WHICH="${1:-all}"
 case "$WHICH" in
-  A|B|C|all) ;;
-  -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
-  *) echo "unknown test '$WHICH' (want A, B, C or all)" >&2; exit 2 ;;
+  A|B|C|all|up|down) ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) echo "unknown mode '$WHICH'" >&2; usage >&2; exit 2 ;;
 esac
 
 # ---------------------------------------------------------------- helpers
 
-say()  { printf '%s\n' "$*"; }
+say()   { printf '%s\n' "$*"; }
 head1() { printf '\n=== %s ===\n' "$*"; }
 verdict() { printf '  >> %-4s %s\n' "$1" "$2"; }
 
+# Ask for the sudo password once, at the start, then keep the timestamp alive.
+# `all` does five restarts and can easily outlive sudo's default 15-minute
+# timeout; a prompt appearing mid-sequence would stall the run unattended.
+prime_sudo() {
+  [[ "$DOCKER" == sudo\ * ]] || return 0
+  say "  priming sudo (no docker group here, so every compose call needs it)"
+  if ! sudo -v; then
+    say "  sudo failed, cannot drive compose" >&2
+    exit 1
+  fi
+  ( while true; do sleep 60; sudo -n true 2>/dev/null || exit 0; done ) &
+  SUDO_KEEPALIVE_PID=$!
+}
+
+cleanup() {
+  local rc=$?
+  set +e
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null
+  fi
+  # Succeeds only if empty, so up/down modes leave no litter but real runs keep
+  # their wavs and logs.
+  rmdir "$OUTDIR" 2>/dev/null
+  if (( STARTED_BY_US )) || (( RIVAL_WAS_UP )); then
+    if [[ "$KEEP_UP" == 1 ]]; then
+      say ""
+      say "KEEP_UP=1, leaving containers as they are."
+      (( RIVAL_WAS_UP )) && say "  note: $RIVAL is still stopped; restore it with"
+      (( RIVAL_WAS_UP )) && say "        $DOCKER compose up -d $RIVAL"
+    else
+      say ""
+      say "restoring the container state we found:"
+      if (( STARTED_BY_US )); then
+        say "  stopping $SERVICE (we started it)"
+        $DOCKER compose stop "$SERVICE" >/dev/null 2>&1
+      fi
+      if (( RIVAL_WAS_UP )); then
+        say "  bringing $RIVAL back up (we stopped it for the port)"
+        $DOCKER compose up -d "$RIVAL" >/dev/null 2>&1
+      fi
+    fi
+  fi
+  exit "$rc"
+}
+
+is_running() {
+  [[ -n "$($DOCKER compose ps -q --status running "$1" 2>/dev/null)" ]]
+}
+
 wait_ready() {
-  local deadline=$((SECONDS + READY_TIMEOUT))
+  local start=$SECONDS elapsed
   printf '  waiting for %s/health ' "$BASE"
-  while (( SECONDS < deadline )); do
+  while (( SECONDS - start < READY_TIMEOUT )); do
     if curl -fsS -o /dev/null --max-time 3 "$BASE/health" 2>/dev/null; then
-      printf ' ready\n'
+      printf ' ready in %ds\n' $((SECONDS - start))
       return 0
     fi
-    printf '.'
+    elapsed=$((SECONDS - start))
+    # A dot every 3s, the elapsed seconds every 30s, so a long weight download
+    # looks like progress rather than a hang.
+    if (( elapsed > 0 && elapsed % 30 < 3 )); then printf '[%ds]' "$elapsed"; else printf '.'; fi
     sleep 3
   done
   printf '\n'
-  say "  TIMEOUT after ${READY_TIMEOUT}s. Check: $DOCKER compose logs --tail 50 $SERVICE"
+  say "  TIMEOUT after ${READY_TIMEOUT}s. Check:  $DOCKER compose logs --tail 50 $SERVICE" >&2
   return 1
+}
+
+# Bring the service up if needed, evicting the rival TTS service from :8003
+# first. Records what it changed so cleanup can undo it.
+ensure_up() {
+  if is_running "$SERVICE"; then
+    say "  $SERVICE is already running (leaving it up afterwards)"
+  else
+    if is_running "$RIVAL"; then
+      say "  $RIVAL holds :8003 (both TTS services bind it by design); stopping it"
+      $DOCKER compose stop "$RIVAL" >/dev/null
+      RIVAL_WAS_UP=1
+    fi
+    say "  starting $SERVICE (first run also builds the image)"
+    $DOCKER compose up -d --build "$SERVICE" >/dev/null
+    STARTED_BY_US=1
+  fi
+  wait_ready
 }
 
 # Restart = fresh process = the RNG is re-seeded to ModelConfig.seed. This is the
@@ -97,9 +195,8 @@ detect_model() {
   say "  model: $MODEL"
   if [[ "${MODEL,,}" != *voxtral* ]]; then
     say ""
-    say "  REFUSING: :8003 is serving '$MODEL', not Voxtral. Both TTS services bind"
-    say "  this port by design, so you are probably pointed at crispasr-tts (TADA)."
-    say "  Start the right one:  $DOCKER compose up -d --build $SERVICE"
+    say "  REFUSING: :8003 is serving '$MODEL', not Voxtral. Something other than" >&2
+    say "  the $SERVICE container is answering on that port." >&2
     exit 1
   fi
 }
@@ -108,7 +205,10 @@ detect_model() {
 synth() {
   local name="$1"; shift
   local out="$OUTDIR/$name.wav"
-  local -a cmd=("$TTS_CMD" -t "$TEXT" --voice "$VOICE" --format wav -o "$out")
+  # --url from BASE, so overriding BASE moves the synthesis too and not just the
+  # health poll. Without this they can silently diverge and the test measures a
+  # different server than the one it restarts.
+  local -a cmd=("${TTS_ARGV[@]}" --url "$BASE" -t "$TEXT" --voice "$VOICE" --format wav -o "$out")
   [[ -n "$MODEL" ]] && cmd+=(--model "$MODEL")
   cmd+=("$@")
   # Diagnostics go to stderr: this function's stdout is captured by the caller,
@@ -121,24 +221,22 @@ synth() {
   printf '%s' "$out"
 }
 
-# sha256 (first 12 chars) of a file.
 hash_of() { sha256sum "$1" | cut -c1-12; }
 
-# Duration in seconds from the WAV header, and the implied 12.5 Hz frame count:
-# frames are what stage 0 actually decided, so a duration change IS a frame change.
-dur_of() {
-  python - "$1" <<'PY'
-import sys, wave
-with wave.open(sys.argv[1]) as w:
-    secs = w.getnframes() / float(w.getframerate())
-print(f"{secs:8.3f}s  ~{round(secs * 12.5):5d} frames")
-PY
+secs_of() {
+  python -c 'import sys,wave;w=wave.open(sys.argv[1]);print("%.3f"%(w.getnframes()/float(w.getframerate())))' "$1"
 }
 
-# Report one take: label, hash, duration.
+# Duration plus the implied 12.5 Hz frame count: frames are what stage 0 actually
+# decided, so a duration change IS a frame count change.
+dur_of() {
+  local s; s="$(secs_of "$1")"
+  printf '%8.3fs  ~%5d frames' "$s" "$(python -c "print(round($s * 12.5))")"
+}
+
 report() {
   local label="$1" f="$2"
-  printf '  %-22s %s  %s\n' "$label" "$(hash_of "$f")" "$(dur_of "$f")"
+  printf '  %-26s %s  %s\n' "$label" "$(hash_of "$f")" "$(dur_of "$f")"
 }
 
 # ---------------------------------------------------------------- tests
@@ -150,7 +248,7 @@ test_A() {
 
   restart_server
   local a1; a1="$(synth A_seed1 --seed 1)"
-  report "seed=1  (1st after boot)" "$a1"
+  report "seed=1   (1st after boot)" "$a1"
 
   restart_server
   local a2; a2="$(synth A_seed999 --seed 999)"
@@ -217,7 +315,7 @@ test_C() {
   for (( i = 1; i <= REPEATS; i++ )); do
     f="$(synth "C_call$i")"
     hashes+=("$(hash_of "$f")")
-    durs+=("$(python -c 'import sys,wave;w=wave.open(sys.argv[1]);print("%.3f"%(w.getnframes()/float(w.getframerate())))' "$f")")
+    durs+=("$(secs_of "$f")")
     printf '  call %-3d %s  %ss\n' "$i" "${hashes[-1]}" "${durs[-1]}"
   done
 
@@ -241,21 +339,41 @@ test_C() {
 # ---------------------------------------------------------------- main
 
 say "Voxtral TTS determinism probe"
+say "  mode    : $WHICH"
 say "  service : $SERVICE at $BASE"
+[[ "$WHICH" == up || "$WHICH" == down ]] || say "  outputs : $OUTDIR"
+
+prime_sudo
+trap cleanup EXIT INT TERM
+
+if [[ "$WHICH" == down ]]; then
+  say ""
+  if is_running "$SERVICE"; then
+    say "stopping $SERVICE"
+    $DOCKER compose stop "$SERVICE" >/dev/null
+    say "done. To put the other TTS back on :8003:  $DOCKER compose up -d $RIVAL"
+  else
+    say "$SERVICE is not running, nothing to do"
+  fi
+  exit 0
+fi
+
 say "  text    : ${TEXT:0:60}..."
 say "  voice   : $VOICE"
-say "  outputs : $OUTDIR"
 say ""
 say "  NOTE: no warmup call is sent, ever. A synthesis before the measurement"
 say "  would advance the RNG and invalidate every comparison below."
-
-if ! curl -fsS -o /dev/null --max-time 5 "$BASE/health" 2>/dev/null; then
-  say ""
-  say "  $SERVICE is not up yet. Start it first:"
-  say "    $DOCKER compose up -d --build $SERVICE"
-  exit 1
-fi
+say ""
+ensure_up
 detect_model
+
+if [[ "$WHICH" == up ]]; then
+  KEEP_UP=1
+  say ""
+  say "$SERVICE is up and ready at $BASE. Left running (mode 'up')."
+  say "Stop it with:  ./voxtral/test_seed_determinism.sh down"
+  exit 0
+fi
 
 case "$WHICH" in
   A)   test_A ;;
