@@ -171,8 +171,19 @@ services:
       # Acoustic-decoder (stage 1) sampling temperature (entrypoint default is 0.7,
       # lowered from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
-      # Seed for both stages: fixed = reproducible; change for a different take:
+      # vLLM ENGINE seed for both stages (not a sampling param: the sampling seed is
+      # inert here, see the entrypoint's note). This is the only seed that reaches the
+      # one random draw in the pipeline, the Gaussian each frame's flow-matching ODE
+      # starts from. vLLM already defaults it to 0, so takes are already deterministic
+      # per process from the first request; changing this just picks a different
+      # stream. Reproducing one specific request still needs a restart, because every
+      # generated frame advances that global RNG:
       # - VOXTRAL_SEED=42
+      # Bitwise determinism escape hatch, read by vLLM itself (not the entrypoint).
+      # Forces batch-invariant kernels so results stop depending on how requests get
+      # batched together. Costs throughput; only worth it when chasing a numerical
+      # diff. See vllm/model_executor/layers/batch_invariant.py:
+      # - VLLM_BATCH_INVARIANT=1
       # Per-stage max concurrent sequences (packaged 32). NOTE: the acoustic stage
       # is codec-bs=1, so audio throughput saturates around client concurrency 4-8;
       # raising this past that buys little. (The 0.18 runtime.defaults.max_inflight

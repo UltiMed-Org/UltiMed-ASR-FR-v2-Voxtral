@@ -208,8 +208,31 @@ that older hand-run recipe.)
     therefore not covered by `VOXTRAL_SEED` either. Confirm with one A/B before trusting
     either knob; the real quality levers appear to be `VOXTRAL_EULER_STEPS` and
     `VOXTRAL_CFG_ALPHA`.
-  - `VOXTRAL_SEED` -> seed on both stages (fixed = reproducible; change for a different
-    take). Not settable per request.
+  - `VOXTRAL_SEED` -> the vLLM **engine** seed (`ModelConfig.seed`) on both stages, *not* a
+    sampling param. The distinction is the whole game, because **sampling params cannot
+    affect Voxtral's audio at all**: stage 0 feeds vLLM's Sampler the output of
+    `fake_logits_for_audio_tokens()`, a vocab-wide `-inf` row with exactly **one** finite
+    entry (`voxtral_tts_audio_generation.py:1041`), so the winning token is forced whatever
+    seed/temperature/top_p/top_k/repetition_penalty say, and stage 1 raises if asked for
+    logits at all. The audio is produced *beside* that path in `make_omni_output`
+    (`voxtral_tts.py:325-337`). So the **only** randomness in the whole pipeline is the
+    Gaussian each frame's flow-matching ODE starts from (`torch.randn` at
+    `voxtral_tts_audio_generation.py:527`, or `static_noise.normal_()` in the CUDA-graph
+    path), drawn from the **global** torch RNG with no generator argument. vLLM seeds that
+    global RNG from `ModelConfig.seed` and deliberately re-seeds it after warmup
+    (`v1/worker/gpu_worker.py:712`, "so the random state is not affected by model
+    initialization and profiling"), and the default is already **0**. Consequences:
+    takes are **already deterministic per process** (request N after a fresh boot is
+    reproducible if requests 1..N-1 were identical), `VOXTRAL_SEED` picks a *different*
+    deterministic stream rather than switching determinism on, and reproducing one specific
+    request needs a **restart** because every generated frame advances that RNG. Concurrency
+    destroys it outright (interleaved draws). Per-request reproducibility would need the
+    noise drawn from a seeded `torch.Generator`, i.e. an upstream vllm-omni change.
+  - `VLLM_BATCH_INVARIANT=1` (a vLLM env var, not read by `entrypoint.sh`; surfaced
+    commented in the compose service) forces batch-invariant kernels so results stop
+    depending on how requests happen to batch together. Needed for *bitwise* determinism on
+    top of a pinned RNG, since reduction order otherwise shifts with batch shape. Costs
+    throughput; only worth it when chasing a numerical diff.
   - `VOXTRAL_MAX_NUM_SEQS` -> both stages' `max_num_seqs` (packaged **32**). Unset = 32.
     Note the acoustic stage is `codec-bs=1`, so per the maintainers audio throughput
     **saturates around client concurrency 4-8**; raising this past that buys little. (The

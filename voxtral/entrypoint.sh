@@ -34,8 +34,16 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #   VOXTRAL_ACOUSTIC_TEMP -> stage_id 1 sampling temperature. Default 0.7 (lowered
 #                            from upstream 0.9 for steadier, less artifacty audio;
 #                            raise toward 0.9 for more expressive/varied output).
-#   VOXTRAL_SEED          -> seed on BOTH stages (fixed = reproducible; change it
-#                            for a different rendition of the same text+voice).
+#   VOXTRAL_SEED          -> vLLM engine seed on BOTH stages (NOT a sampling param,
+#                            see the long note at the patch site: the sampling seed
+#                            cannot affect Voxtral's output, the engine seed can
+#                            because it seeds the global RNG the flow-matching noise
+#                            is drawn from). vLLM already defaults it to 0, so this
+#                            selects a different deterministic stream rather than
+#                            turning determinism on. Reproducing one specific request
+#                            still needs a restart (every frame advances that RNG).
+#                            Not settable per request either: the request's `seed`
+#                            field lands in sampling params, i.e. in the inert half.
 #   VOXTRAL_MAX_NUM_SEQS  -> both stages' max_num_seqs (packaged 32). The acoustic
 #                            stage is codec-bs=1, so raising this past the ~4-8
 #                            concurrency saturation point buys little.
@@ -90,15 +98,15 @@ max_tokens = os.environ.get("VOXTRAL_MAX_TOKENS")  # stage 0 output-length cap
 max_model_len = os.environ.get("VOXTRAL_MAX_MODEL_LEN")  # stage 0 total context
 
 
-def _positive_int(name, raw):
-    """Parse a length knob, refusing junk at boot instead of letting pyyaml write a
+def _bounded_int(name, raw, minimum=1):
+    """Parse an integer knob, refusing junk at boot instead of letting pyyaml write a
     string into a field vLLM will later reject with a much less obvious error."""
     try:
         value = int(raw)
     except ValueError:
         sys.exit("voxtral entrypoint: %s must be an integer, got %r" % (name, raw))
-    if value < 1:
-        sys.exit("voxtral entrypoint: %s must be >= 1, got %d" % (name, value))
+    if value < minimum:
+        sys.exit("voxtral entrypoint: %s must be >= %d, got %d" % (name, minimum, value))
     return value
 
 
@@ -114,11 +122,26 @@ if cfg_alpha is not None and abs(float(cfg_alpha) - 1.0) < 1e-9:
 
 for stage in cfg.get("stages", []):
     sampling = stage.setdefault("default_sampling_params", {})
+    # Seed goes on the STAGE (a vLLM EngineArgs field, reaching ModelConfig.seed via
+    # StageDeployConfig.engine_extras), NOT in default_sampling_params. The sampling
+    # seed is provably inert here: stage 0 hands vLLM's Sampler the output of
+    # fake_logits_for_audio_tokens(), a vocab-wide -inf row with exactly ONE finite
+    # entry, so the argmax is forced no matter what seed/temperature/top_p do; and
+    # stage 1 never calls compute_logits at all. The engine seed is what matters,
+    # because the ONE random draw in the whole pipeline (the Gaussian each frame's
+    # flow-matching ODE starts from) comes from the global torch RNG, which vLLM
+    # re-seeds to ModelConfig.seed after warmup (v1/worker/gpu_worker.py). Default is
+    # already 0, so takes are deterministic per process from the first request; this
+    # only picks a different stream. Reproducing one specific request still needs a
+    # restart, since every generated frame advances that global RNG.
     if seed:
-        sampling["seed"] = int(seed)
+        stage["seed"] = _bounded_int("VOXTRAL_SEED", seed, minimum=0)
     if max_num_seqs:
         stage["max_num_seqs"] = int(max_num_seqs)
-    # stage_id 1 = acoustic decoder; its temperature is the audio-quality lever.
+    # stage_id 1 = audio_tokenizer (latents -> waveform). SUSPECTED NO-OP: that model
+    # has no sampling path and never calls compute_logits, so this temperature very
+    # likely changes nothing. Kept because it is harmless and unverified on real
+    # hardware; A/B 0.7 vs 0.9 on identical text (byte-identical output = inert).
     if stage.get("stage_id") == 1 and temp:
         sampling["temperature"] = float(temp)
     # stage_id 0 = AR LLM; cfg_alpha lives in ITS sampling extra_args (that is
@@ -136,9 +159,9 @@ for stage in cfg.get("stages", []):
     # 1 is fed 50-frame chunks by generator2tokenizer_async_chunk and never sees the
     # whole utterance, so its own max_tokens does not cap duration.
     if stage.get("stage_id") == 0 and max_tokens:
-        sampling["max_tokens"] = _positive_int("VOXTRAL_MAX_TOKENS", max_tokens)
+        sampling["max_tokens"] = _bounded_int("VOXTRAL_MAX_TOKENS", max_tokens)
     if stage.get("stage_id") == 0 and max_model_len:
-        stage["max_model_len"] = _positive_int("VOXTRAL_MAX_MODEL_LEN", max_model_len)
+        stage["max_model_len"] = _bounded_int("VOXTRAL_MAX_MODEL_LEN", max_model_len)
 
 # The prompt always costs tokens, so a max_tokens that reaches max_model_len can
 # never be spent in full: vLLM stops the request at the context limit instead
