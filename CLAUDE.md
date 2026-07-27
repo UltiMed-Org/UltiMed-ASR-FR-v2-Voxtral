@@ -186,7 +186,14 @@ that older hand-run recipe.)
   usually still the better answer (steadier prosody, far lower time-to-first-audio, and a
   bad take costs seconds not minutes).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
-  service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
+  service's `environment:`). Changing a knob's **value** needs no rebuild, just `up -d`
+  (`restart` is not enough: it does not re-read `environment:`). Changing **`entrypoint.sh`
+  itself does**, because `voxtral/Dockerfile` COPYs it into the image, so a knob added in
+  this repo is silently ignored by an older image, with the var set and nothing happening.
+  That already bit `VOXTRAL_PER_REQUEST_SEED` once, which is why its `PYTHONPATH` now comes
+  from compose instead. To tell the two apart, read the `voxtral entrypoint: patched ... ->
+  ...` line the script logs at boot: it lists every knob that image knows about and their
+  effective values. Voxtral is a
   **two-stage** pipeline (topology frozen in `model_executor/models/voxtral_tts/pipeline.py`):
   stage 0 = `audio_generation`, the 4B AR LLM, text -> acoustic latents, greedy at temp 0.0,
   `enforce_eager: false` so already compiled/CUDA-graph'd; stage 1 = `audio_tokenizer`,
@@ -234,8 +241,10 @@ that older hand-run recipe.)
     varied call to call inside one process. `VOXTRAL_PER_REQUEST_SEED` below lifts the
     restart requirement.
   - `VOXTRAL_PER_REQUEST_SEED=1` -> make a take reproducible **per request**, no restart.
-    This is the one knob here that is **not** upstream behaviour: it puts
-    `/opt/voxtral-patches` (compose-mounted from `voxtral/patches/`) on `PYTHONPATH`, whose
+    This is the one knob here that is **not** upstream behaviour: with
+    `/opt/voxtral-patches` (compose-mounted from `voxtral/patches/`) on `PYTHONPATH`, set
+    **in the compose `environment:`** rather than by `entrypoint.sh` (see the rebuild note
+    above), its
     `sitecustomize.py` monkeypatches `VoxtralTTSForConditionalGeneration.make_omni_output`
     to re-pin the global torch RNG just before each frame's noise draw, from a seed the
     request carries plus that request's own frame counter. Clients send it as
@@ -301,7 +310,7 @@ that older hand-run recipe.)
   - `VOXTRAL_MAX_TOKENS` -> stage_id 0's `default_sampling_params.max_tokens`, the
     per-request audio-length cap in 12.5 Hz frames (packaged **2048** = 163.84 s; unset =
     2048). See the length bullet above; `tts.py --max-new-tokens` overrides it per call up
-    to 4096.
+    to 4096. **Compose runs 4096** (= 327.68 s), matching that per-request ceiling.
   - `VOXTRAL_MAX_MODEL_LEN` -> stage_id 0's `max_model_len` (packaged **4096**; unset =
     4096), shared by the prompt's text tokens and the generated frames, so it is the true
     length ceiling. Each token of context costs ~104 KiB of KV cache (2 x 26 layers x 8 kv
@@ -309,7 +318,9 @@ that older hand-run recipe.)
     `VOXTRAL_GPU_MEM_UTIL`, so raising this does not allocate more memory: it trades
     concurrency (how many long requests fit before preemption) for length. Note
     `VLLM_EXTRA_ARGS=--max-model-len ...` is **not** the lever, the per-stage YAML field
-    is.
+    is. **Compose runs 6144**: 4096 frames plus ~2048 tokens of prompt room, because
+    leaving it at 4096 alongside `max_tokens=4096` would make the last frames unreachable
+    (the entrypoint warns when `max_tokens >= max_model_len`).
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
     Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
