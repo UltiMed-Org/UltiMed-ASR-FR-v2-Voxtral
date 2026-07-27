@@ -363,9 +363,18 @@ test_D() {
   say "  voxtral/patches/sitecustomize.py into the stage-0 engine process."
 
   if ! patch_active; then
-    verdict SKIP "patch not loaded (no '[voxtral-seed-patch] active' line in the log)."
-    say "     Uncomment VOXTRAL_PER_REQUEST_SEED=1 in docker-compose.yml, then:"
+    verdict SKIP "patch not loaded: no '[voxtral-seed-patch] active' line in the log."
+    say "     Setting the env var is not enough on its own, so here is what the running"
+    say "     container actually has:"
+    $DOCKER compose exec -T "$SERVICE" env 2>/dev/null \
+      | grep -E '^(VOXTRAL_PER_REQUEST_SEED|PYTHONPATH)=' | sed 's/^/       /' \
+      || say "       neither VOXTRAL_PER_REQUEST_SEED nor PYTHONPATH is set in there"
+    say "     Both are needed: the var is the toggle, PYTHONPATH=/opt/voxtral-patches is"
+    say "     what actually imports the patch. Both come from docker-compose.yml, and"
+    say "     env edits need a recreate, which \`restart\` does not do:"
     say "       $DOCKER compose up -d $SERVICE && ./voxtral/test_seed_determinism.sh D"
+    say "     If they are both set and this still skips, the patch raised on import:"
+    say "       $DOCKER compose logs $SERVICE | grep voxtral-seed-patch"
     return 0
   fi
 
