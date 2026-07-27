@@ -247,6 +247,13 @@ def _install_lazy_hook():
             return spec
 
     sys.meta_path.insert(0, _Finder())
+    # Logged on every interpreter that imports this file, BEFORE any patching, so
+    # the log can tell three states apart: no line at all means this file was
+    # never imported (PYTHONPATH does not reach the process); "armed" without a
+    # later "active" means it was imported but the model module never came through
+    # the hook; "active" means the patch is on. Without this line the first two
+    # look identical, which cost a debugging round.
+    _log("armed in pid %d, watching for %s" % (os.getpid(), _TARGET_MODULE))
 
 
 _chain_other_sitecustomize()

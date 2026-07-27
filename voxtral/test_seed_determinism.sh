@@ -69,7 +69,7 @@ SUDO_KEEPALIVE_PID=""
 
 usage() {
   cat <<'EOF'
-Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|all|up|down]
+Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|all|up|down|doctor]
 
   A     Does the request `seed` field change anything?   (2 restarts)
   B     Is output reproducible per process?              (2 restarts)
@@ -78,6 +78,7 @@ Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|all|up|down]
   all   A then B then C then D (default)
   up    Just bring voxtral-tts up and leave it running
   down  Just stop voxtral-tts
+  doctor Check why per-request seeding is not active (no synthesis)
 
 Every restart reloads ~9GB of weights, so `all` takes a while. The service is
 started if needed and restored to its original state on exit (KEEP_UP=1 to keep
@@ -91,7 +92,7 @@ EOF
 
 WHICH="${1:-all}"
 case "$WHICH" in
-  A|B|C|D|all|up|down) ;;
+  A|B|C|D|all|up|down|doctor) ;;
   -h|--help|help) usage; exit 0 ;;
   *) echo "unknown mode '$WHICH'" >&2; usage >&2; exit 2 ;;
 esac
@@ -403,6 +404,89 @@ test_D() {
   fi
 }
 
+# ---------------------------------------------------------------- doctor
+
+# Check every link in the seeding chain INSIDE the running container, in
+# dependency order, so the first failing step is the cause and not a symptom.
+# Written because "test D skips" was indistinguishable from three different
+# breakages, and none of them can be seen from the host.
+doctor() {
+  head1 "DOCTOR: is per-request seeding actually wired up?"
+  if ! is_running "$SERVICE"; then
+    say "  $SERVICE is NOT running, so nothing below can be inspected. That is also"
+    say "  what a crash loop looks like from here, and 'start it' would be useless"
+    say "  advice in that case, so here is the state and the tail of the log:"
+    say ""
+    $DOCKER compose ps "$SERVICE" 2>&1 | sed 's/^/     /' || true
+    say ""
+    $DOCKER compose logs --tail 25 "$SERVICE" 2>&1 | sed 's/^/     /' || true
+    say ""
+    say "  If it never started:  $DOCKER compose up -d $SERVICE"
+    say "  If it died at boot, the tail above says why. A likely candidate after a"
+    say "  length change is stage 0 failing to fit: lower VOXTRAL_MAX_MODEL_LEN or"
+    say "  VOXTRAL_GPU_MEM_UTIL in docker-compose.yml."
+    return 1
+  fi
+
+  say ""
+  say "1. env inside the container (both lines must be there)"
+  $DOCKER compose exec -T "$SERVICE" env 2>/dev/null \
+    | grep -E '^(VOXTRAL_PER_REQUEST_SEED|PYTHONPATH)=' | sed 's/^/     /' \
+    || { say "     NEITHER is set, yet docker-compose.yml has both: this container predates"
+         say "     that edit. Recreate it (\`restart\` does NOT re-read environment:):"
+         say "       $DOCKER compose up -d $SERVICE"; }
+
+  say ""
+  say "2. the patch file as the container sees it (must be readable by the runtime uid)"
+  $DOCKER compose exec -T "$SERVICE" ls -l /opt/voxtral-patches/ 2>&1 | sed 's/^/     /' \
+    || say "     could not list /opt/voxtral-patches (mount missing?)"
+
+  say ""
+  say "3. does python in the container pick it up as sitecustomize?"
+  $DOCKER compose exec -T "$SERVICE" python3 -c '
+import sys
+try:
+    import sitecustomize
+except ModuleNotFoundError:
+    print("NO: sitecustomize not importable, so PYTHONPATH does not reach python")
+    raise SystemExit(1)
+print("yes:", getattr(sitecustomize, "__file__", "?"))
+print("import hook installed:", any(type(f).__name__ == "_Finder" for f in sys.meta_path))
+' 2>&1 | sed 's/^/     /' || say "     ^ this step failed, see above"
+
+  say ""
+  say "4. does importing the model module apply the patch? (pulls in torch, ~30s)"
+  local log4="$OUTDIR/doctor_import.log"
+  if $DOCKER compose exec -T "$SERVICE" python3 -c '
+import vllm_omni.model_executor.models.voxtral_tts.voxtral_tts as m
+print("PATCHED:", getattr(m.VoxtralTTSForConditionalGeneration.make_omni_output,
+                          "_voxtral_seed_patched", False))
+' >"$log4" 2>&1; then
+    grep -E 'voxtral-seed-patch|PATCHED:' "$log4" | sed 's/^/     /' || tail -3 "$log4" | sed 's/^/     /'
+  else
+    say "     the import itself failed; last lines:"
+    tail -5 "$log4" | sed 's/^/     /'
+  fi
+
+  say ""
+  say "5. what the running server logged (seeding, and the effective YAML knobs)"
+  $DOCKER compose logs "$SERVICE" 2>/dev/null \
+    | grep -E 'voxtral-seed-patch|entrypoint: patched|entrypoint: per-request' \
+    | tail -8 | sed 's/^/     /' \
+    || say "     nothing: no [voxtral-seed-patch] lines and no 'entrypoint: patched' line"
+
+  say ""
+  say "  How to read step 5:"
+  say "    'active'           -> the patch IS on; a failing test D is then a behaviour"
+  say "                          problem (concurrency, or extra_args lost), not wiring."
+  say "    'armed' but no     -> this file was imported but the model module never came"
+  say "    'active'              through the hook. Paste steps 3-5 and I can dig."
+  say "    neither            -> PYTHONPATH never reached the server process. Step 1 says"
+  say "                          whether the container even has it."
+  say "    'entrypoint: patched ... max_tokens=N' is the audio-length answer: no"
+  say "    max_tokens= field there means that image predates the knob (up -d --build)."
+}
+
 # ---------------------------------------------------------------- main
 
 say "Voxtral TTS determinism probe"
@@ -423,6 +507,12 @@ if [[ "$WHICH" == down ]]; then
     say "$SERVICE is not running, nothing to do"
   fi
   exit 0
+fi
+
+if [[ "$WHICH" == doctor ]]; then
+  KEEP_UP=1
+  doctor
+  exit $?
 fi
 
 say "  text    : ${TEXT:0:60}..."
