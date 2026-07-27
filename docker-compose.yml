@@ -232,15 +232,26 @@ services:
       # 12.5 Hz audio frame per decode step, so the packaged max_tokens of 2048
       # means 163.84 s; past that the audio is cut off mid-sentence with
       # finish_reason "length" and no error. 12.5 frames = 1 second, so
-      # seconds x 12.5 = the value to set (4096 = 327.68 s, 7500 = 600 s):
+      # seconds x 12.5 = the value to set (4096 = 327.68 s, 7500 = 600 s). 4096 is
+      # also the ceiling tts.py --max-new-tokens can ask for per request
+      # (vllm-omni's _TTS_MAX_NEW_TOKENS_MAX), so setting it here means the two
+      # agree and no request can be silently truncated below it:
       # - VOXTRAL_MAX_TOKENS=2048
+      - VOXTRAL_MAX_TOKENS=4096
       # Stage-0 context (packaged 4096). Prompt text tokens and generated frames
       # SHARE it, so this is the real ceiling and VOXTRAL_MAX_TOKENS above is
       # unreachable beyond it. Not a model limit (the checkpoint's params.json
       # says max_seq_len 65536), but every token of context costs ~104 KiB of KV
       # cache, so raising it trades concurrency for length inside the same
       # VOXTRAL_GPU_MEM_UTIL pool. Keep it above VOXTRAL_MAX_TOKENS + the prompt:
+      # leaving it at the packaged 4096 with max_tokens=4096 would mean the 4096th
+      # frame is never reached, since the text tokens are spent from the same 4096.
+      # 6144 = 4096 frames + ~2048 tokens of prompt room, which covers the ~1200-1600
+      # French tokens it takes to ask for 327 s of speech; the entrypoint warns if
+      # this ever drops back to or below max_tokens. ~640 MiB of KV cache for one
+      # full-length request, against a pool of several GB at GPU_MEM_UTIL=0.7:
       # - VOXTRAL_MAX_MODEL_LEN=4096
+      - VOXTRAL_MAX_MODEL_LEN=6144
       # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap).
       # NOTE: --max-model-len is NOT the lever here, the per-stage YAML field is
       # (use VOXTRAL_MAX_MODEL_LEN above):
