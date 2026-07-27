@@ -26,8 +26,11 @@ particular does nothing there: stage 0's sampler is handed logits with a single
 finite entry, so its result is forced. The one random draw in that pipeline
 (each frame's flow-matching noise) comes from the global RNG, which vLLM
 already pins, so takes are deterministic per process and reproducing a specific
-one needs a restart. See the Voxtral seed notes in CLAUDE.md. If vLLM rejects a
-request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
+one needs a restart, unless the service was started with
+`VOXTRAL_PER_REQUEST_SEED=1`, in which case `--noise-seed N` makes that one
+request reproducible on demand. See the Voxtral seed notes in CLAUDE.md. If
+vLLM rejects a request without a model name, add
+`--model mistralai/Voxtral-4B-TTS-2603`.
 
 The deployed backend is HumeAI TADA 3B multilingual (French), so this
 client exposes TADA's per-request knobs. As of CrispASR #197 the talker
@@ -181,6 +184,7 @@ def build_speech_body(
     num_steps: int | None = None,
     cfg_scale: float | None = None,
     cfg_alpha: float | None = None,
+    noise_seed: int | None = None,
     noise_temp: float | None = None,
     max_new_tokens: int | None = None,
     consent_attestation: str | None = None,
@@ -259,6 +263,13 @@ def build_speech_body(
         to `cfg_scale` above: different backend, different server field,
         different default. Unset = the value the server booted with
         (`VOXTRAL_CFG_ALPHA` in docker-compose.yml).
+    noise_seed : int or None
+        Voxtral per-request seed for the flow-matching noise, sent nested in
+        `extra_params` as `voxtral_noise_seed`. Only does something when the
+        service runs with `VOXTRAL_PER_REQUEST_SEED=1`, which injects
+        `voxtral/patches/sitecustomize.py`; stock vllm-omni ignores the key and
+        the take stays unreproducible without a restart. Unrelated to `seed`
+        above, which Voxtral cannot act on at all.
     noise_temp : float or None
         TADA acoustic noise temperature (server field `noise_temp`, default
         0.9). Env `TADA_NOISE_TEMP`.
@@ -315,14 +326,23 @@ def build_speech_body(
     }
     body.update({k: v for k, v in optional.items() if v is not None})
     # Voxtral takes its model-specific knobs through a nested `extra_params`
-    # object instead of flat fields, which is why cfg_alpha cannot join the map
+    # object instead of flat fields, which is why these two cannot join the map
     # above. Server side (vllm-omni 0.22) `serving_speech.py` merges that object
-    # into stage 0's SamplingParams.extra_args, and the model then reads one
-    # cfg_alpha per request from it (`voxtral_tts.py::_extract_cfg_alpha`,
-    # falling back to 1.2). Still opt-in like everything else here: omitted
-    # entirely when unset, so the server keeps its deploy-YAML default.
-    if cfg_alpha is not None:
-        body["extra_params"] = {"cfg_alpha": cfg_alpha}
+    # verbatim into stage 0's SamplingParams.extra_args, and the model then reads
+    # one cfg_alpha per request from it (`voxtral_tts.py::_extract_cfg_alpha`,
+    # falling back to 1.2). `voxtral_noise_seed` rides the same route, but stock
+    # vllm-omni has no reader for it: only our optional monkeypatch does (see
+    # voxtral/patches/sitecustomize.py), which is why sending it to a server
+    # without VOXTRAL_PER_REQUEST_SEED is harmless rather than an error. Still
+    # opt-in like everything else here: the whole object is omitted when both are
+    # unset, so the server keeps its deploy-YAML defaults.
+    extra_params = {
+        "cfg_alpha": cfg_alpha,
+        "voxtral_noise_seed": noise_seed,
+    }
+    extra_params = {k: v for k, v in extra_params.items() if v is not None}
+    if extra_params:
+        body["extra_params"] = extra_params
     return body
 
 
@@ -346,6 +366,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         num_steps=args.num_steps,
         cfg_scale=args.cfg_scale,
         cfg_alpha=args.cfg_alpha,
+        noise_seed=args.noise_seed,
         noise_temp=args.noise_temp,
         max_new_tokens=args.max_new_tokens,
         consent_attestation=args.consent_attestation,
@@ -630,7 +651,8 @@ def main() -> int:
                         "With sampling on, different seeds change the wording. NOTE: this "
                         "is a TADA/CrispASR knob; against voxtral-tts it lands in stage 0's "
                         "sampling params, which are forced by construction there, so it "
-                        "does nothing (see the Voxtral seed notes in CLAUDE.md).")
+                        "does nothing: use --noise-seed instead (see the Voxtral seed "
+                        "notes in CLAUDE.md).")
 
     voice = p.add_argument_group(
         "voice / cloning",
@@ -702,12 +724,13 @@ def main() -> int:
     acoustic.add_argument("--noise-temp", type=float, default=None,
                           help="Acoustic noise temperature. Server default 0.9.")
 
-    # Voxtral (vllm-omni) knobs. --cfg-alpha is the odd one out: unlike every
-    # group above it does not map to a flat server field but rides inside the
-    # request's `extra_params` object (see build_speech_body), while
-    # --max-new-tokens is a plain field. These two are the whole per-request
-    # surface for Voxtral quality/length; temperature/seed/Euler-steps are
-    # startup-only there (VOXTRAL_* env vars in docker-compose.yml).
+    # Voxtral (vllm-omni) knobs. --cfg-alpha and --noise-seed are the odd ones
+    # out: unlike every group above they do not map to flat server fields but
+    # ride inside the request's `extra_params` object (see build_speech_body),
+    # while --max-new-tokens is a plain field. Those three are the whole
+    # per-request surface for Voxtral quality/length/reproducibility;
+    # temperature and Euler-steps are startup-only there (VOXTRAL_* env vars in
+    # docker-compose.yml), and --noise-seed needs one of them enabled.
     voxtral = p.add_argument_group(
         "Voxtral (vLLM)",
         "Per-request knobs the voxtral-tts service honours. Unset = the value the "
@@ -718,6 +741,14 @@ def main() -> int:
                               "(deploy default 1.2; higher = tighter text adherence). "
                               "Distinct from TADA's --cfg-scale. 1.0 disables CFG and "
                               "yields garbled, off-text audio.")
+    voxtral.add_argument("--noise-seed", type=int, default=None,
+                         help="Seed THIS request's per-frame flow-matching noise, so the "
+                              "same text plus the same value gives identical audio with no "
+                              "restart. Requires the service to run with "
+                              "VOXTRAL_PER_REQUEST_SEED=1 (docker-compose.yml); otherwise "
+                              "it is silently ignored. Not the same as --seed, which "
+                              "Voxtral cannot act on. Send reproducible work one request "
+                              "at a time: concurrent requests share the one RNG.")
     voxtral.add_argument("--max-new-tokens", type=int, default=None,
                          help="Max audio frames for THIS request, i.e. seconds x 12.5 "
                               "(deploy default 2048 = 163.84 s, server hard cap 4096 = "
