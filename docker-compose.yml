@@ -158,7 +158,7 @@ services:
     volumes:
       - ./cache:/cache
       # Monkeypatch drop-in for VOXTRAL_PER_REQUEST_SEED below. Always mounted but
-      # never imported unless that var is set (entrypoint.sh owns the PYTHONPATH),
+      # never imported unless that var is set (PYTHONPATH below puts it in reach),
       # so it is inert by default and editable from the host without a rebuild.
       - ./voxtral/patches:/opt/voxtral-patches:ro
     environment:
@@ -190,7 +190,15 @@ services:
       # re-pinned from that seed, so `tts.py --noise-seed 7` twice returns identical
       # audio at any point in the container's life. Unset = stock behaviour, patch
       # never imported:
-      # - VOXTRAL_PER_REQUEST_SEED=1
+      - VOXTRAL_PER_REQUEST_SEED=1
+      # The var above is the toggle; PYTHONPATH below is what actually gets the
+      # patch imported, and it lives HERE rather than in entrypoint.sh because that
+      # script is COPY'd into the image (voxtral/Dockerfile), so changing it needs
+      # `up -d --build` while an env var needs only `up -d`. Harmless when the
+      # toggle is off: sitecustomize.py checks it and returns. Keep this directory
+      # holding nothing but sitecustomize.py, since PYTHONPATH precedes
+      # site-packages and any other module name here would shadow the real one.
+      - PYTHONPATH=/opt/voxtral-patches
       # Bitwise determinism escape hatch, read by vLLM itself (not the entrypoint).
       # Forces batch-invariant kernels so results stop depending on how requests get
       # batched together. Costs throughput; only worth it when chasing a numerical

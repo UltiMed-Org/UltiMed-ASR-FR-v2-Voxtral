@@ -259,8 +259,18 @@ if [ -n "${VOXTRAL_PER_REQUEST_SEED:-}" ]; then
          "is missing. Mount ./voxtral/patches there (see docker-compose.yml)." >&2
     exit 1
   fi
-  export PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
-  echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH=$PYTHONPATH" >&2
+  # compose normally sets PYTHONPATH itself, precisely so enabling this needs no
+  # rebuild: THIS FILE IS BAKED INTO THE IMAGE, so anything only done here is
+  # invisible until `up -d --build`. Adding the directory twice is harmless but
+  # confusing in logs, so only prepend when it is genuinely absent.
+  case ":${PYTHONPATH:-}:" in
+    *":$PATCH_DIR:"*)
+      echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH already has" \
+           "$PATCH_DIR" >&2 ;;
+    *)
+      export PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
+      echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH=$PYTHONPATH" >&2 ;;
+  esac
 fi
 
 # 0.22 serve form: `vllm serve MODEL --omni` (the vllm-omni plugin registers the
