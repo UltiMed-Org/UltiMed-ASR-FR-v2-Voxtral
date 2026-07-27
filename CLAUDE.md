@@ -141,14 +141,19 @@ that older hand-run recipe.)
   request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
-  only), and `extra_params` (see `--cfg-alpha` below). It **ignores** `instructions`,
-  `language`, `task_type` and `max_new_tokens`: those only take effect on the
-  Qwen3-TTS / Fish paths in vllm-omni's `serving_speech.py` (`_build_tts_params`),
-  whereas Voxtral builds its prompt from just `SpeechRequest(input, voice|ref_audio)`.
-  So of tts.py's flags only `--voice`, `--speed`, `--cfg-alpha`, `--format` (and
-  `--model`) matter here; the TADA knobs must be left unset (they are opt-in, never
-  sent unless given, and vllm-omni's schema does not define them). Sampling knobs
-  (temperature/seed/top_p) are NOT per request; they live in the startup YAML (below).
+  only), `max_new_tokens` (see the length section below), and `extra_params` (see
+  `--cfg-alpha` below). It **ignores** `instructions`, `language` and `task_type`: those
+  only take effect on the Qwen3-TTS / Fish paths in vllm-omni's `serving_speech.py`
+  (`_build_tts_params`), whereas Voxtral builds its prompt from just
+  `SpeechRequest(input, voice|ref_audio)`. `max_new_tokens` is the exception that looks
+  like it should be in that ignored list but is not: it is applied *after* prompt
+  building by a generic override gated on `_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES`, which
+  includes `voxtral_tts`. So of tts.py's flags only `--voice`, `--speed`, `--cfg-alpha`,
+  `--max-new-tokens`, `--format` (and `--model`) matter here; the TADA knobs must be left
+  unset (they are opt-in, never sent unless given, and vllm-omni's schema does not define
+  them). Sampling knobs (temperature/top_p) are NOT per request; they live in the startup
+  YAML (below). `seed` is accepted by the schema but pointless: the override only touches
+  stage 0, which is greedy at temp 0.0, so use `VOXTRAL_SEED` to change stage 1's take.
 - **`--cfg-alpha`, the one per-request quality lever:** `serving_speech.py` merges a
   request's `extra_params` dict into stage 0's `SamplingParams.extra_args`, and the
   model reads one cfg_alpha per request out of it
@@ -159,6 +164,25 @@ that older hand-run recipe.)
   its deploy default) and only **warns** on the known-bad `1.0` rather than refusing it
   the way `entrypoint.sh` does at startup: per request the damage stops at that call.
   Do not confuse it with TADA's `--cfg-scale` (different backend, field and default).
+- **Audio length: the 163.84 s cap and how to move it.** Stage 0 emits exactly one audio
+  frame per decode step at 12.5 Hz (the checkpoint's `params.json`,
+  `multimodal.audio_model_args.audio_encoding_args.frame_rate`), so **tokens / 12.5 =
+  seconds** and the deploy YAML's stage-0 `default_sampling_params.max_tokens: 2048`
+  means one request maxes out at **163.84 s**. Overrun is silent: the audio is cut off
+  mid-sentence with `finish_reason: "length"` and HTTP 200. This is **not** a model limit
+  (the checkpoint says `max_seq_len 65536`, `max_position_embeddings 128000`). Two ways
+  up: `./tts.py --max-new-tokens N` per request (server-capped at vllm-omni's
+  `_TTS_MAX_NEW_TOKENS_MAX = 4096`, i.e. 327.68 s), or `VOXTRAL_MAX_TOKENS` at startup
+  (uncapped). Either way the **real** ceiling is stage 0's `max_model_len` (packaged
+  4096), because the prompt's text tokens and the generated frames share that one
+  context, so a `max_tokens` past it is simply never reached: raise
+  `VOXTRAL_MAX_MODEL_LEN` too, and keep it above `VOXTRAL_MAX_TOKENS` + the prompt
+  (`entrypoint.sh` warns when it is not). Stage 1's own `max_tokens: 2048` is a red
+  herring: `generator2tokenizer_async_chunk` feeds it 50-frame windows
+  (`codec_left_context_frames` 25 + `codec_chunk_frames` 25), so it never sees the whole
+  utterance and never bounds duration. Splitting long text per sentence client-side is
+  usually still the better answer (steadier prosody, far lower time-to-first-audio, and a
+  bad take costs seconds not minutes).
 - **Startup / tuning env vars** (read by `entrypoint.sh`, surfaced commented in the
   service's `environment:`; all editable without a rebuild, just `up -d`). Voxtral is a
   **two-stage** pipeline: stage 0 (the AR LLM, greedy at temp 0.0, `enforce_eager: false`
@@ -201,6 +225,18 @@ that older hand-run recipe.)
     the ~9GB weights land; uses `HF_TOKEN` if gated), injects `n_decoding_steps`, and
     re-patches idempotently every boot (surviving HF restoring the file). Unset = the
     vllm-omni default **7** (raise toward 8-16 for quality, drop to 3-4 for speed/latency).
+  - `VOXTRAL_MAX_TOKENS` -> stage_id 0's `default_sampling_params.max_tokens`, the
+    per-request audio-length cap in 12.5 Hz frames (packaged **2048** = 163.84 s; unset =
+    2048). See the length bullet above; `tts.py --max-new-tokens` overrides it per call up
+    to 4096.
+  - `VOXTRAL_MAX_MODEL_LEN` -> stage_id 0's `max_model_len` (packaged **4096**; unset =
+    4096), shared by the prompt's text tokens and the generated frames, so it is the true
+    length ceiling. Each token of context costs ~104 KiB of KV cache (2 x 26 layers x 8 kv
+    heads x 128 head_dim x 2 bytes bf16), and the KV pool is fixed by
+    `VOXTRAL_GPU_MEM_UTIL`, so raising this does not allocate more memory: it trades
+    concurrency (how many long requests fit before preemption) for length. Note
+    `VLLM_EXTRA_ARGS=--max-model-len ...` is **not** the lever, the per-stage YAML field
+    is.
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
     Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
