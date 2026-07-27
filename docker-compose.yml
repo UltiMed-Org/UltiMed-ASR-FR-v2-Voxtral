@@ -157,6 +157,10 @@ services:
       - no-new-privileges:true
     volumes:
       - ./cache:/cache
+      # Monkeypatch drop-in for VOXTRAL_PER_REQUEST_SEED below. Always mounted but
+      # never imported unless that var is set (entrypoint.sh owns the PYTHONPATH),
+      # so it is inert by default and editable from the host without a rebuild.
+      - ./voxtral/patches:/opt/voxtral-patches:ro
     environment:
       - HOME=/cache
       - HF_HOME=/cache/huggingface
@@ -179,6 +183,14 @@ services:
       # stream. Reproducing one specific request still needs a restart, because every
       # generated frame advances that global RNG:
       # - VOXTRAL_SEED=42
+      # Lifts exactly that restart requirement, via the monkeypatch mounted at
+      # /opt/voxtral-patches (read voxtral/patches/sitecustomize.py before enabling:
+      # it reaches into vllm-omni internals and lists its own limits). With this set,
+      # a request carrying extra_params.voxtral_noise_seed gets its per-frame noise
+      # re-pinned from that seed, so `tts.py --noise-seed 7` twice returns identical
+      # audio at any point in the container's life. Unset = stock behaviour, patch
+      # never imported:
+      # - VOXTRAL_PER_REQUEST_SEED=1
       # Bitwise determinism escape hatch, read by vLLM itself (not the entrypoint).
       # Forces batch-invariant kernels so results stop depending on how requests get
       # batched together. Costs throughput; only worth it when chasing a numerical

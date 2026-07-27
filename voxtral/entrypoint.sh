@@ -72,7 +72,8 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            head_dim x 2 bytes), so raising it trades concurrency
 #                            for length within the same gpu_memory_utilization pool.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
-#  params.json, not this deploy YAML.)
+#  params.json, not this deploy YAML. VOXTRAL_PER_REQUEST_SEED likewise: it
+#  injects a monkeypatch via PYTHONPATH, see the block above `exec`.)
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
 python3 - "$TUNED_YAML" <<'PY'
 import os, sys, vllm_omni, yaml
@@ -234,6 +235,32 @@ sys.stderr.write(
     "%s -> %d in %s\n" % (old if old is not None else "unset(default 7)", steps, path)
 )
 PY
+fi
+
+# VOXTRAL_PER_REQUEST_SEED -> make takes reproducible per request instead of only
+# "request N after a fresh boot". Voxtral draws its per-frame flow-matching noise
+# from the global torch RNG, which vLLM seeds once at the end of warmup, so
+# repeating a request today needs a restart. Setting this to 1 puts
+# /opt/voxtral-patches on PYTHONPATH; its sitecustomize.py then re-pins that RNG
+# before each frame from a seed the request carries in
+# extra_params.voxtral_noise_seed (`tts.py --noise-seed N`). Read that file first:
+# it is a monkeypatch on vllm-omni internals, and it documents its own limits
+# (chiefly that concurrent requests share the one RNG). Unset = stock behaviour,
+# nothing is imported.
+#
+# PYTHONPATH is the mechanism because vLLM spawns the stage engines as separate
+# interpreters: the model, and the RNG that matters, live in
+# StageEngineCoreProc_stage0, not in this process. Env vars are inherited by
+# those children, so sitecustomize runs there too.
+if [ -n "${VOXTRAL_PER_REQUEST_SEED:-}" ]; then
+  PATCH_DIR=/opt/voxtral-patches
+  if [ ! -f "$PATCH_DIR/sitecustomize.py" ]; then
+    echo "voxtral entrypoint: VOXTRAL_PER_REQUEST_SEED is set but $PATCH_DIR/sitecustomize.py" \
+         "is missing. Mount ./voxtral/patches there (see docker-compose.yml)." >&2
+    exit 1
+  fi
+  export PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH=$PYTHONPATH" >&2
 fi
 
 # 0.22 serve form: `vllm serve MODEL --omni` (the vllm-omni plugin registers the
