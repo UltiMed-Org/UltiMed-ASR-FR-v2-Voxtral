@@ -22,10 +22,12 @@
 # and thereby advance the RNG before the measurement. Readiness is polled on
 # /health only.
 #
-# Test D is the odd one out: it checks the optional monkeypatch that lifts that
-# whole restriction (VOXTRAL_PER_REQUEST_SEED, voxtral/patches/sitecustomize.py),
-# so it needs no restart and deliberately sends traffic between its measurements.
-# It skips itself when the patch is not loaded.
+# Tests D and E are the odd ones out: they check what our PATCHED vllm_omni adds
+# (voxtral/vllm-omni, branch `perso`, installed by voxtral/Dockerfile), which
+# lifts that whole restriction. D pins one take with --noise-seed; E checks that
+# --cfg-alpha and --euler-steps reach the model at all. Both need no restart, D
+# deliberately sends traffic between its measurements, and both skip themselves
+# when the running image is stock rather than forked.
 #
 # It owns the container lifecycle: brings voxtral-tts up if it is down, stops
 # crispasr-tts first if that one is holding :8003 (both TTS services bind that
@@ -69,16 +71,17 @@ SUDO_KEEPALIVE_PID=""
 
 usage() {
   cat <<'EOF'
-Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|all|up|down|doctor]
+Usage: ./voxtral/test_seed_determinism.sh [A|B|C|D|E|all|up|down|doctor]
 
   A     Does the request `seed` field change anything?   (2 restarts)
   B     Is output reproducible per process?              (2 restarts)
   C     Does duration ever move within one process?      (1 restart, N calls)
   D     Does --noise-seed reproduce one request?         (no restart)
-  all   A then B then C then D (default)
+  E     Do --cfg-alpha / --euler-steps reach the model?  (no restart)
+  all   A then B then C then D then E (default)
   up    Just bring voxtral-tts up and leave it running
   down  Just stop voxtral-tts
-  doctor Check why per-request seeding is not active (no synthesis)
+  doctor Check why per-request knobs are not active (no synthesis)
 
 Every restart reloads ~9GB of weights, so `all` takes a while. The service is
 started if needed and restored to its original state on exit (KEEP_UP=1 to keep
@@ -92,7 +95,7 @@ EOF
 
 WHICH="${1:-all}"
 case "$WHICH" in
-  A|B|C|D|all|up|down|doctor) ;;
+  A|B|C|D|E|all|up|down|doctor) ;;
   -h|--help|help) usage; exit 0 ;;
   *) echo "unknown mode '$WHICH'" >&2; usage >&2; exit 2 ;;
 esac
@@ -350,34 +353,43 @@ test_C() {
   fi
 }
 
-# Reading the log, not the env, on purpose: the env var only says what was asked
-# for, while this line proves the patch really loaded inside the stage-0 engine
-# process (the one that owns the RNG).
-patch_active() {
-  $DOCKER compose logs "$SERVICE" 2>/dev/null | grep -q 'voxtral-seed-patch\] active'
+# Asking the installed files, not the env or the log: there is no toggle to read
+# any more, only "is the vllm_omni in this image the forked one". Same grep the
+# entrypoint does at boot, run against the live container so a stale image (built
+# before the fork landed) is caught rather than assumed away.
+fork_active() {
+  $DOCKER compose exec -T "$SERVICE" python3 -c '
+import sys, sysconfig, os
+sp = sysconfig.get_paths()["purelib"]
+target = os.path.join(sp, "vllm_omni", "model_executor", "models", "voxtral_tts", "voxtral_tts.py")
+try:
+    sys.exit(0 if "_make_frame_noise" in open(target).read() else 1)
+except OSError:
+    sys.exit(1)
+' >/dev/null 2>&1
+}
+
+# Shared skip message for D and E: both need the same one thing.
+require_fork() {
+  fork_active && return 0
+  verdict SKIP "the running image ships STOCK vllm_omni, not our patched clone."
+  say "     Per-request cfg_alpha / seed / euler_steps live in voxtral/vllm-omni"
+  say "     (branch \`perso\`), installed by voxtral/Dockerfile, so an image built before"
+  say "     that landed has no reader for them and answers 200 regardless. Rebuild:"
+  say "       $DOCKER compose up -d --build $SERVICE"
+  say "     If the clone is missing (it is gitignored), recreate it first: see"
+  say "     voxtral/patches/README.md. The boot log states which one is loaded:"
+  say "       $DOCKER compose logs $SERVICE | grep 'vllm_omni at'"
+  return 1
 }
 
 test_D() {
   head1 "TEST D: does --noise-seed reproduce one request, with no restart?"
-  say "  This one tests our own monkeypatch rather than stock behaviour: it needs"
-  say "  VOXTRAL_PER_REQUEST_SEED=1 on the service, which injects"
-  say "  voxtral/patches/sitecustomize.py into the stage-0 engine process."
+  say "  This tests our fork rather than stock behaviour: upstream draws each frame's"
+  say "  flow-matching noise from the global RNG, so a take can only be reproduced by"
+  say "  restarting and replaying every request before it."
 
-  if ! patch_active; then
-    verdict SKIP "patch not loaded: no '[voxtral-seed-patch] active' line in the log."
-    say "     Setting the env var is not enough on its own, so here is what the running"
-    say "     container actually has:"
-    $DOCKER compose exec -T "$SERVICE" env 2>/dev/null \
-      | grep -E '^(VOXTRAL_PER_REQUEST_SEED|PYTHONPATH)=' | sed 's/^/       /' \
-      || say "       neither VOXTRAL_PER_REQUEST_SEED nor PYTHONPATH is set in there"
-    say "     Both are needed: the var is the toggle, PYTHONPATH=/opt/voxtral-patches is"
-    say "     what actually imports the patch. Both come from docker-compose.yml, and"
-    say "     env edits need a recreate, which \`restart\` does not do:"
-    say "       $DOCKER compose up -d $SERVICE && ./voxtral/test_seed_determinism.sh D"
-    say "     If they are both set and this still skips, the patch raised on import:"
-    say "       $DOCKER compose logs $SERVICE | grep voxtral-seed-patch"
-    return 0
-  fi
+  require_fork || return 0
 
   # No restart anywhere here, which is the entire claim. The unseeded call in the
   # middle deliberately advances the global RNG, so a pass means the seed pins the
@@ -392,9 +404,10 @@ test_D() {
     verdict PASS "same seed, same audio, across intervening traffic and with no restart."
   else
     verdict FAIL "the same seed gave different audio."
-    say "     Check the log for '[voxtral-seed-patch] WARNING' lines: 'shared a step'"
-    say "     means requests overlapped (serialize them), 'no sampling_extra_args' means"
-    say "     stage 0 lost its extra_args (keep VOXTRAL_CFG_ALPHA set). $d1 vs $d2"
+    say "     Most likely stage 0 lost its extra_args, which switches off"
+    say "     has_sampling_extra_args and drops EVERY per-request extra: keep"
+    say "     VOXTRAL_CFG_ALPHA set in docker-compose.yml. Run \`doctor\` for the"
+    say "     full chain. Files: $d1 vs $d2"
   fi
 
   if cmp -s "$d1" "$d3"; then
@@ -404,14 +417,50 @@ test_D() {
   fi
 }
 
+test_E() {
+  head1 "TEST E: do --cfg-alpha and --euler-steps reach the model?"
+  say "  Upstream drops unknown flat request fields silently (pydantic extra='ignore'),"
+  say "  and its only route to cfg_alpha is nested in extra_params, so 'the knob did"
+  say "  nothing' and 'the knob never arrived' look identical from a client. These"
+  say "  calls tell them apart: same text, same seed, one knob moved at a time."
+
+  require_fork || return 0
+
+  # Seeded on purpose. Without a fixed seed the noise differs per call and ANY two
+  # takes differ, which would make this test pass for the wrong reason.
+  local base cfg steps
+  base="$(synth  E_base            --noise-seed 11)"
+  cfg="$(synth   E_cfg_alpha_1_8   --noise-seed 11 --cfg-alpha 1.8)"
+  steps="$(synth E_euler_steps_3   --noise-seed 11 --euler-steps 3)"
+  report "seed 11, server defaults" "$base"
+  report "seed 11, --cfg-alpha 1.8" "$cfg"
+  report "seed 11, --euler-steps 3" "$steps"
+
+  if cmp -s "$base" "$cfg"; then
+    verdict FAIL "--cfg-alpha 1.8 gave byte-identical audio, so it never reached the model."
+    say "     Unless the server already boots at 1.8 (check VOXTRAL_CFG_ALPHA), this means"
+    say "     extra_params is not being merged into stage 0's extra_args."
+  else
+    verdict PASS "--cfg-alpha changes the audio, so per-request CFG is live."
+  fi
+
+  if cmp -s "$base" "$steps"; then
+    verdict FAIL "--euler-steps 3 gave byte-identical audio, so it never reached the model."
+    say "     Unless the server already boots at 3 (check VOXTRAL_EULER_STEPS), stage 0 is"
+    say "     still using its params.json step count for this request."
+  else
+    verdict PASS "--euler-steps changes the audio, so per-request ODE steps are live."
+  fi
+}
+
 # ---------------------------------------------------------------- doctor
 
-# Check every link in the seeding chain INSIDE the running container, in
+# Check every link in the per-request-knob chain INSIDE the running container, in
 # dependency order, so the first failing step is the cause and not a symptom.
 # Written because "test D skips" was indistinguishable from three different
 # breakages, and none of them can be seen from the host.
 doctor() {
-  head1 "DOCTOR: is per-request seeding actually wired up?"
+  head1 "DOCTOR: are the per-request knobs actually wired up?"
   if ! is_running "$SERVICE"; then
     say "  $SERVICE is NOT running, so nothing below can be inspected. That is also"
     say "  what a crash loop looks like from here, and 'start it' would be useless"
@@ -429,60 +478,56 @@ doctor() {
   fi
 
   say ""
-  say "1. env inside the container (both lines must be there)"
-  $DOCKER compose exec -T "$SERVICE" env 2>/dev/null \
-    | grep -E '^(VOXTRAL_PER_REQUEST_SEED|PYTHONPATH)=' | sed 's/^/     /' \
-    || { say "     NEITHER is set, yet docker-compose.yml has both: this container predates"
-         say "     that edit. Recreate it (\`restart\` does NOT re-read environment:):"
-         say "       $DOCKER compose up -d $SERVICE"; }
-
-  say ""
-  say "2. the patch file as the container sees it (must be readable by the runtime uid)"
-  $DOCKER compose exec -T "$SERVICE" ls -l /opt/voxtral-patches/ 2>&1 | sed 's/^/     /' \
-    || say "     could not list /opt/voxtral-patches (mount missing?)"
-
-  say ""
-  say "3. does python in the container pick it up as sitecustomize?"
+  say "1. is the installed vllm_omni our fork or the stock one bundled in the base image?"
   $DOCKER compose exec -T "$SERVICE" python3 -c '
-import sys
-try:
-    import sitecustomize
-except ModuleNotFoundError:
-    print("NO: sitecustomize not importable, so PYTHONPATH does not reach python")
-    raise SystemExit(1)
-print("yes:", getattr(sitecustomize, "__file__", "?"))
-print("import hook installed:", any(type(f).__name__ == "_Finder" for f in sys.meta_path))
-' 2>&1 | sed 's/^/     /' || say "     ^ this step failed, see above"
+import sysconfig, os
+sp = sysconfig.get_paths()["purelib"]
+model = os.path.join(sp, "vllm_omni", "model_executor", "models", "voxtral_tts", "voxtral_tts.py")
+serving = os.path.join(sp, "vllm_omni", "entrypoints", "openai", "serving_speech.py")
+def has(path, needle):
+    try:
+        return needle in open(path).read()
+    except OSError as exc:
+        return "unreadable (%s)" % exc
+print("site-packages :", sp)
+print("model side    :", has(model, "_make_frame_noise"), "(_make_frame_noise: seed + euler steps)")
+print("request side  :", has(serving, "_apply_voxtral_request_overrides"), "(flat field routing)")
+' 2>&1 | sed 's/^/     /' \
+    || say "     could not inspect the install (see above)"
+  say "     Both must say True. False = this image was built before the fork landed, or"
+  say "     the local clone was missing at build time: $DOCKER compose up -d --build $SERVICE"
 
   say ""
-  say "4. does importing the model module apply the patch? (pulls in torch, ~30s)"
-  local log4="$OUTDIR/doctor_import.log"
-  if $DOCKER compose exec -T "$SERVICE" python3 -c '
-import vllm_omni.model_executor.models.voxtral_tts.voxtral_tts as m
-print("PATCHED:", getattr(m.VoxtralTTSForConditionalGeneration.make_omni_output,
-                          "_voxtral_seed_patched", False))
-' >"$log4" 2>&1; then
-    grep -E 'voxtral-seed-patch|PATCHED:' "$log4" | sed 's/^/     /' || tail -3 "$log4" | sed 's/^/     /'
-  else
-    say "     the import itself failed; last lines:"
-    tail -5 "$log4" | sed 's/^/     /'
-  fi
+  say "2. does stage 0 still carry a non-empty extra_args? (the gate for ALL per-request extras)"
+  $DOCKER compose exec -T "$SERVICE" python3 -c '
+import yaml
+with open("/tmp/voxtral_tts_tuned.yaml") as f:
+    cfg = yaml.safe_load(f)
+for stage in cfg.get("stages", []):
+    if stage.get("stage_id") == 0:
+        extra = (stage.get("default_sampling_params") or {}).get("extra_args")
+        print("stage 0 extra_args:", extra)
+        print("verdict:", "OK" if extra else "EMPTY -> has_sampling_extra_args=False, every "
+              "per-request extra is dropped (set VOXTRAL_CFG_ALPHA in docker-compose.yml)")
+        break
+else:
+    print("no stage_id 0 found in the tuned YAML")
+' 2>&1 | sed 's/^/     /' \
+    || say "     could not read /tmp/voxtral_tts_tuned.yaml (entrypoint never got that far?)"
 
   say ""
-  say "5. what the running server logged (seeding, and the effective YAML knobs)"
+  say "3. what the running server logged at boot"
   $DOCKER compose logs "$SERVICE" 2>/dev/null \
-    | grep -E 'voxtral-seed-patch|entrypoint: patched|entrypoint: per-request' \
+    | grep -E 'entrypoint: patched|entrypoint: vllm_omni at|entrypoint: set acoustic' \
     | tail -8 | sed 's/^/     /' \
-    || say "     nothing: no [voxtral-seed-patch] lines and no 'entrypoint: patched' line"
+    || say "     nothing: no 'entrypoint:' lines at all, so this is not our image"
 
   say ""
-  say "  How to read step 5:"
-  say "    'active'           -> the patch IS on; a failing test D is then a behaviour"
-  say "                          problem (concurrency, or extra_args lost), not wiring."
-  say "    'armed' but no     -> this file was imported but the model module never came"
-  say "    'active'              through the hook. Paste steps 3-5 and I can dig."
-  say "    neither            -> PYTHONPATH never reached the server process. Step 1 says"
-  say "                          whether the container even has it."
+  say "  How to read this:"
+  say "    step 1 False        -> wiring: rebuild, the request never reaches a reader."
+  say "    step 1 True, 2 EMPTY-> the knobs arrive and are then discarded before the model."
+  say "    both fine, D fails  -> a behaviour problem, not wiring. Keep a copy of the"
+  say "                           differing wavs and check whether requests overlapped."
   say "    'entrypoint: patched ... max_tokens=N' is the audio-length answer: no"
   say "    max_tokens= field there means that image predates the knob (up -d --build)."
 }
@@ -535,9 +580,10 @@ fi
 case "$WHICH" in
   A)   test_A ;;
   D)   test_D ;;
+  E)   test_E ;;
   B)   test_B ;;
   C)   test_C ;;
-  all) test_A; test_B; test_C; test_D ;;
+  all) test_A; test_B; test_C; test_D; test_E ;;
 esac
 
 say ""
