@@ -126,9 +126,12 @@ services:
   # Voxtral TTS (text->audio) via vLLM, NOT CrispASR. Model:
   # mistralai/Voxtral-4B-TTS-2603, served by vllm-omni. This is a separate
   # runtime from the crispasr image, so it gets its own image built from
-  # voxtral/Dockerfile (a thin layer on the official vllm/vllm-omni:v0.22.0
-  # image). Client: root tts.py (absorbed the former
-  # voxtral/query_test.py), e.g.
+  # voxtral/Dockerfile (the official vllm/vllm-omni:v0.22.0 image, plus flash-attn,
+  # plus vllm_omni reinstalled from ./voxtral/vllm-omni, our local clone of
+  # upstream at the same tag whose `perso` branch adds per-request cfg_alpha /
+  # seed / euler_steps). That clone is gitignored: on a fresh checkout, recreate it
+  # from voxtral/patches/ BEFORE the first --build, see the README there.
+  # Client: root tts.py (absorbed the former voxtral/query_test.py), e.g.
   #   ./tts.py -t "Bonjour." --voice neutral_female -o out.wav
   # It POSTs to :8003/v1/audio/speech, same as any OpenAI TTS client.
   #
@@ -157,10 +160,6 @@ services:
       - no-new-privileges:true
     volumes:
       - ./cache:/cache
-      # Monkeypatch drop-in for VOXTRAL_PER_REQUEST_SEED below. Always mounted but
-      # never imported unless that var is set (PYTHONPATH below puts it in reach),
-      # so it is inert by default and editable from the host without a rebuild.
-      - ./voxtral/patches:/opt/voxtral-patches:ro
     environment:
       - HOME=/cache
       - HF_HOME=/cache/huggingface
@@ -176,29 +175,15 @@ services:
       # lowered from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
       # vLLM ENGINE seed for both stages (not a sampling param: the sampling seed is
-      # inert here, see the entrypoint's note). This is the only seed that reaches the
-      # one random draw in the pipeline, the Gaussian each frame's flow-matching ODE
-      # starts from. vLLM already defaults it to 0, so takes are already deterministic
-      # per process from the first request; changing this just picks a different
-      # stream. Reproducing one specific request still needs a restart, because every
-      # generated frame advances that global RNG:
+      # inert here, see the entrypoint's note). It seeds the global RNG that the one
+      # random draw in the pipeline comes from, the Gaussian each frame's
+      # flow-matching ODE starts from, and it now governs only the requests that
+      # carry NO seed of their own: this image runs our patched vllm_omni, where a
+      # seeded request draws from its own generator instead
+      # (`tts.py --noise-seed 7` returns identical audio at any point in the
+      # container's life, no restart, no toggle). vLLM already defaults this to 0,
+      # so changing it just picks a different stream for the unseeded case:
       # - VOXTRAL_SEED=42
-      # Lifts exactly that restart requirement, via the monkeypatch mounted at
-      # /opt/voxtral-patches (read voxtral/patches/sitecustomize.py before enabling:
-      # it reaches into vllm-omni internals and lists its own limits). With this set,
-      # a request carrying extra_params.voxtral_noise_seed gets its per-frame noise
-      # re-pinned from that seed, so `tts.py --noise-seed 7` twice returns identical
-      # audio at any point in the container's life. Unset = stock behaviour, patch
-      # never imported:
-      - VOXTRAL_PER_REQUEST_SEED=1
-      # The var above is the toggle; PYTHONPATH below is what actually gets the
-      # patch imported, and it lives HERE rather than in entrypoint.sh because that
-      # script is COPY'd into the image (voxtral/Dockerfile), so changing it needs
-      # `up -d --build` while an env var needs only `up -d`. Harmless when the
-      # toggle is off: sitecustomize.py checks it and returns. Keep this directory
-      # holding nothing but sitecustomize.py, since PYTHONPATH precedes
-      # site-packages and any other module name here would shadow the real one.
-      - PYTHONPATH=/opt/voxtral-patches
       # Bitwise determinism escape hatch, read by vLLM itself (not the entrypoint).
       # Forces batch-invariant kernels so results stop depending on how requests get
       # batched together. Costs throughput; only worth it when chasing a numerical
@@ -209,11 +194,14 @@ services:
       # raising this past that buys little. (The 0.18 runtime.defaults.max_inflight
       # lever no longer exists in the 0.22 schema.)
       # - VOXTRAL_MAX_NUM_SEQS=32
-      # Euler ODE steps for the stage-1 flow-matching acoustic decoder: the main
+      # Euler ODE steps for the stage-0 flow-matching acoustic transformer: the main
       # compute<->quality lever. More steps = steadier/higher-fidelity audio for
       # more compute; fewer = faster. vllm-omni reads this only from the model's
       # params.json (not this YAML), so entrypoint.sh patches it in. Unset =
-      # vllm-omni default of 7 (raise toward 8-16 for quality, drop to 3-4 for speed):
+      # vllm-omni default of 7 (raise toward 8-16 for quality, drop to 3-4 for speed).
+      # Only the DEFAULT: `tts.py --euler-steps N` overrides it per request (which
+      # drops that request to the eager path, since the CUDA graphs are captured at
+      # one fixed step count), so sweep without restarting:
       - VOXTRAL_EULER_STEPS=16
       # Stage-0 classifier-free guidance scale. Higher = the decoder sticks more
       # tightly to the text at the cost of naturalness/expressivity. Guide:
@@ -221,6 +209,10 @@ services:
       #   1.2        = paper/default, the recommended setting.
       #   ~1.3-1.7   = stronger text adherence; may sound flatter/harsher.
       #   >~2.0      = over-guided, tends to introduce artifacts/distortion.
+      # Only the default (`tts.py --cfg-alpha` overrides it per request), but do NOT
+      # comment it out: stage 0's default_sampling_params.extra_args must be
+      # non-empty or vllm-omni sets has_sampling_extra_args=False and drops every
+      # per-request extra, the noise seed and euler steps included.
       # - VOXTRAL_CFG_ALPHA=1.2
       - VOXTRAL_CFG_ALPHA=1.3
       # Stage-0 GPU memory fraction (packaged 0.8). Stage 0 (0.8) + stage 1 (0.1)

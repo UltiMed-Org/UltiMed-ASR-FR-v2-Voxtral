@@ -12,9 +12,12 @@
 #   stage_id 1 = audio tokenizer, tokens -> 24 kHz wave. A deterministic codec
 #                decoder with no sampling path, so its temperature is very likely
 #                a no-op (see the VOXTRAL_ACOUSTIC_TEMP note below).
-# Most of Voxtral's sampling params are NOT settable per HTTP request (only
-# voice/speed/response_format, plus cfg_alpha via extra_params and max_new_tokens),
-# so we expose them here as startup knobs by editing the copied YAML at boot.
+# The knobs below are DEFAULTS. Since this image builds vllm_omni from our
+# patched clone (voxtral/vllm-omni, branch `perso`, see the Dockerfile), a request
+# can now override cfg_alpha, the noise seed, the Euler step count and stage 1's
+# temperature per call, with no restart and no sweep-by-`up -d`. What is still
+# startup-only is everything the deploy YAML fixes for the whole engine:
+# max_num_seqs, gpu_memory_utilization, max_model_len, and the engine seed.
 # Changing a knob's VALUE needs no rebuild, just `up -d`. Changing THIS FILE does:
 # the Dockerfile COPYs it into the image, so a newly added knob is invisible until
 # `up -d --build`. The "patched ... -> ..." summary line this script logs at boot
@@ -40,22 +43,34 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #   VOXTRAL_ACOUSTIC_TEMP -> stage_id 1 sampling temperature. Default 0.7 (lowered
 #                            from upstream 0.9 for steadier, less artifacty audio;
 #                            raise toward 0.9 for more expressive/varied output).
+#                            Suspected no-op: stage 1 is a deterministic codec
+#                            decoder with no sampling path. Our fork lets a request
+#                            override it (`acoustic_temperature`) so the claim can
+#                            be tested without a restart.
 #   VOXTRAL_SEED          -> vLLM engine seed on BOTH stages (NOT a sampling param,
 #                            see the long note at the patch site: the sampling seed
 #                            cannot affect Voxtral's output, the engine seed can
 #                            because it seeds the global RNG the flow-matching noise
 #                            is drawn from). vLLM already defaults it to 0, so this
 #                            selects a different deterministic stream rather than
-#                            turning determinism on. Reproducing one specific request
-#                            still needs a restart (every frame advances that RNG).
-#                            Not settable per request either: the request's `seed`
-#                            field lands in sampling params, i.e. in the inert half.
+#                            turning determinism on, and it only governs requests
+#                            that carry NO seed of their own: our fork draws a seeded
+#                            request's noise from its own generator instead, which is
+#                            what makes one specific take reproducible without a
+#                            restart (`tts.py --noise-seed N`, or a plain `seed`
+#                            field, which upstream would have dropped into the inert
+#                            sampling half).
 #   VOXTRAL_MAX_NUM_SEQS  -> both stages' max_num_seqs (packaged 32). The acoustic
 #                            stage is codec-bs=1, so raising this past the ~4-8
 #                            concurrency saturation point buys little.
 #   VOXTRAL_CFG_ALPHA     -> stage_id 0 classifier-free guidance scale (default
 #                            1.2). Nudge up for tighter text adherence; NEVER 1.0
 #                            (disables CFG -> garbled/off-text audio; refused).
+#                            Overridable per request (`tts.py --cfg-alpha`), so this
+#                            is only the default. KEEP IT SET: stage 0's
+#                            default_sampling_params.extra_args must be non-empty or
+#                            vllm-omni sets has_sampling_extra_args=False and drops
+#                            EVERY per-request extra, the noise seed included.
 #   VOXTRAL_GPU_MEM_UTIL  -> stage_id 0 gpu_memory_utilization (packaged 0.8).
 #                            Lower it (e.g. 0.7) so stage 0 + stage 1's 0.1 fit on
 #                            a 24GB card shared with a desktop; unset = 0.8.
@@ -78,8 +93,9 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            head_dim x 2 bytes), so raising it trades concurrency
 #                            for length within the same gpu_memory_utilization pool.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
-#  params.json, not this deploy YAML. VOXTRAL_PER_REQUEST_SEED likewise: it
-#  injects a monkeypatch via PYTHONPATH, see the block above `exec`.)
+#  params.json, not this deploy YAML. It too is now only a default: a request can
+#  carry `euler_steps`, which our fork honours when every request sharing that
+#  decode step agrees on the value.)
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
 python3 - "$TUNED_YAML" <<'PY'
 import os, sys, vllm_omni, yaml
@@ -245,41 +261,28 @@ sys.stderr.write(
 PY
 fi
 
-# VOXTRAL_PER_REQUEST_SEED -> make takes reproducible per request instead of only
-# "request N after a fresh boot". Voxtral draws its per-frame flow-matching noise
-# from the global torch RNG, which vLLM seeds once at the end of warmup, so
-# repeating a request today needs a restart. Setting this to 1 puts
-# /opt/voxtral-patches on PYTHONPATH; its sitecustomize.py then re-pins that RNG
-# before each frame from a seed the request carries in
-# extra_params.voxtral_noise_seed (`tts.py --noise-seed N`). Read that file first:
-# it is a monkeypatch on vllm-omni internals, and it documents its own limits
-# (chiefly that concurrent requests share the one RNG). Unset = stock behaviour,
-# nothing is imported.
-#
-# PYTHONPATH is the mechanism because vLLM spawns the stage engines as separate
-# interpreters: the model, and the RNG that matters, live in
-# StageEngineCoreProc_stage0, not in this process. Env vars are inherited by
-# those children, so sitecustomize runs there too.
-if [ -n "${VOXTRAL_PER_REQUEST_SEED:-}" ]; then
-  PATCH_DIR=/opt/voxtral-patches
-  if [ ! -f "$PATCH_DIR/sitecustomize.py" ]; then
-    echo "voxtral entrypoint: VOXTRAL_PER_REQUEST_SEED is set but $PATCH_DIR/sitecustomize.py" \
-         "is missing. Mount ./voxtral/patches there (see docker-compose.yml)." >&2
-    exit 1
-  fi
-  # compose normally sets PYTHONPATH itself, precisely so enabling this needs no
-  # rebuild: THIS FILE IS BAKED INTO THE IMAGE, so anything only done here is
-  # invisible until `up -d --build`. Adding the directory twice is harmless but
-  # confusing in logs, so only prepend when it is genuinely absent.
-  case ":${PYTHONPATH:-}:" in
-    *":$PATCH_DIR:"*)
-      echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH already has" \
-           "$PATCH_DIR" >&2 ;;
-    *)
-      export PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
-      echo "voxtral entrypoint: per-request seeding enabled, PYTHONPATH=$PYTHONPATH" >&2 ;;
-  esac
-fi
+# Per-request seeding used to be bolted on here, by putting a sitecustomize.py
+# monkeypatch on PYTHONPATH when VOXTRAL_PER_REQUEST_SEED was set. Both the var and
+# the patch are gone: the image now installs our patched vllm_omni (see the
+# Dockerfile), where a request's seed reaches the flow-matching noise draw
+# directly, per request, with nothing to enable and no way to half-enable it.
+# Report what the running vllm_omni actually supports, since "the env var was set
+# and nothing happened" was exactly the failure mode that cost the most time.
+python3 - <<'PY' || true
+import sys, sysconfig, os
+sp = sysconfig.get_paths()["purelib"]
+target = os.path.join(sp, "vllm_omni", "model_executor", "models", "voxtral_tts", "voxtral_tts.py")
+try:
+    with open(target) as f:
+        forked = "_make_frame_noise" in f.read()
+except OSError as exc:
+    sys.stderr.write("voxtral entrypoint: could not inspect %s (%s)\n" % (target, exc))
+    raise SystemExit(0)
+sys.stderr.write(
+    "voxtral entrypoint: vllm_omni at %s is %s -> per-request cfg_alpha/seed/euler_steps %s\n"
+    % (sp, "PATCHED (perso fork)" if forked else "STOCK", "available" if forked else "NOT available")
+)
+PY
 
 # 0.22 serve form: `vllm serve MODEL --omni` (the vllm-omni plugin registers the
 # omni pipeline into vllm). --deploy-config feeds our patched YAML. VLLM_EXTRA_ARGS
