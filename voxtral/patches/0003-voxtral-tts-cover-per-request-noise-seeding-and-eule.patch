@@ -2,7 +2,7 @@ From a58ccf8a37b2921d3c242721d978de6ef67d2a96 Mon Sep 17 00:00:00 2001
 From: thiswillbeyourgithub
  <26625900+thiswillbeyourgithub@users.noreply.github.com>
 Date: Fri, 31 Jul 2026 20:12:57 +0200
-Subject: [PATCH 3/3] voxtral tts: cover per-request noise seeding and euler
+Subject: [PATCH 3/4] voxtral tts: cover per-request noise seeding and euler
  steps
 
 Pins the three properties the feature exists for: an unseeded batch stays
