@@ -120,14 +120,31 @@ bad model/reference/transcript. See `utils/README.md`.
 CrispASR, `voxtral`/`voxtral4b` are ASR, i.e. speech->text; the "multiple voxtral models"
 in `docker-compose.yml` and `models_ignore_backups/` are all ASR.) So this service uses
 none of the `ghcr.io/crispstrobe/crispasr` image or the `CRISPASR_*` env vars. It builds
-its own image from `voxtral/Dockerfile`, a **thin layer on the official
-`vllm/vllm-omni:v0.22.0-x86_64` image** (which already bundles the matching vLLM +
-vllm-omni + deploy YAMLs); the layer just adds a passwd entry for the runtime uid and our
-entrypoint. `voxtral/entrypoint.sh` copies the bundled deploy YAML, patches the tuning
-knobs into it, and runs `vllm serve MODEL --omni --deploy-config <patched>`. (History:
-0.18 built `FROM vllm/vllm-openai` + `pip install vllm-omni==0.18.0` + a hand-built
-flash-attn wheel and ran `vllm-omni serve --stage-configs-path`; `voxtral/install.sh` is
-that older hand-run recipe.)
+its own image from `voxtral/Dockerfile`, on top of the official
+`vllm/vllm-omni:v0.22.0-x86_64` image (which already bundles the matching vLLM +
+vllm-omni + deploy YAMLs). The layer adds a passwd entry for the runtime uid, flash-attn,
+our entrypoint, and **reinstalls `vllm_omni` from a local fork** (see below).
+`voxtral/entrypoint.sh` copies the bundled deploy YAML, patches the tuning knobs into it,
+and runs `vllm serve MODEL --omni --deploy-config <patched>`. (History: 0.18 built
+`FROM vllm/vllm-openai` + `pip install vllm-omni==0.18.0` + a hand-built flash-attn wheel
+and ran `vllm-omni serve --stage-configs-path`; `voxtral/install.sh` is that older
+hand-run recipe.)
+
+- **The fork (`voxtral/vllm-omni`, branch `perso`) is load-bearing.** Upstream vllm-omni
+  has no request-level route to Voxtral's quality levers, and hides that fact:
+  `OpenAICreateSpeechRequest` declares no `model_config`, so pydantic v2's default
+  `extra='ignore'` **drops unknown flat keys and still answers 200**. A client sending
+  `{"cfg_alpha": 1.5, "seed": 7}` looks like it worked while every call runs at the
+  server's startup defaults. The `perso` branch fixes that in two places: request routing
+  (`serving_speech.py::_apply_voxtral_request_overrides`, plus real `cfg_alpha` /
+  `euler_steps` / `acoustic_temperature` fields on the schema) and the model
+  (`voxtral_tts.py::_make_frame_noise` / `_extract_euler_steps`). The clone is
+  **gitignored**: `voxtral/patches/*.patch` is the tracked backup and
+  `voxtral/patches/README.md` has the recreate recipe, which a fresh checkout must run
+  **before its first `--build`**. Regenerate those patches whenever `perso` gains a commit.
+  The boot log states which copy is serving (`entrypoint: vllm_omni at ... is PATCHED
+  (perso fork)` vs `STOCK`); `./voxtral/test_seed_determinism.sh doctor` checks the whole
+  chain inside the container.
 
 - **Port clash by design:** it binds host **:8003**, the same port as `crispasr-tts`
   (TADA), so only one TTS can be up at a time. Do NOT `sudo docker compose up` with no
@@ -141,21 +158,24 @@ that older hand-run recipe.)
   request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
-  only), `max_new_tokens` (see the length section below), and `extra_params` (see
-  `--cfg-alpha` below). It **ignores** `instructions`, `language` and `task_type`: those
+  only), `max_new_tokens` (see the length section below), and `extra_params`, which is
+  how `cfg_alpha`, `voxtral_noise_seed` and `voxtral_euler_steps` travel (`tts.py
+  --cfg-alpha / --noise-seed / --euler-steps`; the last two need the fork). Our fork also
+  accepts `cfg_alpha`, `euler_steps`, `acoustic_temperature` and `seed` as flat fields,
+  but `tts.py` deliberately uses `extra_params` because that route also works against a
+  stock server. It **ignores** `instructions`, `language` and `task_type`: those
   only take effect on the Qwen3-TTS / Fish paths in vllm-omni's `serving_speech.py`
   (`_build_tts_params`), whereas Voxtral builds its prompt from just
   `SpeechRequest(input, voice|ref_audio)`. `max_new_tokens` is the exception that looks
   like it should be in that ignored list but is not: it is applied *after* prompt
   building by a generic override gated on `_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES`, which
   includes `voxtral_tts`. So of tts.py's flags only `--voice`, `--speed`, `--cfg-alpha`,
-  `--max-new-tokens`, `--format` (and `--model`) matter here; the TADA knobs must be left
-  unset (they are opt-in, never sent unless given, and vllm-omni's schema does not define
-  them). Sampling knobs (temperature/top_p) are NOT per request; they live in the startup
-  YAML (below). `seed` is accepted by the schema but pointless: the override only touches
-  stage 0, which is greedy at temp 0.0, so use `VOXTRAL_SEED` to change stage 1's take.
-  For per-request reproducibility use `--noise-seed` instead, which rides `extra_params`
-  and needs `VOXTRAL_PER_REQUEST_SEED=1` on the service (see that env var below).
+  `--euler-steps`, `--noise-seed`, `--max-new-tokens`, `--format` (and `--model`) matter
+  here; the TADA knobs must be left unset (they are opt-in, never sent unless given, and
+  vllm-omni's schema does not define them). Sampling knobs (temperature/top_p) are NOT per
+  request; they live in the startup YAML (below). `--seed` remains pointless whatever the
+  server: it lands in `SamplingParams`, and stage 0's sampler is handed logits with a
+  single finite entry, so its result is forced. Use `--noise-seed` for reproducibility.
 - **`--cfg-alpha`, the one per-request quality lever:** `serving_speech.py` merges a
   request's `extra_params` dict into stage 0's `SamplingParams.extra_args`, and the
   model reads one cfg_alpha per request out of it
@@ -190,10 +210,10 @@ that older hand-run recipe.)
   (`restart` is not enough: it does not re-read `environment:`). Changing **`entrypoint.sh`
   itself does**, because `voxtral/Dockerfile` COPYs it into the image, so a knob added in
   this repo is silently ignored by an older image, with the var set and nothing happening.
-  That already bit `VOXTRAL_PER_REQUEST_SEED` once, which is why its `PYTHONPATH` now comes
-  from compose instead. To tell the two apart, read the `voxtral entrypoint: patched ... ->
-  ...` line the script logs at boot: it lists every knob that image knows about and their
-  effective values. Voxtral is a
+  That already bit the retired `VOXTRAL_PER_REQUEST_SEED` once. To tell the two apart, read
+  the `voxtral entrypoint: patched ... -> ...` line the script logs at boot: it lists every
+  knob that image knows about and their effective values (and the `vllm_omni at ... is
+  PATCHED/STOCK` line right after it says whether the fork is the one serving). Voxtral is a
   **two-stage** pipeline (topology frozen in `model_executor/models/voxtral_tts/pipeline.py`):
   stage 0 = `audio_generation`, the 4B AR LLM, text -> acoustic latents, greedy at temp 0.0,
   `enforce_eager: false` so already compiled/CUDA-graph'd; stage 1 = `audio_tokenizer`,
@@ -214,9 +234,10 @@ that older hand-run recipe.)
     flow matching, so **the only stochasticity in the output is the fresh Gaussian the ODE
     starts from each frame** (`static_noise.normal_()` in
     `cuda_graph_acoustic_transformer_wrapper.py`), which draws from ambient CUDA RNG and is
-    therefore not covered by `VOXTRAL_SEED` either. Confirm with one A/B before trusting
-    either knob; the real quality levers appear to be `VOXTRAL_EULER_STEPS` and
-    `VOXTRAL_CFG_ALPHA`.
+    therefore not covered by `VOXTRAL_SEED` either. The fork makes the A/B cheap: send
+    `acoustic_temperature` as a flat request field (no restart) with `--noise-seed` pinned,
+    and see whether anything moves. The real quality levers appear to be
+    `VOXTRAL_EULER_STEPS` and `VOXTRAL_CFG_ALPHA`.
   - `VOXTRAL_SEED` -> the vLLM **engine** seed (`ModelConfig.seed`) on both stages, *not* a
     sampling param. The distinction is the whole game, because **sampling params cannot
     affect Voxtral's audio at all**: stage 0 feeds vLLM's Sampler the output of
@@ -238,36 +259,28 @@ that older hand-run recipe.)
     destroys it outright (interleaved draws). All three were **confirmed empirically** on
     2026-07-27 with tests A to C of `voxtral/test_seed_determinism.sh`: the request `seed`
     field changed nothing, both request positions reproduced across boots, and waveforms
-    varied call to call inside one process. `VOXTRAL_PER_REQUEST_SEED` below lifts the
-    restart requirement.
-  - `VOXTRAL_PER_REQUEST_SEED=1` -> make a take reproducible **per request**, no restart.
-    This is the one knob here that is **not** upstream behaviour: with
-    `/opt/voxtral-patches` (compose-mounted from `voxtral/patches/`) on `PYTHONPATH`, set
-    **in the compose `environment:`** rather than by `entrypoint.sh` (see the rebuild note
-    above), its
-    `sitecustomize.py` monkeypatches `VoxtralTTSForConditionalGeneration.make_omni_output`
-    to re-pin the global torch RNG just before each frame's noise draw, from a seed the
-    request carries plus that request's own frame counter. Clients send it as
-    `extra_params: {"voxtral_noise_seed": N}` (`tts.py --noise-seed N`), the same route
-    `cfg_alpha` travels; stock servers merge the key and ignore it, so sending it is always
-    safe. This mirrors what vllm-omni already does for Qwen3-TTS
-    (`extra_args["qwen3_tts_request_seed"]`, read in `worker/gpu_model_runner.py:1725`,
-    which keeps a per-request `torch.Generator`); Voxtral simply has no such hookup.
-    `PYTHONPATH` is the mechanism because vLLM spawns each stage as its own interpreter
-    (`StageEngineCoreProc_stage0` owns the model and the RNG), so a patch applied in the API
-    server process would reach the wrong one. Caveats, in `sitecustomize.py` in full: one
-    global RNG cannot feed several streams, so reproducibility holds **per batch
-    composition**, i.e. send reproducible work one request at a time (a one-time WARNING is
-    logged when a seeded request shares a step); it also depends on stage 0 keeping a
-    non-empty `default_sampling_params.extra_args`, which is what makes vllm-omni pass
-    per-request extras at all (`has_sampling_extra_args`), so keep `VOXTRAL_CFG_ALPHA` set.
-    Test with `./voxtral/test_seed_determinism.sh D` (no restarts), and diagnose with
-    `... doctor` when it skips. The patch logs `armed` (hook installed) before
-    `active` (patch applied) precisely so a silent failure can be located. Nothing is imported when
-    the var is unset. Note there is **no** built-in alternative: `/v1/omni/sleep` +
-    `/v1/omni/wakeup` only move weights (neither calls `set_random_seed`), and vLLM's
-    `collective_rpc`, whose `compile_or_warm_up_model` *would* re-seed, has no HTTP route in
-    0.22.1.
+    varied call to call inside one process. All of that still describes requests that carry
+    **no** seed; the fork's per-request path below is what lifts the restart requirement,
+    and `VOXTRAL_SEED` now only picks the stream for unseeded traffic.
+  - **Per-request seeding (fork, no env var).** `tts.py --noise-seed N` sends
+    `extra_params: {"voxtral_noise_seed": N}`, the same route `cfg_alpha` travels (a flat
+    `seed` field works too on the fork, routed to the same key). The model then draws each
+    frame's noise from a `torch.Generator` seeded `SplitMix64(seed, frame index)`, in
+    `voxtral_tts.py::_make_frame_noise`, instead of from the global RNG. Same text plus
+    same seed gives identical audio at any point in the container's life, **and it holds
+    under concurrency**, because each row gets its own stream rather than a slice of one
+    global sequence (the retired `sitecustomize.py` monkeypatch re-pinned that global RNG,
+    which is why it could only promise reproducibility per batch composition). Requests
+    without a seed keep upstream behaviour bit for bit. This mirrors what vllm-omni already
+    does for Qwen3-TTS (`extra_args["qwen3_tts_request_seed"]`, read in
+    `worker/gpu_model_runner.py`); Voxtral simply had no such hookup. One dependency
+    remains: stage 0 must keep a non-empty `default_sampling_params.extra_args`, which is
+    what makes vllm-omni pass per-request extras at all (`has_sampling_extra_args`), **so
+    keep `VOXTRAL_CFG_ALPHA` set**. Test with `./voxtral/test_seed_determinism.sh D` (no
+    restarts) and `E` for the cfg/steps half; diagnose with `... doctor` when either skips.
+    Note there was **no** built-in alternative: `/v1/omni/sleep` + `/v1/omni/wakeup` only
+    move weights (neither calls `set_random_seed`), and vLLM's `collective_rpc`, whose
+    `compile_or_warm_up_model` *would* re-seed, has no HTTP route in 0.22.1.
   - `VLLM_BATCH_INVARIANT=1` (a vLLM env var, not read by `entrypoint.sh`; surfaced
     commented in the compose service) forces batch-invariant kernels so results stop
     depending on how requests happen to batch together. Needed for *bitwise* determinism on
@@ -290,6 +303,9 @@ that older hand-run recipe.)
     overrides it per call, see above). Deploy default **1.2**. Nudge up for tighter text
     adherence. The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
     decoder hallucinate phonetically-plausible-but-wrong audio (stops following the text).
+    **Do not comment it out**: an empty stage-0 `extra_args` sets
+    `has_sampling_extra_args=False` and vllm-omni then drops *every* per-request extra,
+    the noise seed and euler steps included.
   - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the **stage-0**
     flow-matching acoustic transformer (`n_decoding_steps`): the primary compute<->quality
     lever (more steps = steadier, higher-fidelity audio for more compute; CFG batches a
@@ -300,7 +316,7 @@ that older hand-run recipe.)
     **no extra VRAM**: the only `n_steps`-sized allocation is a `linspace` of `n_steps + 1`
     scalars, the ODE reuses one buffer under `no_grad`, and peak activation is set by the 2x
     CFG batching, not the step count (only the CUDA-graph capture pool grows, marginally).
-    Unlike the knobs above it is **not** a deploy-YAML field, env var, or
+    Upstream it is **not** a deploy-YAML field, env var, or
     per-request param in vllm-omni: the value is read **only** from the model's `params.json`
     at `multimodal.audio_model_args.acoustic_transformer_args.n_decoding_steps`, and this
     model doesn't ship the key, so vllm-omni's mistral parser (`parsers/voxtral_tts.py`)
@@ -309,6 +325,12 @@ that older hand-run recipe.)
     the ~9GB weights land; uses `HF_TOKEN` if gated), injects `n_decoding_steps`, and
     re-patches idempotently every boot (surviving HF restoring the file). Unset = the
     vllm-omni default **7** (raise toward 8-16 for quality, drop to 3-4 for speed/latency).
+    On the fork this is only the **default**: `tts.py --euler-steps N` overrides it per
+    call, so a sweep needs no restart. Two constraints, both in `_extract_euler_steps`: it
+    is a loop bound rather than a per-row tensor, so it is honoured only when every request
+    sharing a decode step agrees (warning logged once otherwise), and a value differing
+    from the captured one **forces the eager path**, since the CUDA graphs bake one fixed
+    step count into their capture. Sweep one call at a time.
   - `VOXTRAL_MAX_TOKENS` -> stage_id 0's `default_sampling_params.max_tokens`, the
     per-request audio-length cap in 12.5 Hz frames (packaged **2048** = 163.84 s; unset =
     2048). See the length bullet above; `tts.py --max-new-tokens` overrides it per call up
@@ -326,12 +348,15 @@ that older hand-run recipe.)
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
     Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
-  schema, statically validated (the YAML patcher runs against the real v0.22.0 deploy
-  config) but not yet run end-to-end in Docker; the first `--build` + smoke call is the
-  real check. The prebuilt image ships no standalone flash-attn; the Dockerfile re-adds it
-  from a prebuilt wheel (the torch2.10 cu13 one, ABI-compatible with the image's torch2.11
-  and verified in-image, since no torch2.11 wheel exists yet) so stage 1 uses flash-attn
-  instead of the SDPA fallback.
+  schema, then switched to building `vllm_omni` from the local `perso` fork. Statically
+  validated only (the YAML patcher runs against the real v0.22.0 deploy config; the fork
+  passes ruff and its unit tests are written but need the image to run, since the host has
+  no matching vLLM), **not yet run end-to-end in Docker**: the first `--build` plus
+  `./voxtral/test_seed_determinism.sh D` and `E` are the real check. The prebuilt image
+  ships no standalone flash-attn; the Dockerfile re-adds it from a prebuilt wheel (the
+  torch2.10 cu13 one, ABI-compatible with the image's torch2.11 and verified in-image,
+  since no torch2.11 wheel exists yet) so stage 1 uses flash-attn instead of the SDPA
+  fallback.
 
 ## Layout notes
 
@@ -343,16 +368,18 @@ that older hand-run recipe.)
   `./models_tts_ignore_backups/` → `/models` (TTS baked refs); `./cache/` → `/cache`
   (auto-downloaded models land here). `voices/` is a symlink to the reference-clip source.
 - Model/audio binaries are gitignored (`**/*.gguf`, `**/*.mp3`, `**/*.wav`, the `models_*`
-  dirs, `cache`, `CrispASR_source`, `voices`), so the tracked repo is just compose + the
-  scripts + `Caddyfile` (the `crispasr-lb` ASR load-balancer config) + `utils/` + `voxtral/`.
+  dirs, `cache`, `CrispASR_source`, `voices`, `voxtral/vllm-omni/`), so the tracked repo is
+  just compose + the scripts + `Caddyfile` (the `crispasr-lb` ASR load-balancer config) +
+  `utils/` + `voxtral/`.
 - `voxtral/` holds the Voxtral TTS experiment (serving Voxtral TTS via **vLLM**, not
   CrispASR; see "Voxtral TTS" above): `Dockerfile` + `entrypoint.sh` back the `voxtral-tts`
   compose service, `install.sh` is the original hand-run recipe, and `env.reference` is a
   captured `pip freeze`. The client is the root `tts.py` (the old `voxtral/query_test.py`
   was merged into it). Also here: `test_seed_determinism.sh`, which owns the container
-  lifecycle and probes what actually makes the output vary (modes `A|B|C|D|all|up|down|doctor`;
-  `doctor` checks the per-request-seeding chain inside the running container and is
-  the first thing to run when seeding looks dead),
-  and `patches/sitecustomize.py`, the opt-in per-request seeding monkeypatch behind
-  `VOXTRAL_PER_REQUEST_SEED` (mounted read-only at `/opt/voxtral-patches`, so editing it
-  needs no rebuild).
+  lifecycle and probes what actually makes the output vary (modes
+  `A|B|C|D|E|all|up|down|doctor`; `doctor` checks the per-request-knob chain inside the
+  running container and is the first thing to run when a knob looks dead);
+  `vllm-omni/`, the **gitignored** upstream clone the image is built from (branch `perso`);
+  and `patches/`, which is now that fork's tracked backup (`*.patch` + a README with the
+  recreate recipe) rather than a runtime mount. `.dockerignore` keeps the clone's git
+  objects and the local `audios/` out of the build context.
