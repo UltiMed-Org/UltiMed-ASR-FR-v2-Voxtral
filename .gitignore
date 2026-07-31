@@ -104,3 +104,12 @@ original_repo_for_quantization/
 .tokensave
 CrispASR_source
 voices
+
+# Local vllm-omni clone that voxtral/Dockerfile builds the TTS image from
+# (branch `perso` carries our per-request cfg_alpha / seed / euler_steps
+# patches). Untracked on purpose: it is a full upstream tree with its own git
+# history, so vendoring it here would bury this repo's diffs. Recreate with:
+#   git clone --branch v0.22.0 --depth 1 \
+#     https://github.com/vllm-project/vllm-omni.git voxtral/vllm-omni
+# then re-apply the `perso` commits (see the Voxtral TTS section of CLAUDE.md).
+voxtral/vllm-omni/
