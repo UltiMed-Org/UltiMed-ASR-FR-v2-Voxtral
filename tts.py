@@ -135,6 +135,58 @@ VOXTRAL_FRAME_RATE_HZ = 12.5
 # (vllm-omni 0.22 serving_speech.py `_TTS_MAX_NEW_TOKENS_MAX`), i.e. 327.68 s.
 VOXTRAL_MAX_NEW_TOKENS_CAP = 4096
 
+# Knobs that only one of the two servers on :8003 can act on, keyed by argparse
+# dest. Used by warn_on_mixed_backend_knobs() below.
+#
+# Why this needs a guard at all: this client is deliberately backend-agnostic and
+# both servers accept an unknown per-request field WITHOUT complaining, so a knob
+# aimed at the wrong one is silently dropped behind an HTTP 200. CrispASR ignores
+# fields its active backend does not declare; vllm-omni is worse, because
+# `OpenAICreateSpeechRequest` sets no pydantic `model_config` and v2 then defaults
+# to extra='ignore', dropping every unknown top-level key. The near-collision
+# --cfg-scale (TADA) vs --cfg-alpha (Voxtral) is the sharp edge: passing the wrong
+# one produces byte-identical audio across a "sweep" and nothing says why.
+TADA_ONLY_KNOBS = (
+    "temperature", "top_p", "top_k", "repetition_penalty", "do_sample",
+    "num_candidates", "num_steps", "cfg_scale", "noise_temp",
+)
+VOXTRAL_ONLY_KNOBS = ("cfg_alpha", "euler_steps", "noise_seed", "max_new_tokens")
+
+
+def warn_on_mixed_backend_knobs(args: argparse.Namespace) -> None:
+    """Warn when one call mixes TADA-only and Voxtral-only per-request knobs.
+
+    Only one TTS server can own :8003 at a time (crispasr-tts or voxtral-tts), so
+    a request carrying both families always has one family thrown away. Which one
+    depends on who is listening, and this client cannot tell from here, hence a
+    warning rather than an error: the request is still sent, in full.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments. Every knob inspected here defaults to ``None``, so a
+        non-None value means the user set it explicitly.
+    """
+    tada = [d for d in TADA_ONLY_KNOBS if getattr(args, d, None) is not None]
+    voxtral = [d for d in VOXTRAL_ONLY_KNOBS if getattr(args, d, None) is not None]
+    if not tada or not voxtral:
+        return
+
+    def flags(dests: list[str]) -> str:
+        """Render dests as CLI flags, with the verb that agrees with the count."""
+        rendered = ", ".join("--" + d.replace("_", "-") for d in dests)
+        return f"{rendered} {'apply' if len(dests) > 1 else 'applies'}"
+
+    print(f"warning: {flags(tada)} only to the CrispASR TADA backend, while "
+          f"{flags(voxtral)} only to the Voxtral (vLLM) backend. Only one of "
+          "them owns :8003, so one group is being silently ignored by whichever "
+          "server is up (both answer 200 for fields they do not know).",
+          file=sys.stderr)
+    if "cfg_scale" in tada and "cfg_alpha" in voxtral:
+        print("warning: --cfg-scale (TADA) and --cfg-alpha (Voxtral) are different "
+              "knobs on different servers, not aliases; pick the one matching the "
+              "running backend.", file=sys.stderr)
+
 
 def _get(url: str, timeout: float = 10.0) -> tuple[int, bytes, str]:
     req = urllib.request.Request(url, method="GET")
@@ -738,7 +790,9 @@ def main() -> int:
                           help="Acoustic flow-matching ODE steps: more = crisper but slower "
                                "(the main quick-vs-accurate lever). Server default 10.")
     acoustic.add_argument("--cfg-scale", type=float, default=None,
-                          help="Acoustic classifier-free guidance weight. Server default 1.6.")
+                          help="Acoustic classifier-free guidance weight. Server default 1.6. "
+                               "TADA only: on a Voxtral server this is dropped silently, "
+                               "use --cfg-alpha there.")
     acoustic.add_argument("--noise-temp", type=float, default=None,
                           help="Acoustic noise temperature. Server default 0.9.")
 
@@ -780,6 +834,8 @@ def main() -> int:
                               "bounded by stage 0's max_model_len, shared with the "
                               "prompt: see VOXTRAL_MAX_MODEL_LEN.")
     args = p.parse_args()
+
+    warn_on_mixed_backend_knobs(args)
 
     # Mirrors the startup guardrail in voxtral/entrypoint.sh, but warns instead
     # of refusing: cfg_alpha=1.0 turns CFG off and the flow-matching decoder
