@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** not started (plan written 2026-09-08, branch `voxtral-voice-cloning-test`)
+**STATUS:** A1 host side done and accepted, container half pending (you must run it: sudo has no TTY for the agent)
 
-**NEXT ACTION:** Stage A1 (inventory the 20 shipped voice embeddings, no GPU needed)
+**NEXT ACTION:** run the two commands in A1's Result to confirm `zz_test` works on the live server, then Stage A2
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -55,7 +55,7 @@ A "voice" in Voxtral is **not** a speaker vector. It is a pre-encoded reference 
 
 No training, no decoder, no GPU beyond the running server. This may already satisfy the goal, so it runs first.
 
-### [ ] A1. Inventory and registration mechanics
+### [x] A1. Inventory and registration mechanics
 
 Write `voxtral/cloning/voices_tool.py` with three subcommands:
 
@@ -67,7 +67,27 @@ Acceptance: `list` prints 20 voices with N matching `tekken.json` exactly. Then 
 
 Estimated: 1 to 2 h. Notes: the server reads voices once at model init, so every registration needs `sudo docker compose up -d voxtral-tts` (not `restart`). If `hf_hub_download` clobbers edits, set `HF_HUB_OFFLINE=1` in the service environment. **TODO:** if that is not enough, the cleaner fix is a local model dir via `VOXTRAL_TTS_MODEL` (`voxtral/entrypoint.sh:32`), but then the euler-steps patch at `:246` needs to handle a local path instead of a repo id.
 
-**Result:**
+**Result:** 2026-09-09, Claude Code. `voxtral/cloning/voices_tool.py` written (click + loguru, PEP 723, no torch: it only copies a file and patches two JSON dicts). Subcommands `paths`, `list`, `add`, `remove`, `restore`.
+
+Host-side acceptance PASSED:
+
+- `list` shows all 20 shipped voices with `.pt` frame counts matching `tekken.json` exactly, 0 problems. Frame counts are derived from the tensor's byte size rather than trusted, so drift cannot go unnoticed.
+- `add --name zz_test --from-voice fr_female` registered a 97-frame copy, byte-identical to the source.
+- `add` then `remove` of a throwaway voice round-tripped cleanly, leaving 21 voices.
+- `remove --name fr_male` correctly refuses shipped voices (their `.pt` is still a `blobs/` symlink).
+- `params.json` and `tekken.json` stayed valid, kept every other key, and `n_decoding_steps` is still 16, so entrypoint.sh's own patch survives this tool.
+- Pristine copies of both configs saved to `cache/cloning/backup/`, restorable with `voices_tool.py restore`.
+
+Container-side acceptance NOT run: `sudo` needs a password and the agent has no TTY. `zz_test` is left registered so you can finish it:
+
+```
+sudo docker compose up -d voxtral-tts     # NOT restart: voices load at model init
+./tts.py -t "Bonjour, ceci est un test." --voice zz_test -o /tmp/zz.wav
+```
+
+Expect audio indistinguishable in character from `--voice fr_female`. If the server answers "Invalid speaker 'zz_test'", the snapshot edits did not reach the container (see the `HF_HUB_OFFLINE` / local-model-dir TODOs). Once confirmed, `./voxtral/cloning/voices_tool.py remove --name zz_test`.
+
+Note for later sessions: the agent cannot run `sudo docker`, so every stage that needs the server has to end with commands for you to run.
 
 ### [ ] A2. Derived voices: truncation, cross-lingual, interpolation
 
@@ -187,3 +207,4 @@ Newest at the bottom. One row per working session.
 | date | stage | what happened | next |
 |---|---|---|---|
 | 2026-09-08 | plan | Plan written (Claude Code). Established that voices are pre-encoded audio prefixes, the encoder is missing from the open weights, the decoder is not. | A1 |
+| 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Container check left to the user (no sudo TTY for the agent). | finish A1 on the server, then A2 |
