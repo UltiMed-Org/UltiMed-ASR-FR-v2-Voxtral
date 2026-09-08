@@ -2,7 +2,7 @@
 
 **STATUS:** A1 host side done and accepted, container half pending (you must run it: sudo has no TTY for the agent)
 
-**NEXT ACTION:** run the two commands in A1's Result to confirm `zz_test` works on the live server, then Stage A2
+**NEXT ACTION:** run `./voxtral/cloning/step.sh` to finish A1 on the live server, then Stage A2
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -29,6 +29,7 @@ Sessions are days apart, so this file is the only memory. Rules:
 4. End every session by updating: the stage checkbox, the stage Result field, the STATUS line, the NEXT ACTION line, and a new session log row. Then commit (one commit per session, message `plan: <stage> <outcome>`).
 5. Keep code in `voxtral/cloning/`, artifacts in `cache/cloning/` (already gitignored, so `.pt` and intermediate files stay out of git).
 6. Scripts follow the repo convention: standalone `uv` scripts with PEP 723 inline deps, no venv, no shared package.
+7. **The agent cannot run `sudo docker`** (no password, no TTY), so anything server-side goes into `voxtral/cloning/step.sh`. The agent updates `stage_<x>()` and the `CURRENT_STAGE` variable, the user runs `./voxtral/cloning/step.sh`, and the run is teed to `cache/cloning/logs/<stage>-<timestamp>.log`. The agent reads that log next session instead of asking for pasted output.
 
 Checkbox legend: `[ ]` todo, `[x]` done and accepted, `[!]` attempted and failed (see Result), `[-]` skipped deliberately.
 
@@ -78,16 +79,15 @@ Host-side acceptance PASSED:
 - `params.json` and `tekken.json` stayed valid, kept every other key, and `n_decoding_steps` is still 16, so entrypoint.sh's own patch survives this tool.
 - Pristine copies of both configs saved to `cache/cloning/backup/`, restorable with `voices_tool.py restore`.
 
-Container-side acceptance NOT run: `sudo` needs a password and the agent has no TTY. `zz_test` is left registered so you can finish it:
+Container-side acceptance NOT run yet: `sudo` needs a password and the agent has no TTY. `zz_test` is left registered. Run:
 
 ```
-sudo docker compose up -d voxtral-tts     # NOT restart: voices load at model init
-./tts.py -t "Bonjour, ceci est un test." --voice zz_test -o /tmp/zz.wav
+./voxtral/cloning/step.sh
 ```
 
-Expect audio indistinguishable in character from `--voice fr_female`. If the server answers "Invalid speaker 'zz_test'", the snapshot edits did not reach the container (see the `HF_HUB_OFFLINE` / local-model-dir TODOs). Once confirmed, `./voxtral/cloning/voices_tool.py remove --name zz_test`.
+It handles the :8003 clash with `crispasr-tts`, brings up `voxtral-tts` with `up -d` (not `restart`), waits for `tts.py --check` to pass, prints the container's own "Available voice embeddings" line, then synthesizes the same sentence twice with `--noise-seed 7`, once with `fr_female` and once with `zz_test`.
 
-Note for later sessions: the agent cannot run `sudo docker`, so every stage that needs the server has to end with commands for you to run.
+Acceptance is sharper than "sounds similar": with the seed pinned the fork's per-frame noise is reproducible and the rest of the pipeline is deterministic, so the two wavs should be **byte identical**. `cmp` decides it. Output lands in `cache/cloning/out/`, the whole run in `cache/cloning/logs/a1-*.log`, which the agent reads next session. Then clean up with `./voxtral/cloning/voices_tool.py remove --name zz_test`.
 
 ### [ ] A2. Derived voices: truncation, cross-lingual, interpolation
 
@@ -207,4 +207,4 @@ Newest at the bottom. One row per working session.
 | date | stage | what happened | next |
 |---|---|---|---|
 | 2026-09-08 | plan | Plan written (Claude Code). Established that voices are pre-encoded audio prefixes, the encoder is missing from the open weights, the decoder is not. | A1 |
-| 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Container check left to the user (no sudo TTY for the agent). | finish A1 on the server, then A2 |
+| 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Added step.sh so all server-side work is one command the user runs, logged for the agent to read back. | user runs step.sh, then A2 |
