@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A2 swept: all 13 takes rendered, none degenerate, numbers triaged. Only the listening pass is left, and only the user can do it.
+**STATUS:** A2 accepted (6 keepers). A3 found that Voxtral clones from a raw clip natively via `ref_audio`, which is a different mechanism from the missing encoder. Needs one rebuild (soxr) to test.
 
-**NEXT ACTION:** listen through `cache/cloning/A2/wav/` in the order suggested in `cache/cloning/A2/notes.md`, fill the judgement table, then A3 (keep the winners, `derive_voices.py clean` the rest).
+**NEXT ACTION:** run `./voxtral/cloning/step.sh a3`: rebuilds with soxr, then clones `olivier 2.ogg`, `olivier.ogg`, `alicia2.ogg`, `alicia.ogg`. Listen and compare against the source clips.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -166,13 +166,49 @@ Reading, to be confirmed by ear:
 - **Cross-lingual is the cheapest diversity of all**: 118 and 128 Hz, 25 to 40 percent slower, zero registration, zero risk.
 
 Note the seed makes takes comparable but not neutral: all 13 share `--noise-seed 7`, so a single unlucky draw affects them all equally. Worth a second sweep at another seed before rejecting a variant on one bad take.
-### [ ] A3. Decision point
+### [x] A3. Decision point
 
 If A2 produced enough usable voices for the dataset, **stop here** and mark Track B as skipped. Write down how many voices exist and how diverse they actually are. Track B is only worth it if A2 falls short or if the diversity is too obviously "the same 20 speakers, blended".
+
+**Result:** 2026-09-09, Claude Code. Two separate findings.
+
+**1. A2 cleared its bar.** The user's listening table (`cache/cloning/A2/notes.md`) marks 6 keepers: `d_frf_head40`, `d_frf_head60`, `d_frf_tail60`, `d_frf_itf_50`, `d_frf_itf_cat`, plus `fr_female` itself. Judgements worth carrying forward:
+
+- Truncation is reliable and mild. `tail60` was called indistinguishable from the parent, the two `head` cuts only slightly different, so the axis works but its range is narrow.
+- `d_frf_itf_50` and `d_frf_itf_cat` were both heard as genuinely different voices, the splice with "a bit of an accent". Cross-language blending is therefore NOT uniformly mush.
+- The failure mode is a **seam**, not a smear: `d_frf_esf_50` switches voice mid-utterance ("before 'le vieux chêne' it uses a different voice than after") and `d_frf_frm_50` garbles "bonjour" before settling into a good male voice. Both are the frame-by-frame average being coherent in places and not others, which matches the low rms flagged in triage. So a blend is worth keeping only if it holds ONE identity across the whole utterance.
+- `d_frf_frm_25` was indistinguishable from the parent: at 25 percent the partner barely registers.
+- Cross-lingual works but costs intelligibility: `nl_male` was rejected for a strong accent, `it_female` and `pt_male` kept with reservations, and `es_male` "fails during 75 and after", i.e. on the number, which is where a non-French speaker prefix hurts most.
+
+**2. The bigger finding: Voxtral already clones from a raw clip, per request.** Reading `serving_speech.py::_build_voxtral_prompt` (and `_validate_voxtral_tts_request`, and the upstream `examples/.../voxtral_tts/end2end.py`), a request may carry `ref_audio` instead of `voice`. mistral_common's `encode_speech_request` decodes the clip and vllm-omni passes the waveform to stage 0 as `multi_modal_data: {"audio": [...]}`. The stage-0 model is `SupportsMultiModal` with an `audio_arrays` field and a real `VoxtralTTSMultiModalProcessor`, so this is a first-class shipped feature, not a stub.
+
+**This does not contradict the "the encoder is missing" background above, it sidesteps it.** The absent codec encoder is what would be needed to bake a new *preset* voice (a `[N, 3072]` pre-encoded prefix on disk). Cloning by `ref_audio` uses the AR LLM's own multimodal audio input instead, a completely different tower, and that one ships with the checkpoint.
+
+Verified live against the running server on the first attempt, with `tts.py --ref-audio` added this session: the request reached the model and failed on a missing dependency, not on the mechanism. `400: "soxr is not installed"`, mistral_common's resampler, absent from the base image because preset voices never resample. One `pip install soxr` line in `voxtral/Dockerfile` and a rebuild.
+
+**Decision: Track B is on hold, not started.** Decoder inversion was designed to work around exactly the problem `ref_audio` does not have. It becomes worth doing only if the clones sound bad, or if a *preset* (a persistent, registerable voice with no per-request clip) turns out to be needed. Track A's 6 derived voices stay useful regardless: they are free diversity that costs no reference audio at all.
+
+Stage A4 below now carries the actual goal: clone `olivier 2.ogg` and `alicia2.ogg`.
+
+### [ ] A4. Clone the target voices (the project's actual acceptance test)
+
+The user's own success criterion: `voices/olivier 2.ogg` and `voices/alicia2.ogg` must come out sounding like those people. Longer takes of the same two speakers exist (`voices/olivier.ogg`, `voices/alicia.ogg`), so the sweep does both lengths per speaker to see whether more reference audio clones better.
+
+`step.sh a3` runs it: rebuild (soxr), boot, one anchor take with `fr_female` to prove the server is fine independently of cloning, then four clones at one fixed text and `--noise-seed 7`. Output in `cache/cloning/A3/wav/`.
+
+Acceptance: both short clips produce a recognisable imitation of their speaker. Failure modes to watch for and what each would mean:
+
+- Right speaker, wrong prosody or a wobbly identity: usable, tune with a longer or cleaner reference clip.
+- Generic voice unrelated to the clip: the audio reached the model but carried no identity, so check the clip's sample rate and length against what `encode_speech_request` produced.
+- Another `soxr` 400: the image did not actually rebuild (`up -d --build --force-recreate` is what `start_voxtral` does, check the log).
+
+Open question once it works: cloning is per request and stateless, so a dataset run pays the reference clip on **every** call. Measure whether that costs meaningful latency, and if it does, revisit whether a preset is worth Track B after all.
 
 **Result:**
 
 ## Track B: new voices from real clips, by inverting the decoder
+
+**ON HOLD since 2026-09-09, see A3.** `ref_audio` clones without the missing encoder, so this whole track is a fallback now rather than the plan. Start it only if A4's clones are unusable, or if a persistent preset voice turns out to be required.
 
 Only start after A3 says Track A is insufficient. Each stage is a gate for the next.
 
@@ -272,3 +308,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A1 | **A1 accepted.** zz_test loaded by the container and produced audio byte identical to fr_female at seed 7. Fixed tts.py --check (sent no voice, so it read a healthy Voxtral server as down) and a pipefail false warning in step.sh. zz_test removed. | A2 |
 | 2026-09-09 | A2 | derive_voices.py written; 8 derived voices (truncations, blends, splice) built and registered, 28 voices consistent. step.sh stage_a2 sweeps them plus 4 cross-lingual at one fixed seed. | user runs step.sh a2, then listens |
 | 2026-09-09 | A2 | Sweep run: 13 takes, all 200, all distinct. wav_stats.py added for triage. Blends shift pitch for real (frm_50 at 150 Hz); cross-language blends show the low-rms mush signature; truncation and cross-lingual look safe. | user listens, then A3 |
+| 2026-09-09 | A3 | A2 accepted, 6 keepers, with the seam-vs-smear failure mode understood. Found that Voxtral clones from a raw clip per request via ref_audio (LLM multimodal input, not the missing codec encoder); verified live, blocked only by soxr missing from the image. Track B put on hold. | user runs step.sh a3 |

@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # The stage the agent last prepared. Updated as part of the session protocol.
-CURRENT_STAGE="a2"
+CURRENT_STAGE="a3"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -225,6 +225,74 @@ stage_a1() {
     echo "    ./voxtral/cloning/voices_tool.py remove --name zz_test"
 }
 
+stage_a3() {
+    # Voice cloning from a real clip, via Voxtral's own ref_audio path.
+    #
+    # This is NOT the derived-voice machinery: nothing is registered, no .pt is
+    # written, params.json is untouched. The clip rides along with each request
+    # and vllm-omni hands the decoded waveform to the stage-0 LLM as multimodal
+    # input, so the missing codec encoder (the thing Track B was designed to work
+    # around) is not on this path at all.
+    #
+    # The rebuild is required once: cloning needs soxr, mistral_common's
+    # resampler, which the base image does not ship because preset voices never
+    # resample anything. Without it the request 400s with "`soxr` is not
+    # installed" and the server stays perfectly healthy, which is why this failed
+    # against a running server rather than at boot.
+    local text="Bonjour, je vous propose aujourd'hui une petite histoire. Le vieux chêne du jardin a soixante-quinze ans."
+    local seed=7
+    local wav_dir="cache/cloning/A3/wav"
+    mkdir -p "$wav_dir"
+
+    # Both lengths of both speakers: the short clips are the target, the long
+    # ones test whether more reference audio clones better. Same text and seed
+    # throughout, so clip length is the only variable within a speaker.
+    local -a clips=(
+        "olivier2:voices/olivier 2.ogg"
+        "olivier_long:voices/olivier.ogg"
+        "alicia2:voices/alicia2.ogg"
+        "alicia_long:voices/alicia.ogg"
+    )
+
+    check_fork_has_local_voice_lookup
+    check_port_clash
+    start_voxtral
+    wait_for_health
+
+    say "anchor take with a preset voice (proves the server is fine if cloning is not)"
+    ./tts.py -t "$text" --voice fr_female --noise-seed "$seed" -o "$wav_dir/_anchor_fr_female.wav"
+
+    local failed=()
+    for entry in "${clips[@]}"; do
+        local label="${entry%%:*}"
+        local clip="${entry#*:}"
+        printf '\n--- %s  (%s)\n' "$label" "$clip"
+        if [[ ! -f "$clip" ]]; then
+            warn "missing clip: $clip"
+            failed+=("$label")
+            continue
+        fi
+        if ! ./tts.py -t "$text" --ref-audio "$clip" --noise-seed "$seed" \
+             -o "$wav_dir/$label.wav"; then
+            failed+=("$label")
+            fail "$label was rejected"
+        fi
+    done
+
+    if ((${#failed[@]})); then
+        fail "${#failed[@]} clone(s) failed: ${failed[*]}"
+        warn "a 'soxr is not installed' 400 means the image did not actually rebuild"
+    fi
+
+    say "results"
+    ls -l "$wav_dir"
+    ./voxtral/cloning/wav_stats.py "$wav_dir" --ref _anchor_fr_female || true
+
+    say "listen: does <name>.wav sound like the person in its source clip?"
+    echo "    source clips are in voices/, takes in $wav_dir"
+    echo "    if yes, Track B (decoder inversion) is unnecessary and A3 closes the project's core goal"
+}
+
 stage_diag() {
     # Read-only post-mortem: starts nothing, changes nothing. Run this after a
     # failed boot, BEFORE any `up -d`, because `docker compose logs` can only
@@ -320,7 +388,7 @@ case "$STAGE" in
         sudo docker compose stop voxtral-tts
         ok "voxtral-tts stopped, GPU freed"
         ;;
-    diag | a1 | a2)
+    diag | a1 | a2 | a3)
         require_sudo
         say "stage $STAGE (log: $LOG_FILE)"
         "stage_$STAGE"
@@ -328,7 +396,7 @@ case "$STAGE" in
         echo "The agent reads that file next session; no need to paste anything."
         ;;
     *)
-        fail "unknown stage '$STAGE' (expected: diag, a1, a2, logs, down)"
+        fail "unknown stage '$STAGE' (expected: diag, a1, a2, a3, logs, down)"
         exit 1
         ;;
 esac

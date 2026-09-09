@@ -85,6 +85,7 @@ Generated with help from Claude Code.
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import subprocess
@@ -232,6 +233,7 @@ def build_speech_body(
     model: str | None = None,
     instruction: str | None = None,
     voice: str | None = None,
+    ref_audio: str | None = None,
     seed: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -284,6 +286,14 @@ def build_speech_body(
         cross-request leak). A `.wav` handed straight to `voice` is still
         rejected by TADA (bake a ref offline first). Also honoured by
         qwen3-tts base, vibevoice-1.5b, ...
+    ref_audio : str or None
+        Voxtral voice cloning: a reference clip as a base64 data URI, an
+        http(s) URL, or a file:// URI resolved inside the container. Mutually
+        exclusive with `voice` server-side (the request needs exactly one of
+        the two). Unlike TADA, this needs no baking step and no encoder on our
+        side: vllm-omni hands the decoded waveform to the stage-0 LLM as
+        multimodal input (`_build_voxtral_prompt` -> `multi_modal_data`), which
+        is a different mechanism from the preset voices' pre-encoded prefixes.
     seed : int or None
         RNG seed. With sampling on, the same seed + text is reproducible and
         different seeds change the wording.
@@ -379,6 +389,7 @@ def build_speech_body(
         "model": model,
         "instructions": instruction,
         "voice": voice,
+        "ref_audio": ref_audio,
         "seed": seed,
         "temperature": temperature,
         "top_p": top_p,
@@ -420,6 +431,44 @@ def build_speech_body(
     return body
 
 
+def resolve_ref_audio(value: str | None) -> str | None:
+    """Turn `--ref-audio` into something the server accepts.
+
+    A local path becomes an inline base64 data URI, which is the only form that
+    works regardless of where the server runs: an http(s) URL needs the clip to
+    be published somewhere, and a `file://` URI is resolved INSIDE the container,
+    so it would silently miss a host path that is not mounted there. URLs and
+    file:// URIs are passed through untouched for the cases where they are what
+    the user wants.
+
+    The MIME type is a hint only. mistral_common sniffs the actual container
+    (soundfile/libsndfile), so ogg, wav, flac and mp3 all work whatever is
+    claimed here.
+
+    Parameters
+    ----------
+    value : str or None
+        A local path, an http(s) URL, a file:// URI, or an already-built
+        data URI. None passes through.
+
+    Returns
+    -------
+    str or None
+        The value to put in the request's `ref_audio` field.
+    """
+    if value is None:
+        return None
+    if value.startswith(("http://", "https://", "file://", "data:")):
+        return value
+    path = Path(value)
+    if not path.is_file():
+        raise SystemExit(f"--ref-audio: no such file: {path}")
+    mime = {".ogg": "audio/ogg", ".wav": "audio/wav", ".mp3": "audio/mpeg",
+            ".flac": "audio/flac", ".m4a": "audio/mp4"}.get(path.suffix.lower(), "audio/ogg")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def _body_from_args(text: str, args: argparse.Namespace) -> dict:
     """Build a /v1/audio/speech body from the parsed CLI args for `text`.
     Single and batch modes share this so their request shapes never drift."""
@@ -430,6 +479,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         model=args.model,
         instruction=args.instruction,
         voice=args.voice,
+        ref_audio=args.ref_audio,
         seed=args.seed,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -756,6 +806,13 @@ def main() -> int:
                             "'default'/'auto'/unset keeps the server's current voice). "
                             "For Voxtral: a built-in embedding name, e.g. fr_male, "
                             "neutral_female.")
+    voice.add_argument("--ref-audio", default=None,
+                       help="VOXTRAL ONLY: clone the voice in this reference clip instead of "
+                            "using a preset. Takes a local audio file (ogg/wav/mp3/flac, sent "
+                            "inline as base64), an http(s) URL, or a file:// URI resolved inside "
+                            "the container. Mutually exclusive with --voice. No baking and no "
+                            "registration: the clip is handed to the model as multimodal input "
+                            "per request, so nothing persists server-side.")
     voice.add_argument("--voice-name", default=None,
                        help="Bake ./voices/<NAME> (its <NAME>.txt transcript) into a tada-ref "
                             "gguf via clone_voice.py if not already baked, then synthesize with "
@@ -884,6 +941,13 @@ def main() -> int:
 
     if args.check:
         return cmd_check(base_url, voice=args.voice)
+
+    if args.ref_audio:
+        # Server-side this is a hard either/or (`_validate_voxtral_tts_request`
+        # wants exactly one), so catch it here rather than as a 400.
+        if args.voice or args.voice_name:
+            p.error("--ref-audio is mutually exclusive with --voice / --voice-name")
+        args.ref_audio = resolve_ref_audio(args.ref_audio)
 
     if args.voice_name:
         if args.voice:

@@ -161,6 +161,16 @@ hand-run recipe.)
   `neutral_female`, ...) and should be passed explicitly:
   `./tts.py -t "Bonjour." --voice neutral_female -o out.wav`. If vLLM rejects a
   request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
+- **Voice cloning works per request, and needs none of the missing encoder.** `ref_audio`
+  (`tts.py --ref-audio <clip|url|file://>`, mutually exclusive with `--voice`) sends a
+  reference clip inline as base64. `serving_speech.py::_build_voxtral_prompt` runs it
+  through mistral_common's `encode_speech_request` and hands the decoded waveform to
+  stage 0 as `multi_modal_data: {"audio": [...]}`, i.e. the AR LLM's own multimodal audio
+  input, NOT the codec encoder that is absent from the open weights (that one is only
+  needed to bake a new *preset* voice). Nothing persists: no registration, no restart.
+  Requires **soxr** in the image (mistral_common resamples the clip); the base image does
+  not ship it, and without it every clone request 400s with "`soxr` is not installed"
+  while the server stays healthy. `voxtral/Dockerfile` installs it.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
   only), `max_new_tokens` (see the length section below), and `extra_params`, which is

@@ -37,6 +37,15 @@ RUN groupadd -g "${APP_GID}" voxtral 2>/dev/null || true \
 RUN pip install --no-cache-dir \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
+# soxr: mistral_common's resampler, needed ONLY on the voice-cloning path.
+# `ref_audio` (a reference clip sent per request, as opposed to one of the 20
+# pre-encoded preset voices) is decoded and resampled to the model's rate by
+# `encode_speech_request`, which imports soxr lazily and otherwise fails the
+# request with "`soxr` is not installed" and a 400. The base image does not ship
+# it because preset voices never touch that code path. Installed as its own
+# layer, before the vllm_omni one, so it survives edits to the clone.
+RUN pip install --no-cache-dir soxr
+
 # Build vllm_omni from the LOCAL clone instead of using the copy bundled in the
 # base image, so our Voxtral patches (per-request cfg_alpha, seed and
 # euler_steps) are what actually serves. The clone lives at ./vllm-omni, is
