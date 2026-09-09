@@ -161,16 +161,23 @@ hand-run recipe.)
   `neutral_female`, ...) and should be passed explicitly:
   `./tts.py -t "Bonjour." --voice neutral_female -o out.wav`. If vLLM rejects a
   request without a model name, add `--model mistralai/Voxtral-4B-TTS-2603`.
-- **Voice cloning works per request, and needs none of the missing encoder.** `ref_audio`
-  (`tts.py --ref-audio <clip|url|file://>`, mutually exclusive with `--voice`) sends a
-  reference clip inline as base64. `serving_speech.py::_build_voxtral_prompt` runs it
-  through mistral_common's `encode_speech_request` and hands the decoded waveform to
-  stage 0 as `multi_modal_data: {"audio": [...]}`, i.e. the AR LLM's own multimodal audio
-  input, NOT the codec encoder that is absent from the open weights (that one is only
-  needed to bake a new *preset* voice). Nothing persists: no registration, no restart.
-  Requires **soxr** in the image (mistral_common resamples the clip); the base image does
-  not ship it, and without it every clone request 400s with "`soxr` is not installed"
-  while the server stays healthy. `voxtral/Dockerfile` installs it.
+- **Voice cloning via `ref_audio` does NOT work on the open weights.** The route looks
+  complete and is not: `serving_speech.py::_build_voxtral_prompt` encodes the clip with
+  mistral_common and passes it as `multi_modal_data`, the stage-0 model is
+  `SupportsMultiModal` with a real processor, and then
+  `voxtral_tts_audio_generation.py::embed_multimodal` calls
+  `audio_tokenizer.encode_waveforms()`, which raises *"requires encoder weights which are
+  not available in the open-source checkpoint"*. The multimodal audio path IS the codec
+  encoder, not a separate understanding tower, so cloning hits exactly the missing piece.
+  Worse, that raise happens inside `execute_model`, which is fatal in vLLM: **one clone
+  request killed EngineCore and every concurrent request with it** (2026-09-09, 500 then
+  connection resets until restart). Fork patch 0006 refuses `ref_audio` at the serving
+  layer so it costs one 400 instead of an outage; drop that guard if a checkpoint ever
+  ships the encoder, since everything else on the path is complete. `tts.py --ref-audio`
+  exists and is what surfaced this; it stays for that eventual case. The **decoder** does
+  ship in full, which is why decoder inversion (`PLAN_VOXTRALTTS_CLONING_TEST.md` Track B)
+  is the remaining route to a cloned voice. `soxr` is in the Dockerfile because the
+  cloning path needs it to resample; unrelated to the encoder problem.
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
   only), `max_new_tokens` (see the length section below), and `extra_params`, which is

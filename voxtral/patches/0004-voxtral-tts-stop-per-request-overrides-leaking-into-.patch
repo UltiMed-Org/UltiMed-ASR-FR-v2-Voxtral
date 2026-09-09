@@ -2,7 +2,7 @@ From 75c62edf38cd24a139397b6f1a83117ec4adf6f0 Mon Sep 17 00:00:00 2001
 From: thiswillbeyourgithub
  <26625900+thiswillbeyourgithub@users.noreply.github.com>
 Date: Fri, 31 Jul 2026 21:11:56 +0200
-Subject: [PATCH 4/5] voxtral tts: stop per-request overrides leaking into the
+Subject: [PATCH 4/6] voxtral tts: stop per-request overrides leaking into the
  engine defaults
 
 The `is default_sampling_params_list` guard the seed block used (and that the

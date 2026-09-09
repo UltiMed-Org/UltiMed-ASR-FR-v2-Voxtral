@@ -2,7 +2,7 @@ From 7bdd136f1cbecc4e6d7d74ec4816bea3ee498196 Mon Sep 17 00:00:00 2001
 From: thiswillbeyourgithub
  <26625900+thiswillbeyourgithub@users.noreply.github.com>
 Date: Fri, 31 Jul 2026 20:11:06 +0200
-Subject: [PATCH 2/5] voxtral tts: per-request noise seed and euler steps in
+Subject: [PATCH 2/6] voxtral tts: per-request noise seed and euler steps in
  the acoustic decoder
 
 The Gaussian each 12.5 Hz frame's flow-matching ODE starts from is the only

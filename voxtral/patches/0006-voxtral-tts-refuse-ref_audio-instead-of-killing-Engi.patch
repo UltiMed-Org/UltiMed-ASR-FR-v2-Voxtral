@@ -1,0 +1,44 @@
+From 0bc304710cf6a47f96a3b4605bc5ff8022bdfd79 Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Wed, 9 Sep 2026 23:06:14 +0200
+Subject: [PATCH 6/6] voxtral-tts: refuse ref_audio instead of killing
+ EngineCore
+
+The open-source checkpoint has no codec encoder, so encode_waveforms()
+raises inside execute_model, which is fatal: one clone request takes
+down the engine and every concurrent request with it.
+---
+ .../entrypoints/openai/serving_speech.py      | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/vllm_omni/entrypoints/openai/serving_speech.py b/vllm_omni/entrypoints/openai/serving_speech.py
+index a12c0d9..405d841 100644
+--- a/vllm_omni/entrypoints/openai/serving_speech.py
++++ b/vllm_omni/entrypoints/openai/serving_speech.py
+@@ -1378,6 +1378,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+         if request.voice is None and request.ref_audio is None:
+             return "Either 'voice' (preset speaker) or 'ref_audio' (voice cloning) must be provided"
+ 
++        if request.ref_audio is not None:
++            # ref_audio is accepted end to end by the serving layer, then dies in
++            # the engine: embed_multimodal() -> audio_tokenizer.encode_waveforms()
++            # raises "requires encoder weights which are not available in the
++            # open-source checkpoint", and an exception inside execute_model is
++            # fatal, so ONE clone request kills EngineCore and every concurrent
++            # request with it (observed 2026-09-09: 500, then connection resets
++            # until the container restarts).
++            #
++            # Refusing here turns a server-wide outage into one 400. Drop this
++            # guard if a checkpoint ever ships the codec encoder; the rest of the
++            # path (prompt building, multimodal plumbing, the encoder call site)
++            # is complete and would work as is.
++            return (
++                "Voice cloning via 'ref_audio' is not available: the open-source "
++                "Voxtral checkpoint ships the audio codec DECODER but not its encoder, "
++                "so the reference clip cannot be encoded. Use a preset 'voice' instead."
++            )
++
+         if request.ref_audio is not None:
+             fmt_err = self._validate_ref_audio_format(request.ref_audio)
+             if fmt_err:
