@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A1 done and accepted end to end (host + container). Registering a voice is a solved, verified operation. Next stage is A2.
+**STATUS:** A2 host side done: 8 derived voices built and registered (`derive_voices.py`). Waiting on the listening pass, which needs one boot.
 
-**NEXT ACTION:** Stage A2, derived voices. The server can stay up: A2 is host-side tensor edits plus `tts.py` calls, and only registering a NEW voice needs `up -d` (~19 min to healthy).
+**NEXT ACTION:** run `./voxtral/cloning/step.sh a2` (~19 min to healthy, then 13 quick takes), listen through `cache/cloning/A2/wav/`, fill `cache/cloning/A2/notes.md`.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -123,7 +123,22 @@ Acceptance: at least **4 new voices** that are clearly distinct from the 20 orig
 
 Estimated: 2 to 3 h, mostly listening.
 
-**Result:**
+**Result:** 2026-09-09, Claude Code, host side. `voxtral/cloning/derive_voices.py` written (click + loguru + CPU-only torch via a pinned PEP 723 index, so ~200 MB instead of ~2.5 GB of CUDA and no contention with the running server). It does tensor surgery only and shells out to `voices_tool.py add` for registration, so the three-files-must-agree logic is not duplicated. Ops: `head`, `tail`, `mix` (alpha blend, both cut to the shorter), `cat`. Math runs in float32 and is cast back to bfloat16 on save, so a derived file is format-identical to a shipped one.
+
+8 variants built and registered, all `d_*` so `clean` can remove exactly what was created. `voices_tool.py list` reports 28 voices, 0 problems:
+
+| voice | recipe | frames |
+|---|---|---|
+| d_frf_head40 | fr_female[:40] | 40 |
+| d_frf_head60 | fr_female[:60] | 60 |
+| d_frf_tail60 | fr_female[-60:] | 60 |
+| d_frf_itf_50 | 0.5 fr_female + 0.5 it_female | 97 |
+| d_frf_esf_50 | 0.5 fr_female + 0.5 es_female | 97 |
+| d_frf_frm_50 | 0.5 fr_female + 0.5 fr_male | 97 |
+| d_frf_frm_25 | 0.75 fr_female + 0.25 fr_male | 97 |
+| d_frf_itf_cat | fr_female[:48] + it_female[48:] | 172 |
+
+Cross-lingual needs no registration at all (shipped voices, French text), so `stage_a2()` just adds `es_male`, `it_female`, `pt_male`, `nl_male` to the sweep. 13 takes total, same text and same `--noise-seed 7` throughout so every difference is attributable to the prefix, plus `fr_female` as the anchor the acceptance bar is set against. Container side pending: one boot, then listening.
 
 ### [ ] A3. Decision point
 
@@ -229,3 +244,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Added step.sh so all server-side work is one command the user runs, logged for the agent to read back. | user runs step.sh, then A2 |
 | 2026-09-09 | A1 | Two failed container boots. A locally-added voice bricks stock vllm_omni (remote hf_hub_download per voice, 404, boot loop); HF_HUB_OFFLINE=1 fixed that but broke vLLM's repo-id config resolution, so it was reverted. Real fix is fork patch 0005 (local-first voice lookup, None instead of raise). step.sh now builds and preflights the fork. | re-run step.sh a1 |
 | 2026-09-09 | A1 | **A1 accepted.** zz_test loaded by the container and produced audio byte identical to fr_female at seed 7. Fixed tts.py --check (sent no voice, so it read a healthy Voxtral server as down) and a pipefail false warning in step.sh. zz_test removed. | A2 |
+| 2026-09-09 | A2 | derive_voices.py written; 8 derived voices (truncations, blends, splice) built and registered, 28 voices consistent. step.sh stage_a2 sweeps them plus 4 cross-lingual at one fixed seed. | user runs step.sh a2, then listens |
