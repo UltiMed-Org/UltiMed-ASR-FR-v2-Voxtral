@@ -282,6 +282,12 @@ stage_a3() {
     if ((${#failed[@]})); then
         fail "${#failed[@]} clone(s) failed: ${failed[*]}"
         warn "a 'soxr is not installed' 400 means the image did not actually rebuild"
+        # A request that kills EngineCore leaves its traceback ONLY in the
+        # container log, and the agent cannot run docker. Dumping it here is the
+        # difference between diagnosing this next session and asking for another
+        # run. Costs nothing on the success path, which never reaches this.
+        warn "capturing the container state so the traceback lands in this log"
+        dump_container_state
     fi
 
     say "results"
