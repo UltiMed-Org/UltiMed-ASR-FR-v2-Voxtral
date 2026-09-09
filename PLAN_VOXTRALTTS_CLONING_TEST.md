@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A2 accepted (6 keepers). A3 found that Voxtral clones from a raw clip natively via `ref_audio`, which is a different mechanism from the missing encoder. Needs one rebuild (soxr) to test.
+**STATUS:** A2 accepted (6 keepers). A4 FAILED: `ref_audio` cloning routes straight into the missing codec encoder and killed the engine. Track B is back on, and is the only route to the target voices.
 
-**NEXT ACTION:** run `./voxtral/cloning/step.sh a3`: rebuilds with soxr, then clones `olivier 2.ogg`, `olivier.ogg`, `alicia2.ogg`, `alicia.ogg`. Listen and compare against the source clips.
+**NEXT ACTION:** Track B, stage B1 (recover the true codes of the shipped voices). CPU-only tensor work, no server needed. Ask the agent to prepare it.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -180,17 +180,15 @@ If A2 produced enough usable voices for the dataset, **stop here** and mark Trac
 - `d_frf_frm_25` was indistinguishable from the parent: at 25 percent the partner barely registers.
 - Cross-lingual works but costs intelligibility: `nl_male` was rejected for a strong accent, `it_female` and `pt_male` kept with reservations, and `es_male` "fails during 75 and after", i.e. on the number, which is where a non-French speaker prefix hurts most.
 
-**2. The bigger finding: Voxtral already clones from a raw clip, per request.** Reading `serving_speech.py::_build_voxtral_prompt` (and `_validate_voxtral_tts_request`, and the upstream `examples/.../voxtral_tts/end2end.py`), a request may carry `ref_audio` instead of `voice`. mistral_common's `encode_speech_request` decodes the clip and vllm-omni passes the waveform to stage 0 as `multi_modal_data: {"audio": [...]}`. The stage-0 model is `SupportsMultiModal` with an `audio_arrays` field and a real `VoxtralTTSMultiModalProcessor`, so this is a first-class shipped feature, not a stub.
+**2. A claim I got wrong, corrected the same day by A4.** I read `serving_speech.py::_build_voxtral_prompt` and `_validate_voxtral_tts_request` and concluded that `ref_audio` cloning worked without the missing encoder, on the reasoning that `multi_modal_data: {"audio": [...]}` meant the AR LLM's own audio-understanding tower. That reasoning stopped one frame too early. The real chain is `embed_multimodal` (`voxtral_tts_audio_generation.py:1022`) -> `audio_tokenizer.encode_waveforms` (`voxtral_tts_audio_tokenizer.py:985`), which raises *"requires encoder weights which are not available in the open-source checkpoint"*. **The multimodal audio input IS the codec encoder.** Cloning hits exactly the piece that is missing, and the Background section was right all along.
 
-**This does not contradict the "the encoder is missing" background above, it sidesteps it.** The absent codec encoder is what would be needed to bake a new *preset* voice (a `[N, 3072]` pre-encoded prefix on disk). Cloning by `ref_audio` uses the AR LLM's own multimodal audio input instead, a completely different tower, and that one ships with the checkpoint.
+Two things from A3 survive and matter. First, the request path is complete right up to the encoder call, so a checkpoint shipping encoder weights would clone with no code change. Second, `encode_tokens` (same file, just above `encode_waveforms`) turns codes into the `[N, 3072]` prefix by summing the 37 codebook lookups: that is B1's premise confirmed in shipped code, so recovering codes is sufficient and no encoder is needed for the second half of Track B.
 
-Verified live against the running server on the first attempt, with `tts.py --ref-audio` added this session: the request reached the model and failed on a missing dependency, not on the mechanism. `400: "soxr is not installed"`, mistral_common's resampler, absent from the base image because preset voices never resample. One `pip install soxr` line in `voxtral/Dockerfile` and a rebuild.
+**Decision: Track B is the route.** There is no shortcut past the missing encoder, so cloning `olivier 2.ogg` and `alicia2.ogg` means decoder inversion. Track A's 6 derived voices stay useful meanwhile, but they are blends of other people's voices, not the two targets.
 
-**Decision: Track B is on hold, not started.** Decoder inversion was designed to work around exactly the problem `ref_audio` does not have. It becomes worth doing only if the clones sound bad, or if a *preset* (a persistent, registerable voice with no per-request clip) turns out to be needed. Track A's 6 derived voices stay useful regardless: they are free diversity that costs no reference audio at all.
+Stage A4 below carried the actual goal, and is where this fell over.
 
-Stage A4 below now carries the actual goal: clone `olivier 2.ogg` and `alicia2.ogg`.
-
-### [ ] A4. Clone the target voices (the project's actual acceptance test)
+### [!] A4. Clone the target voices via ref_audio: FAILED, mechanism unavailable
 
 The user's own success criterion: `voices/olivier 2.ogg` and `voices/alicia2.ogg` must come out sounding like those people. Longer takes of the same two speakers exist (`voices/olivier.ogg`, `voices/alicia.ogg`), so the sweep does both lengths per speaker to see whether more reference audio clones better.
 
@@ -202,13 +200,30 @@ Acceptance: both short clips produce a recognisable imitation of their speaker. 
 - Generic voice unrelated to the clip: the audio reached the model but carried no identity, so check the clip's sample rate and length against what `encode_speech_request` produced.
 - Another `soxr` 400: the image did not actually rebuild (`up -d --build --force-recreate` is what `start_voxtral` does, check the log).
 
-Open question once it works: cloning is per request and stateless, so a dataset run pays the reference clip on **every** call. Measure whether that costs meaningful latency, and if it does, revisit whether a preset is worth Track B after all.
+**Result:** 2026-09-09, Claude Code. Failed, and structurally, not as a bug we can fix.
 
-**Result:**
+Run 1 (`cache/cloning/logs/a3-20260909-222246.log`): `soxr` fixed, so the request reached the model. The anchor take with `fr_female` succeeded, then the first clone returned `500 EngineCore encountered an issue` and every request after it got `Broken pipe` / `Connection reset`: the engine process was dead.
+
+Run 2 (`diag`) recovered the traceback:
+
+```
+embed_multimodal (voxtral_tts.py:286)
+  -> embed_multimodal (voxtral_tts_audio_generation.py:1022)
+    -> audio_tokenizer.encode_waveforms (voxtral_tts_audio_tokenizer.py:985)
+RuntimeError: encode_waveforms requires encoder weights which are not
+available in the open-source checkpoint.
+```
+
+Two lessons:
+
+1. **`ref_audio` is not a way around the missing encoder, it is the way INTO it.** See the A3 correction above.
+2. **One clone request killed the whole engine.** The raise happens inside `execute_model`, which vLLM treats as fatal, so it took down concurrent traffic too, from an unauthenticated request. Fork patch 0006 refuses `ref_audio` in `_validate_voxtral_tts_request`, turning an outage into one 400 that explains itself. Remove that guard if a checkpoint ever ships the encoder: everything else on the path already works.
+
+`tts.py --ref-audio` and the `soxr` layer are kept. They cost nothing, they are correct, and they are exactly what a working checkpoint would need.
 
 ## Track B: new voices from real clips, by inverting the decoder
 
-**ON HOLD since 2026-09-09, see A3.** `ref_audio` clones without the missing encoder, so this whole track is a fallback now rather than the plan. Start it only if A4's clones are unusable, or if a persistent preset voice turns out to be required.
+**THE route, since 2026-09-09, see A4.** `ref_audio` cloning turned out to call the missing encoder, so there is no shortcut. B1 is next and needs no server: CPU tensor work against the shipped decoder and codebooks.
 
 Only start after A3 says Track A is insufficient. Each stage is a gate for the next.
 
@@ -309,3 +324,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A2 | derive_voices.py written; 8 derived voices (truncations, blends, splice) built and registered, 28 voices consistent. step.sh stage_a2 sweeps them plus 4 cross-lingual at one fixed seed. | user runs step.sh a2, then listens |
 | 2026-09-09 | A2 | Sweep run: 13 takes, all 200, all distinct. wav_stats.py added for triage. Blends shift pitch for real (frm_50 at 150 Hz); cross-language blends show the low-rms mush signature; truncation and cross-lingual look safe. | user listens, then A3 |
 | 2026-09-09 | A3 | A2 accepted, 6 keepers, with the seam-vs-smear failure mode understood. Found that Voxtral clones from a raw clip per request via ref_audio (LLM multimodal input, not the missing codec encoder); verified live, blocked only by soxr missing from the image. Track B put on hold. | user runs step.sh a3 |
+| 2026-09-09 | A4 | ref_audio cloning FAILED: embed_multimodal calls encode_waveforms, whose weights are absent, and the raise killed EngineCore. Fork patch 0006 refuses it with a 400 instead. My A3 claim that cloning sidesteps the encoder was wrong, corrected in place. Track B is the route. | B1 |
