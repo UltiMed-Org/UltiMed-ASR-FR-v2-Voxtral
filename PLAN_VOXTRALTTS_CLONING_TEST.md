@@ -1,6 +1,6 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A1 host side done and accepted, container half pending (you must run it: sudo has no TTY for the agent)
+**STATUS:** A1 host side accepted. Container half BLOCKED: the first-ever build of the voxtral-tts image succeeded but the server never came up (see A1 Result, 2026-09-09 run 2).
 
 **NEXT ACTION:** run `./voxtral/cloning/step.sh` to finish A1 on the live server, then Stage A2
 

@@ -15,6 +15,7 @@
 # Usage:
 #     ./voxtral/cloning/step.sh            # run CURRENT_STAGE
 #     ./voxtral/cloning/step.sh a1         # run a specific stage
+#     ./voxtral/cloning/step.sh diag       # post-mortem after a failed boot (starts nothing)
 #     ./voxtral/cloning/step.sh logs       # tail the voxtral-tts container logs
 #     ./voxtral/cloning/step.sh down       # stop voxtral-tts (frees the GPU)
 #
@@ -82,19 +83,57 @@ start_voxtral() {
 wait_for_health() {
     # tts.py --check hits /health and does a real smoke synthesis, so a pass here
     # means the model actually loaded rather than just the process being alive.
-    local deadline=$((SECONDS + 900))
+    #
+    # Two lessons from the 2026-09-09 run, both encoded here:
+    #   - 900s was not enough. That run timed out one second after the container
+    #     logged "Stage 0 engine launch started", i.e. it gave up exactly when the
+    #     interesting part began. First boot pays for plugin init, model-info
+    #     caching and loading ~9 GB of weights, so the budget is now 2400s.
+    #   - A dead container looked identical to a slow one: the loop polled a
+    #     closed port for the full deadline while nothing was running. It now
+    #     checks container state every round and bails out immediately.
+    local deadline=$((SECONDS + 2400))
+    local last_report=0
     while ((SECONDS < deadline)); do
         if ./tts.py --check >/dev/null 2>&1; then
             ok "server healthy after ${SECONDS}s"
             return 0
         fi
+
+        # Exited container: stop waiting, the logs are the whole story.
+        if ! sudo docker compose ps --status running --services 2>/dev/null | grep -qx "voxtral-tts"; then
+            fail "voxtral-tts is no longer running (exited after ${SECONDS}s of waiting)"
+            dump_container_state
+            return 1
+        fi
+
+        # A heartbeat every 60s with the container's own last line, so a human
+        # watching can tell "loading weights" from "wedged".
+        if ((SECONDS - last_report >= 60)); then
+            last_report=$SECONDS
+            printf '\n  %4ds  %s\n' "$SECONDS" "$(sudo docker compose logs --tail 1 voxtral-tts 2>/dev/null | tail -1 | cut -c1-160)"
+        fi
         sleep 10
         printf '.'
     done
-    fail "server did not become healthy within 900s"
-    say "last 40 log lines"
-    sudo docker compose logs --tail 40 voxtral-tts
+    fail "server did not become healthy within 2400s"
+    dump_container_state
     return 1
+}
+
+dump_container_state() {
+    # Everything needed to diagnose a failed boot, in one place, inside the log
+    # file the agent reads. 400 lines because the interesting failure (CUDA OOM,
+    # a missing weight, a YAML rejection) is usually a traceback, not one line.
+    say "container status"
+    sudo docker compose ps -a voxtral-tts || true
+    say "exit code and OOM flag"
+    sudo docker inspect --format 'exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}} error={{.State.Error}}' \
+        "$(sudo docker compose ps -a -q voxtral-tts 2>/dev/null | head -1)" 2>/dev/null || warn "container not found"
+    say "GPU"
+    nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv || true
+    say "last 400 container log lines"
+    sudo docker compose logs --tail 400 voxtral-tts || true
 }
 
 show_voice_boot_log() {
@@ -149,6 +188,18 @@ stage_a1() {
     echo "    ./voxtral/cloning/voices_tool.py remove --name zz_test"
 }
 
+stage_diag() {
+    # Read-only post-mortem: starts nothing, changes nothing. Run this after a
+    # failed boot, BEFORE any `up -d`, because `docker compose logs` can only
+    # reach a container that still exists. Recreating it destroys the evidence.
+    dump_container_state
+    say "image and compose config"
+    sudo docker images voxtral-tts-local --format '{{.Repository}}:{{.Tag}} {{.Size}} created {{.CreatedSince}}' || true
+    say "disk"
+    df -h . | tail -2
+    say "done. Nothing was started or stopped."
+}
+
 stage_a2() {
     # Filled in by the agent at the start of the A2 session.
     fail "stage a2 is not prepared yet; ask the agent to fill in stage_a2() in this script"
@@ -166,7 +217,7 @@ case "$STAGE" in
         sudo docker compose stop voxtral-tts
         ok "voxtral-tts stopped, GPU freed"
         ;;
-    a1 | a2)
+    diag | a1 | a2)
         require_sudo
         say "stage $STAGE (log: $LOG_FILE)"
         "stage_$STAGE"
@@ -174,7 +225,7 @@ case "$STAGE" in
         echo "The agent reads that file next session; no need to paste anything."
         ;;
     *)
-        fail "unknown stage '$STAGE' (expected: a1, a2, logs, down)"
+        fail "unknown stage '$STAGE' (expected: diag, a1, a2, logs, down)"
         exit 1
         ;;
 esac
