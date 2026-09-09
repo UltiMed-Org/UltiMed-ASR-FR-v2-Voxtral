@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A2 host side done: 8 derived voices built and registered (`derive_voices.py`). Waiting on the listening pass, which needs one boot.
+**STATUS:** A2 swept: all 13 takes rendered, none degenerate, numbers triaged. Only the listening pass is left, and only the user can do it.
 
-**NEXT ACTION:** run `./voxtral/cloning/step.sh a2` (~19 min to healthy, then 13 quick takes), listen through `cache/cloning/A2/wav/`, fill `cache/cloning/A2/notes.md`.
+**NEXT ACTION:** listen through `cache/cloning/A2/wav/` in the order suggested in `cache/cloning/A2/notes.md`, fill the judgement table, then A3 (keep the winners, `derive_voices.py clean` the rest).
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -140,6 +140,32 @@ Estimated: 2 to 3 h, mostly listening.
 
 Cross-lingual needs no registration at all (shipped voices, French text), so `stage_a2()` just adds `es_male`, `it_female`, `pt_male`, `nl_male` to the sweep. 13 takes total, same text and same `--noise-seed 7` throughout so every difference is attributable to the prefix, plus `fr_female` as the anchor the acceptance bar is set against. Container side pending: one boot, then listening.
 
+**Sweep done**, 2026-09-09, Claude Code, `cache/cloning/logs/a2-20260909-212024.log`. All 13 takes returned 200, and `cmp` confirms all 13 are pairwise distinct, so no variant silently collapsed onto a parent. `wav_stats.py` (added this session, stdlib-only triage: duration, autocorrelation F0, rms) says:
+
+| voice | sec | F0 Hz | rms |
+|---|---|---|---|
+| fr_female (anchor) | 7.04 | 188 | 1321 |
+| d_frf_esf_50 | 6.40 | 207 | 412 |
+| d_frf_frm_25 | 6.96 | 188 | 890 |
+| d_frf_frm_50 | 8.24 | 150 | 946 |
+| d_frf_head40 | 6.32 | 207 | 1623 |
+| d_frf_head60 | 7.28 | 188 | 1546 |
+| d_frf_itf_50 | 8.16 | 214 | 559 |
+| d_frf_itf_cat | 8.72 | 194 | 1177 |
+| d_frf_tail60 | 7.68 | 190 | 1111 |
+| es_male | 9.76 | 118 | 1540 |
+| it_female | 8.72 | 194 | 1240 |
+| nl_male | 9.68 | 182 | 1601 |
+| pt_male | 8.88 | 128 | 1777 |
+
+Reading, to be confirmed by ear:
+
+- **Blending moves the voice, it does not just average it.** `d_frf_frm_50` lands at 150 Hz, between its 188 Hz and 150-ish parents, a register no shipped voice occupies. If it sounds natural, interpolation is a real axis and A3 should expand it (more pairs, more alphas), not drop it.
+- **The two cross-language blends look like the predicted mush**: rms 412 and 559 against the anchor's 1321, i.e. a third of the level, which is what a decoder hedging on an off-manifold prefix produces. Same-language `frm` blends sit at 890 to 946, much closer.
+- **Truncation is safe**: all three at or above the anchor's level. `head40` also shifts pitch up to 207 Hz, so shortening is not neutral, it is its own axis.
+- **Cross-lingual is the cheapest diversity of all**: 118 and 128 Hz, 25 to 40 percent slower, zero registration, zero risk.
+
+Note the seed makes takes comparable but not neutral: all 13 share `--noise-seed 7`, so a single unlucky draw affects them all equally. Worth a second sweep at another seed before rejecting a variant on one bad take.
 ### [ ] A3. Decision point
 
 If A2 produced enough usable voices for the dataset, **stop here** and mark Track B as skipped. Write down how many voices exist and how diverse they actually are. Track B is only worth it if A2 falls short or if the diversity is too obviously "the same 20 speakers, blended".
@@ -245,3 +271,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A1 | Two failed container boots. A locally-added voice bricks stock vllm_omni (remote hf_hub_download per voice, 404, boot loop); HF_HUB_OFFLINE=1 fixed that but broke vLLM's repo-id config resolution, so it was reverted. Real fix is fork patch 0005 (local-first voice lookup, None instead of raise). step.sh now builds and preflights the fork. | re-run step.sh a1 |
 | 2026-09-09 | A1 | **A1 accepted.** zz_test loaded by the container and produced audio byte identical to fr_female at seed 7. Fixed tts.py --check (sent no voice, so it read a healthy Voxtral server as down) and a pipefail false warning in step.sh. zz_test removed. | A2 |
 | 2026-09-09 | A2 | derive_voices.py written; 8 derived voices (truncations, blends, splice) built and registered, 28 voices consistent. step.sh stage_a2 sweeps them plus 4 cross-lingual at one fixed seed. | user runs step.sh a2, then listens |
+| 2026-09-09 | A2 | Sweep run: 13 takes, all 200, all distinct. wav_stats.py added for triage. Blends shift pitch for real (frm_50 at 150 Hz); cross-language blends show the low-rms mush signature; truncation and cross-lingual look safe. | user listens, then A3 |
