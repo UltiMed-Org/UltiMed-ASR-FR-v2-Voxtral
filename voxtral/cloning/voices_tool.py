@@ -242,6 +242,30 @@ def _save_json(path: Path, data: dict) -> None:
         json.dump(data, handle)
 
 
+def warn_if_server_will_brick() -> None:
+    """Warn when the compose service would 404 on a locally-added voice.
+
+    Learned the hard way on 2026-09-09: the model loads voice embeddings in
+    `voxtral_tts.py:131-138`, and when it was named by repo id it calls
+    `hf_hub_download` for EVERY name in params.json, hitting the remote repo.
+    A voice that exists only on disk 404s, model init dies, and
+    `restart: unless-stopped` turns that into a silent boot loop.
+
+    `HF_HUB_OFFLINE=1` in the service environment makes those lookups resolve
+    from the local cache instead. This is a heuristic grep, not a guarantee:
+    it only reads docker-compose.yml, so an override file or a shell export is
+    invisible to it.
+    """
+    compose = REPO_ROOT / "docker-compose.yml"
+    if compose.is_file() and "HF_HUB_OFFLINE=1" in compose.read_text():
+        return
+    logger.warning(
+        "HF_HUB_OFFLINE=1 not found in docker-compose.yml. Without it the server "
+        "tries to DOWNLOAD this voice from the HF repo at model init, 404s, and "
+        "boot-loops. Add it to the voxtral-tts environment before starting."
+    )
+
+
 def _voice_dicts(snapshot: Path) -> tuple[dict, dict, dict, dict]:
     """Load both configs and return them with their voice sub-dicts.
 
@@ -381,6 +405,7 @@ def cmd_add(name: str, from_voice: str | None, from_file: str | None, force: boo
     # resolved through the HF symlink, so source.name is an opaque blob hash.
     origin = f"voice '{from_voice}'" if from_voice else source.name
     logger.success(f"registered '{name}': {frames} frames ({frames / frame_rate:.2f} s) from {origin}")
+    warn_if_server_will_brick()
     logger.info("apply with: sudo docker compose up -d voxtral-tts   (restart is NOT enough)")
 
 

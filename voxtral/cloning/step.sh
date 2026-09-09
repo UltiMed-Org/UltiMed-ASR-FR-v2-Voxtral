@@ -72,6 +72,18 @@ check_port_clash() {
     fi
 }
 
+check_hf_offline() {
+    # Preflight for the 2026-09-09 boot loop: with a locally-added voice and no
+    # HF_HUB_OFFLINE=1, the model 404s on that voice at init and the container
+    # restarts forever. Catch it here rather than after 30 minutes of waiting.
+    if ! grep -q "HF_HUB_OFFLINE=1" docker-compose.yml; then
+        fail "HF_HUB_OFFLINE=1 is missing from docker-compose.yml"
+        warn "locally-added voices will 404 at model init and boot-loop the container"
+        exit 1
+    fi
+    ok "HF_HUB_OFFLINE=1 present, locally-added voices resolve from /cache"
+}
+
 start_voxtral() {
     # `up -d` and not `restart`: the container only re-reads environment: and
     # re-loads the voice embeddings at model init.
@@ -161,6 +173,7 @@ stage_a1() {
     local text="Bonjour, ceci est un test de voix."
     local seed=7
 
+    check_hf_offline
     check_port_clash
     start_voxtral
     wait_for_health
@@ -171,8 +184,8 @@ stage_a1() {
 
     say "synthesizing with the registered copy (zz_test)"
     if ! ./tts.py -t "$text" --voice zz_test --noise-seed "$seed" -o "$OUT_DIR/a1_zz_test.wav"; then
-        fail "zz_test was rejected: the snapshot edits did not reach the container"
-        warn "next step is the HF_HUB_OFFLINE / local-model-dir TODO in the plan"
+        fail "zz_test was rejected by the server"
+        warn "the container is up, so this is a lookup problem, not the boot-loop bug"
         return 1
     fi
 

@@ -1,6 +1,6 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A1 host side accepted. Container half BLOCKED: the first-ever build of the voxtral-tts image succeeded but the server never came up (see A1 Result, 2026-09-09 run 2).
+**STATUS:** A1 host side accepted. Container half: boot-loop diagnosed and fixed (HF_HUB_OFFLINE=1), needs one more run to confirm.
 
 **NEXT ACTION:** run `./voxtral/cloning/step.sh` to finish A1 on the live server, then Stage A2
 

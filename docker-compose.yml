@@ -164,6 +164,19 @@ services:
       - HOME=/cache
       - HF_HOME=/cache/huggingface
       - XDG_CACHE_HOME=/cache
+      # REQUIRED as soon as a locally-added voice exists, and harmless otherwise.
+      # voxtral_tts.py:131-138 loops over every name in params.json's
+      # audio_tokenizer_args.voice and, when the model was named by repo id
+      # (is_hf_model), fetches voice_embedding/<name>.pt with hf_hub_download,
+      # i.e. from the REMOTE repo rather than the local snapshot. A voice that
+      # exists only on disk (see voxtral/cloning/voices_tool.py) therefore 404s
+      # at model init, StageEngineCoreProc exits 1, and `restart: unless-stopped`
+      # turns that into a boot loop with no obvious cause. Offline mode makes
+      # hf_hub_download resolve purely from /cache, which holds the full
+      # checkpoint already, so every voice (shipped or added) is found locally.
+      # Cost: a genuinely missing file now fails locally instead of downloading,
+      # which is the behaviour we want for a pinned checkpoint anyway.
+      - HF_HUB_OFFLINE=1
       # If the model repo is gated on Hugging Face, pass a token:
       # - HF_TOKEN=TODO
       # entrypoint.sh reads the tuning vars below at boot and patches them into a
