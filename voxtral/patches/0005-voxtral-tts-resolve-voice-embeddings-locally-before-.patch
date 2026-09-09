@@ -1,0 +1,89 @@
+From 47db7d52175f9035bbfd3b5777257cb2cf943dac Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Wed, 9 Sep 2026 20:06:55 +0200
+Subject: [PATCH 5/5] voxtral tts: resolve voice embeddings locally before
+ hitting the Hub
+
+Upstream calls hf_hub_download unconditionally for a repo-id model, so every
+boot needs the network and, worse, a voice that exists only in the local
+snapshot raises RemoteEntryNotFoundError instead of being skipped. That kills
+model init, defeats the 'Voice embedding not found' warning right below it,
+and with a restarting supervisor turns into a boot loop.
+
+Try the cache first (local_files_only), fall back to a real download so a cold
+cache still works, and return None when neither has it so the caller skips
+that voice as upstream intended.
+---
+ .../models/voxtral_tts/voxtral_tts.py         | 51 +++++++++++++++++--
+ 1 file changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+index 54c6b0a..9f9e812 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+@@ -130,11 +130,8 @@ class VoxtralTTSForConditionalGeneration(
+             if speaker_id:
+                 self.voice_to_embedding = {}
+                 for sid in speaker_id:
+-                    if self.is_hf_model:
+-                        path = hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
+-                    else:
+-                        path = Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
+-                    if Path(path).exists():
++                    path = self._resolve_voice_embedding(sid)
++                    if path is not None and Path(path).exists():
+                         self.voice_to_embedding[sid] = torch.load(path, map_location="cpu")
+                     else:
+                         logger.warning("Voice embedding not found: %s", path)
+@@ -158,6 +155,50 @@ class VoxtralTTSForConditionalGeneration(
+         else:
+             raise ValueError("Invalid model stage")
+ 
++    def _resolve_voice_embedding(self, sid: str) -> "str | Path | None":
++        """Locate ``voice_embedding/<sid>.pt``, preferring what is already cached.
++
++        Upstream calls ``hf_hub_download`` unconditionally for a repo-id model,
++        which has two bad consequences:
++
++        1. every boot needs the network, even with the whole checkpoint cached;
++        2. a voice present only in the local snapshot raises
++           ``RemoteEntryNotFoundError`` (404) instead of being skipped, so model
++           init dies and the "Voice embedding not found" warning below never runs.
++
++        (2) is not hypothetical: adding a locally-computed voice to params.json
++        turned into a container boot loop, because the 404 kills the stage-0
++        engine and the supervisor keeps restarting it.
++
++        Local first, Hub second, so a cold cache still downloads the shipped
++        voices while a locally-added one resolves off disk. A voice that is
++        neither available locally nor on the Hub returns None and is skipped by
++        the caller, which is upstream's stated intent for a missing embedding.
++
++        Parameters
++        ----------
++        sid : str
++            Voice name from ``params.json``'s ``audio_tokenizer_args.voice``.
++
++        Returns
++        -------
++        str or Path or None
++            Path to the embedding file, or None when it cannot be found.
++        """
++        if not self.is_hf_model:
++            return Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
++
++        filename = f"voice_embedding/{sid}.pt"
++        try:
++            return hf_hub_download(repo_id=self.repo_id, filename=filename, local_files_only=True)
++        except Exception:  # not cached yet: fall through to a real download
++            pass
++        try:
++            return hf_hub_download(repo_id=self.repo_id, filename=filename)
++        except Exception as exc:
++            logger.warning("Voice embedding '%s' is neither cached nor on the Hub: %s", sid, exc)
++            return None
++
+     # -------------------- CUDA Graph for acoustic transformer --------------------
+ 
+     def get_language_model(self) -> "nn.Module":

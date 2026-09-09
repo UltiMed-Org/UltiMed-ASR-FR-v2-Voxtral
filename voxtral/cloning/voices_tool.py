@@ -243,26 +243,27 @@ def _save_json(path: Path, data: dict) -> None:
 
 
 def warn_if_server_will_brick() -> None:
-    """Warn when the compose service would 404 on a locally-added voice.
+    """Warn when the served vllm_omni would 404 on a locally-added voice.
 
-    Learned the hard way on 2026-09-09: the model loads voice embeddings in
-    `voxtral_tts.py:131-138`, and when it was named by repo id it calls
-    `hf_hub_download` for EVERY name in params.json, hitting the remote repo.
-    A voice that exists only on disk 404s, model init dies, and
-    `restart: unless-stopped` turns that into a silent boot loop.
+    Learned the hard way on 2026-09-09: stock `voxtral_tts.py` loads voice
+    embeddings by calling `hf_hub_download` for EVERY name in params.json,
+    hitting the REMOTE repo. A voice that exists only on disk 404s, model init
+    dies, and `restart: unless-stopped` turns that into a silent boot loop.
 
-    `HF_HUB_OFFLINE=1` in the service environment makes those lookups resolve
-    from the local cache instead. This is a heuristic grep, not a guarantee:
-    it only reads docker-compose.yml, so an override file or a shell export is
-    invisible to it.
+    The perso fork's patch 0005 resolves the local cache first, which is what
+    makes locally-added voices usable at all. (HF_HUB_OFFLINE=1 looks like an
+    alternative fix and is not: vLLM cannot resolve a repo-id model offline.)
+
+    This greps the fork source, so it catches an unpatched clone but not a
+    stale image built before the patch: `step.sh` builds with --build for that.
     """
-    compose = REPO_ROOT / "docker-compose.yml"
-    if compose.is_file() and "HF_HUB_OFFLINE=1" in compose.read_text():
+    forked = REPO_ROOT / "voxtral/vllm-omni/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py"
+    if forked.is_file() and "_resolve_voice_embedding" in forked.read_text():
         return
     logger.warning(
-        "HF_HUB_OFFLINE=1 not found in docker-compose.yml. Without it the server "
-        "tries to DOWNLOAD this voice from the HF repo at model init, 404s, and "
-        "boot-loops. Add it to the voxtral-tts environment before starting."
+        "voxtral/vllm-omni lacks the local-first voice lookup (patch 0005). Without "
+        "it the server tries to DOWNLOAD this voice at model init, 404s, and boot-loops. "
+        "Re-apply voxtral/patches/*.patch and rebuild before starting."
     )
 
 

@@ -138,7 +138,12 @@ hand-run recipe.)
   server's startup defaults. The `perso` branch fixes that in two places: request routing
   (`serving_speech.py::_apply_voxtral_request_overrides`, plus real `cfg_alpha` /
   `euler_steps` / `acoustic_temperature` fields on the schema) and the model
-  (`voxtral_tts.py::_make_frame_noise` / `_extract_euler_steps`). The clone is
+  (`voxtral_tts.py::_make_frame_noise` / `_extract_euler_steps`). Patch 0005 adds a
+  third fix, `_resolve_voice_embedding`: stock vllm_omni `hf_hub_download`s every voice
+  named in `params.json` from the REMOTE repo, so a voice added locally (see
+  `voxtral/cloning/`) 404s at model init and boot-loops the container. The fork resolves
+  the cache first and skips a voice it cannot find instead of raising. Note
+  `HF_HUB_OFFLINE=1` is NOT an alternative: vLLM cannot resolve a repo-id model offline. The clone is
   **gitignored**: `voxtral/patches/*.patch` is the tracked backup and
   `voxtral/patches/README.md` has the recreate recipe, which a fresh checkout must run
   **before its first `--build`**. Regenerate those patches whenever `perso` gains a commit.

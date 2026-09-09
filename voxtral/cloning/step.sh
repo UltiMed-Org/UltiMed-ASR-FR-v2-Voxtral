@@ -72,23 +72,31 @@ check_port_clash() {
     fi
 }
 
-check_hf_offline() {
-    # Preflight for the 2026-09-09 boot loop: with a locally-added voice and no
-    # HF_HUB_OFFLINE=1, the model 404s on that voice at init and the container
-    # restarts forever. Catch it here rather than after 30 minutes of waiting.
-    if ! grep -q "HF_HUB_OFFLINE=1" docker-compose.yml; then
-        fail "HF_HUB_OFFLINE=1 is missing from docker-compose.yml"
+check_fork_has_local_voice_lookup() {
+    # Preflight for the 2026-09-09 boot loop: stock vllm_omni hf_hub_downloads
+    # every voice named in params.json, so a locally-added one 404s at model
+    # init and the container restarts forever. The perso fork resolves the cache
+    # first (patch 0005). Check the source the image is built from, since a
+    # stale image is exactly the failure this is meant to catch.
+    if ! grep -q "_resolve_voice_embedding" \
+        voxtral/vllm-omni/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py 2>/dev/null; then
+        fail "voxtral/vllm-omni is missing the local-first voice lookup (patch 0005)"
         warn "locally-added voices will 404 at model init and boot-loop the container"
+        warn "re-apply voxtral/patches/*.patch, see voxtral/patches/README.md"
         exit 1
     fi
-    ok "HF_HUB_OFFLINE=1 present, locally-added voices resolve from /cache"
+    ok "fork has the local-first voice lookup"
 }
 
 start_voxtral() {
     # `up -d` and not `restart`: the container only re-reads environment: and
     # re-loads the voice embeddings at model init.
-    say "starting voxtral-tts"
-    sudo docker compose up -d voxtral-tts
+    # --build because the Dockerfile installs vllm_omni FROM the local clone and
+    # COPYs entrypoint.sh: without it, a fork or entrypoint change is silently
+    # served by the old image. Layers are cached, so it is nearly free when
+    # nothing changed.
+    say "starting voxtral-tts (building if the fork or entrypoint changed)"
+    sudo docker compose up -d --build voxtral-tts
     ok "container up, waiting for the model to load (9 GB of weights, this takes minutes)"
 }
 
@@ -173,7 +181,7 @@ stage_a1() {
     local text="Bonjour, ceci est un test de voix."
     local seed=7
 
-    check_hf_offline
+    check_fork_has_local_voice_lookup
     check_port_clash
     start_voxtral
     wait_for_health
