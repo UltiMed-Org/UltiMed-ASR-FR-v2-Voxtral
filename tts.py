@@ -103,6 +103,11 @@ DEFAULT_URL = "http://127.0.0.1:8003"
 # service is the one on :8003; TADA voices are tada-ref-*.gguf paths instead.
 # Kept as a reference list, not argparse choices, since --voice is
 # backend-dependent free text.
+# Voice `--check` retries with when the server refuses a voiceless request
+# (vllm-omni does, TADA does not). Any preset works; this one is the voice
+# the compose service is actually used with.
+VOXTRAL_CHECK_VOICE = "fr_female"
+
 VOXTRAL_VOICES = [
     "ar_male",
     "casual_female",
@@ -493,7 +498,7 @@ def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
     return container_voice
 
 
-def cmd_check(base_url: str) -> int:
+def cmd_check(base_url: str, voice: str | None = None) -> int:
     print(f"GET {base_url}/health", file=sys.stderr)
     try:
         code, body, _ = _get(f"{base_url}/health", timeout=5.0)
@@ -507,12 +512,26 @@ def cmd_check(base_url: str) -> int:
     # Smoke test: synthesize a tiny clip to confirm the model actually loads.
     # No sampling knobs are sent, so this exercises exactly the server's
     # configured defaults (the path real requests take when run bare).
-    print(f"POST {base_url}/v1/audio/speech (smoke test)", file=sys.stderr)
-    code, body, ctype, elapsed = _post_json(
-        f"{base_url}/v1/audio/speech",
-        build_speech_body(text="Test.", response_format="wav", speed=1.0),
-        timeout=120.0,
-    )
+    def smoke(with_voice: str | None) -> tuple[int, bytes, str, float]:
+        print(f"POST {base_url}/v1/audio/speech (smoke test"
+              + (f", voice={with_voice}" if with_voice else "") + ")", file=sys.stderr)
+        return _post_json(
+            f"{base_url}/v1/audio/speech",
+            build_speech_body(text="Test.", response_format="wav", speed=1.0,
+                              voice=with_voice),
+            timeout=120.0,
+        )
+
+    code, body, ctype, elapsed = smoke(voice)
+    if code == 400 and voice is None and b"'voice'" in body:
+        # Backend-dependent, and the reason --check takes a voice at all: TADA
+        # synthesizes with whatever reference it was started with, but vllm-omni
+        # requires `voice` or `ref_audio` on EVERY request (serving_speech.py),
+        # so a bare smoke call is a 400 no matter how healthy the server is.
+        # Retry with a preset rather than reporting a live server as down.
+        print(f"  -> 400 (no default voice on this backend); retrying with "
+              f"{VOXTRAL_CHECK_VOICE}", file=sys.stderr)
+        code, body, ctype, elapsed = smoke(VOXTRAL_CHECK_VOICE)
     if code != 200:
         print(f"  -> {code}: {body[:500].decode('utf-8', 'replace')}", file=sys.stderr)
         return 1
@@ -864,7 +883,7 @@ def main() -> int:
     base_url = args.url.rstrip("/")
 
     if args.check:
-        return cmd_check(base_url)
+        return cmd_check(base_url, voice=args.voice)
 
     if args.voice_name:
         if args.voice:

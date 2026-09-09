@@ -162,8 +162,14 @@ show_voice_boot_log() {
     # direct proof that a snapshot edit reached the container, as opposed to the
     # server merely accepting the name.
     say "voices the container loaded"
-    if sudo docker compose logs voxtral-tts 2>/dev/null | grep -m1 "Available voice embeddings"; then
-        :
+    # Captured into a variable rather than piped into an `if`: `grep -m1` exits
+    # on the first match, `docker compose logs` then dies of SIGPIPE, and
+    # `set -o pipefail` reports that 141 as the pipeline status. The line got
+    # printed and warned about at the same time on the 2026-09-09 run.
+    local line
+    line="$(sudo docker compose logs voxtral-tts 2>/dev/null | grep -m1 "Available voice embeddings" || true)"
+    if [[ -n "$line" ]]; then
+        echo "$line"
     else
         warn "no 'Available voice embeddings' line found in the logs"
     fi
