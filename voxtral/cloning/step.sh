@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # The stage the agent last prepared. Updated as part of the session protocol.
-CURRENT_STAGE="a1"
+CURRENT_STAGE="a2"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -229,9 +229,75 @@ stage_diag() {
 }
 
 stage_a2() {
-    # Filled in by the agent at the start of the A2 session.
-    fail "stage a2 is not prepared yet; ask the agent to fill in stage_a2() in this script"
-    return 1
+    # Derived voices. The 8 d_* variants are already built and registered on the
+    # host by derive_voices.py, so this side is one boot (model init reads the
+    # voice list exactly once) followed by a synthesis sweep.
+    #
+    # Every take uses the SAME text and the SAME noise seed, so any difference
+    # between two wavs comes from the voice prefix alone. fr_female is included
+    # as the anchor to compare against: it is the voice the dataset work already
+    # likes, and "as natural as fr_female" is the A2 acceptance bar.
+    local text="Bonjour, je m'appelle Camille et je vous propose aujourd'hui une petite histoire. Le vieux chêne du jardin a soixante-quinze ans."
+    local seed=7
+    local wav_dir="cache/cloning/A2/wav"
+    mkdir -p "$wav_dir"
+
+    # Cross-lingual costs nothing and needs no registration: these are shipped
+    # voices, just driven with French text. Accented French is legitimate
+    # diversity for a dataset.
+    local voices=(
+        fr_female
+        d_frf_head40 d_frf_head60 d_frf_tail60
+        d_frf_itf_50 d_frf_esf_50 d_frf_frm_50 d_frf_frm_25
+        d_frf_itf_cat
+        es_male it_female pt_male nl_male
+    )
+
+    check_fork_has_local_voice_lookup
+    check_port_clash
+    start_voxtral
+    wait_for_health
+    show_voice_boot_log
+
+    say "synthesizing ${#voices[@]} takes (same text, same seed $seed)"
+    local failed=()
+    for v in "${voices[@]}"; do
+        printf '\n--- %s\n' "$v"
+        if ! ./tts.py -t "$text" --voice "$v" --noise-seed "$seed" -o "$wav_dir/$v.wav"; then
+            failed+=("$v")
+            fail "$v was rejected"
+        fi
+    done
+
+    if ((${#failed[@]})); then
+        fail "${#failed[@]} voice(s) rejected: ${failed[*]}"
+        warn "a d_* rejection means the boot did not pick up the registration"
+    fi
+
+    say "results"
+    ls -l "$wav_dir"
+    # A blank notes file so the listening pass has somewhere to land. Written
+    # only once: re-running the stage must not wipe judgements already made.
+    local notes="cache/cloning/A2/notes.md"
+    if [[ ! -f "$notes" ]]; then
+        {
+            echo "# A2 listening notes"
+            echo
+            echo "Same text, same noise seed, one wav per voice in wav/."
+            echo "Judge each against fr_female: natural / robotic / unstable, and"
+            echo "distinct-from-parents or not. Acceptance: 4+ keepers."
+            echo
+            echo "| voice | natural? | distinct? | keep | note |"
+            echo "|---|---|---|---|---|"
+            for v in "${voices[@]}"; do echo "| $v | | | | |"; done
+        } > "$notes"
+        ok "listening template written to $notes"
+    else
+        ok "notes already exist at $notes, left untouched"
+    fi
+
+    say "listen through $wav_dir, fill in $notes, then tell the agent"
+    echo "    to drop the losers:  ./voxtral/cloning/derive_voices.py clean"
 }
 
 # ------------------------------------------------------------------- main ----
