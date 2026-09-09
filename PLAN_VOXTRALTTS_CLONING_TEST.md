@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A1 host side accepted. Container half: boot-loop diagnosed and fixed (HF_HUB_OFFLINE=1), needs one more run to confirm.
+**STATUS:** A1 host side accepted. Container half: two boot failures diagnosed, real fix is fork patch 0005 (local-first voice lookup), needs one run to confirm.
 
-**NEXT ACTION:** run `./voxtral/cloning/step.sh` to finish A1 on the live server, then Stage A2
+**NEXT ACTION:** run `./voxtral/cloning/step.sh a1` (it now rebuilds the image, so it is slower than a plain boot) to finish A1 on the live server, then Stage A2
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -66,7 +66,7 @@ Write `voxtral/cloning/voices_tool.py` with three subcommands:
 
 Acceptance: `list` prints 20 voices with N matching `tekken.json` exactly. Then `add` a copy of `fr_female` under the name `zz_test`, restart the service, and `./tts.py -t "Bonjour, ceci est un test." --voice zz_test -o /tmp/zz.wav` produces audio identical in character to `fr_female`.
 
-Estimated: 1 to 2 h. Notes: the server reads voices once at model init, so every registration needs `sudo docker compose up -d voxtral-tts` (not `restart`). If `hf_hub_download` clobbers edits, set `HF_HUB_OFFLINE=1` in the service environment. **TODO:** if that is not enough, the cleaner fix is a local model dir via `VOXTRAL_TTS_MODEL` (`voxtral/entrypoint.sh:32`), but then the euler-steps patch at `:246` needs to handle a local path instead of a repo id.
+Estimated: 1 to 2 h. Notes: the server reads voices once at model init, so every registration needs `sudo docker compose up -d voxtral-tts` (not `restart`). (Superseded, kept for the record: this line originally guessed `HF_HUB_OFFLINE=1` as the fix for `hf_hub_download` clobbering the edits. It is not, see the Result addendum below.)
 
 **Result:** 2026-09-09, Claude Code. `voxtral/cloning/voices_tool.py` written (click + loguru, PEP 723, no torch: it only copies a file and patches two JSON dicts). Subcommands `paths`, `list`, `add`, `remove`, `restore`.
 
@@ -88,6 +88,16 @@ Container-side acceptance NOT run yet: `sudo` needs a password and the agent has
 It handles the :8003 clash with `crispasr-tts`, brings up `voxtral-tts` with `up -d` (not `restart`), waits for `tts.py --check` to pass, prints the container's own "Available voice embeddings" line, then synthesizes the same sentence twice with `--noise-seed 7`, once with `fr_female` and once with `zz_test`.
 
 Acceptance is sharper than "sounds similar": with the seed pinned the fork's per-frame noise is reproducible and the rest of the pipeline is deterministic, so the two wavs should be **byte identical**. `cmp` decides it. Output lands in `cache/cloning/out/`, the whole run in `cache/cloning/logs/a1-*.log`, which the agent reads next session. Then clean up with `./voxtral/cloning/voices_tool.py remove --name zz_test`.
+
+**Result addendum, same day, two failed boots before the working fix:**
+
+Registering a local voice **bricked the server** rather than being politely ignored. Root cause at `voxtral_tts.py:134`: stock vllm_omni loads voice embeddings with `hf_hub_download(repo_id, f"voice_embedding/{sid}.pt")` for **every** name in `params.json`. Since the model is named by repo id, that goes to the REMOTE repo, so `zz_test.pt` (which exists only on disk) 404s, `StageEngineCoreProc` exits 1, and `restart: unless-stopped` turns it into a silent boot loop that looks exactly like a slow first boot. That cost the first 30-minute run.
+
+**First fix was wrong.** `HF_HUB_OFFLINE=1` in the service environment makes those lookups resolve from `/cache`, but it also breaks vLLM's own config resolution for a repo-id model: `Invalid repository ID or local directory specified: 'mistralai/Voxtral-4B-TTS-2603'`, then `Could not determine model_type` and `Could not detect config format for no config file found`. Note the asymmetry that made this misleading: the entrypoint's own `hf_hub_download(model, "params.json")` works fine offline, so the flag looks harmless right up until vLLM starts. Reverted, with a comment in `docker-compose.yml` so nobody re-adds it.
+
+**Actual fix: fork patch 0005**, `_resolve_voice_embedding()` in the `perso` branch. It tries `local_files_only=True` first, falls back to a real download, and returns `None` (caller skips the voice, logging a warning) instead of raising. So locally-added voices work, shipped voices still download on a cold cache, and a typo degrades to one missing voice rather than a dead server. This reaches the container **only through a rebuild**, since the Dockerfile installs `vllm_omni` from the local clone, hence `step.sh` now uses `up -d --build`.
+
+Guards added so this cannot silently repeat: `step.sh` refuses to start when the fork source lacks `_resolve_voice_embedding`, and `voices_tool.py` warns on `add` for the same reason.
 
 ### [ ] A2. Derived voices: truncation, cross-lingual, interpolation
 
@@ -208,3 +218,4 @@ Newest at the bottom. One row per working session.
 |---|---|---|---|
 | 2026-09-08 | plan | Plan written (Claude Code). Established that voices are pre-encoded audio prefixes, the encoder is missing from the open weights, the decoder is not. | A1 |
 | 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Added step.sh so all server-side work is one command the user runs, logged for the agent to read back. | user runs step.sh, then A2 |
+| 2026-09-09 | A1 | Two failed container boots. A locally-added voice bricks stock vllm_omni (remote hf_hub_download per voice, 404, boot loop); HF_HUB_OFFLINE=1 fixed that but broke vLLM's repo-id config resolution, so it was reverted. Real fix is fork patch 0005 (local-first voice lookup, None instead of raise). step.sh now builds and preflights the fork. | re-run step.sh a1 |
