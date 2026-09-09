@@ -88,11 +88,12 @@ wait_for_health() {
     #   - 900s was not enough. That run timed out one second after the container
     #     logged "Stage 0 engine launch started", i.e. it gave up exactly when the
     #     interesting part began. First boot pays for plugin init, model-info
-    #     caching and loading ~9 GB of weights, so the budget is now 2400s.
+    #     caching and loading ~9 GB of weights. The user reports boots taking
+#     well over 900s, so the budget is 1800s (30 min).
     #   - A dead container looked identical to a slow one: the loop polled a
     #     closed port for the full deadline while nothing was running. It now
     #     checks container state every round and bails out immediately.
-    local deadline=$((SECONDS + 2400))
+    local deadline=$((SECONDS + 1800))
     local last_report=0
     while ((SECONDS < deadline)); do
         if ./tts.py --check >/dev/null 2>&1; then
@@ -116,7 +117,7 @@ wait_for_health() {
         sleep 10
         printf '.'
     done
-    fail "server did not become healthy within 2400s"
+    fail "server did not become healthy within 1800s"
     dump_container_state
     return 1
 }
