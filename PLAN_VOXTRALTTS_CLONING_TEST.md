@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A1 host side accepted. Container half: two boot failures diagnosed, real fix is fork patch 0005 (local-first voice lookup), needs one run to confirm.
+**STATUS:** A1 done and accepted end to end (host + container). Registering a voice is a solved, verified operation. Next stage is A2.
 
-**NEXT ACTION:** run `./voxtral/cloning/step.sh a1` (it now rebuilds the image, so it is slower than a plain boot) to finish A1 on the live server, then Stage A2
+**NEXT ACTION:** Stage A2, derived voices. The server can stay up: A2 is host-side tensor edits plus `tts.py` calls, and only registering a NEW voice needs `up -d` (~19 min to healthy).
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -99,6 +99,15 @@ Registering a local voice **bricked the server** rather than being politely igno
 
 Guards added so this cannot silently repeat: `step.sh` refuses to start when the fork source lacks `_resolve_voice_embedding`, and `voices_tool.py` warns on `add` for the same reason.
 
+**Container-side acceptance PASSED**, 2026-09-09, Claude Code, third run:
+
+- The container's own log lists `zz_test` among `Available voice embeddings`, so the snapshot edit reached model init through patch 0005.
+- `fr_female` and `zz_test` both synthesized "Bonjour, ceci est un test de voix." at `--noise-seed 7`: 115244 bytes each, **byte identical** under `cmp`. The registration path is faithful, and per-request noise seeding is confirmed reproducible across voices as a bonus.
+- Boot to healthy took **1147 s** (~19 min) including the image rebuild, so the 1800 s budget is right and 900 s was never going to work.
+
+One client bug found and fixed on the way: `tts.py --check` sent no `voice`, which TADA tolerates (it uses whatever reference it was started with) but vllm-omni refuses with a 400 on every request. So `--check` reported a perfectly healthy Voxtral server as down, and `step.sh` sat in its wait loop watching 400s go by for 1147 s. `cmd_check` now passes `--voice` when given and, on that specific 400, retries once with `VOXTRAL_CHECK_VOICE`. Also fixed a false "no Available voice embeddings line" warning caused by `pipefail` plus `grep -m1` (SIGPIPE on the upstream `docker compose logs`).
+
+`zz_test` removed after the test.
 ### [ ] A2. Derived voices: truncation, cross-lingual, interpolation
 
 Cheap manipulations of existing prefixes, each producing a new registered voice:
@@ -219,3 +228,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-08 | plan | Plan written (Claude Code). Established that voices are pre-encoded audio prefixes, the encoder is missing from the open weights, the decoder is not. | A1 |
 | 2026-09-09 | A1 | voices_tool.py written and verified host side: 20 voices consistent, add/remove/restore round trip clean, configs intact. Added step.sh so all server-side work is one command the user runs, logged for the agent to read back. | user runs step.sh, then A2 |
 | 2026-09-09 | A1 | Two failed container boots. A locally-added voice bricks stock vllm_omni (remote hf_hub_download per voice, 404, boot loop); HF_HUB_OFFLINE=1 fixed that but broke vLLM's repo-id config resolution, so it was reverted. Real fix is fork patch 0005 (local-first voice lookup, None instead of raise). step.sh now builds and preflights the fork. | re-run step.sh a1 |
+| 2026-09-09 | A1 | **A1 accepted.** zz_test loaded by the container and produced audio byte identical to fr_female at seed 7. Fixed tts.py --check (sent no voice, so it read a healthy Voxtral server as down) and a pipefail false warning in step.sh. zz_test removed. | A2 |
