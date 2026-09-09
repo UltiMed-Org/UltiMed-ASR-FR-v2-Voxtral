@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** A2 accepted (6 keepers). A4 FAILED: `ref_audio` cloning routes straight into the missing codec encoder and killed the engine. Track B is back on, and is the only route to the target voices.
+**STATUS:** B1 done: 18/20 shipped voices invert to bit-exact codes, 2 land at bf16 noise without reaching bit equality. The embedding layer is now invertible, which is the half of Track B that needed proving.
 
-**NEXT ACTION:** Track B, stage B1 (recover the true codes of the shipped voices). CPU-only tensor work, no server needed. Ask the agent to prepare it.
+**NEXT ACTION:** B2, load the decoder standalone and hear the shipped voices' reference clips. Still CPU-only, no server. Ask the agent to prepare it.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -227,7 +227,7 @@ Two lessons:
 
 Only start after A3 says Track A is insufficient. Each stage is a gate for the next.
 
-### [ ] B1. Recover the true codes of the shipped voices (CPU, no decoder)
+### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
 Each `[N, 3072]` embedding is a sum of 37 rows from the known `[9088, 3072]` table, one row from each codebook's known offset range (offsets are `cumsum` of codebook sizes: 8194 for semantic, then 36 x 23 for acoustic, per `MultiVocabEmbeddings`). Recover the indices by coordinate descent: initialize by picking each codebook's nearest row to the residual, then repeatedly hold 36 fixed and re-solve the 37th exactly by nearest-row lookup on the residual.
 
@@ -239,7 +239,22 @@ Bonus output: the marginal statistics of real code streams (semantic histogram, 
 
 Estimated: 2 to 3 h. Pure numpy or torch on CPU, seconds of compute.
 
-**Result:**
+**Result:** 2026-09-09, Claude Code. `voxtral/cloning/recover_codes.py` (`run` + `verify`). **Passed**, with one documented anomaly.
+
+**Layout confirmed against the source, not guessed.** `MultiVocabEmbeddings` + `MultimodalAudioModelArgs.get_codebook_sizes` give sizes `[8194] + [23] * 36` (each codebook gets +2 special ids, `AudioSpecialTokens` has exactly two members), summing to 9022 real rows, and `nn.Embedding` allocates up to the next multiple of 128, which is the table's 9088. The plan's guess was right and the padding explains the rest. Sizes are re-derived from params.json at runtime rather than hardcoded.
+
+**Results:** 18 of the 20 shipped voices recover **bit for bit**: re-embedding the codes and rounding to bfloat16 reproduces the stored tensor exactly, every element of every frame. Derived voices behave exactly as their construction predicts: the four truncations and the splice are bit-exact too (they are slices of real frames), while all four blends fail hard (0 to 1 percent of frames). **A blend of two code sums is not itself a code sum**, which is the A2 seam-vs-smear story confirmed arithmetically: the user heard `esf_50` switch voice mid-utterance, and here it is the only prefix that no set of codes can explain at all (0.26 percent).
+
+That gives Track B a free on-manifold detector: any candidate prefix can be checked for "is this a thing the codebooks can actually represent" before spending a second of GPU on it.
+
+**Two anomalies, both recorded rather than smoothed over:**
+
+1. `cheerful_female` and `neutral_male` reach a residual of 0.0126 mean (relative ~9e-3, within bf16 rounding, so they pass the acceptance criterion as written) but **0 percent of frames are bit-exact**, against 0.0075 and 100 percent for the other 18. The gap is systematic, not a few stuck frames: every frame is slightly wrong by a similar amount, and the residual is not a constant offset (its per-frame mean vector is small next to its spread). 120 restarts and 25 sweeps did not move it. Something about those two prefixes differs; unresolved.
+2. **Excluding the special-token rows makes recovery worse, not better.** Real audio codes are shifted past `[EMPTY_AUDIO]` / `[END_AUDIO]`, so forbidding ids 0 and 1 looks principled. Measured: it makes the worst frame 150x worse. Real voices genuinely contain frames built from those rows. The flag survives as `--no-special` purely to reproduce that measurement.
+
+**Method note for B3/B4.** Plain block coordinate descent leaves ~5 percent of frames in a local minimum (95 percent bit-exact). Frames are independent, so the fix is to keep the solved ones and restart only the stragglers from random codes: 24 restarts take 18 of 20 voices to 100 percent. Expect the same shape of problem when inverting the decoder, and budget for restarts there too.
+
+Outputs: `cache/cloning/codes/<voice>.npy` (`[N, 37]` int16) plus `stats.json` with the semantic-code usage and acoustic level histogram, the prior B3/B4 asked for.
 
 ### [ ] B2. Load the decoder standalone and hear the reference clips
 
@@ -325,3 +340,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A2 | Sweep run: 13 takes, all 200, all distinct. wav_stats.py added for triage. Blends shift pitch for real (frm_50 at 150 Hz); cross-language blends show the low-rms mush signature; truncation and cross-lingual look safe. | user listens, then A3 |
 | 2026-09-09 | A3 | A2 accepted, 6 keepers, with the seam-vs-smear failure mode understood. Found that Voxtral clones from a raw clip per request via ref_audio (LLM multimodal input, not the missing codec encoder); verified live, blocked only by soxr missing from the image. Track B put on hold. | user runs step.sh a3 |
 | 2026-09-09 | A4 | ref_audio cloning FAILED: embed_multimodal calls encode_waveforms, whose weights are absent, and the raise killed EngineCore. Fork patch 0006 refuses it with a 400 instead. My A3 claim that cloning sidesteps the encoder was wrong, corrected in place. Track B is the route. | B1 |
+| 2026-09-09 | B1 | Codes recovered: 18/20 shipped voices bit-exact, 2 at bf16 noise but never bit-exact (unresolved). Blends provably unrepresentable, giving a free on-manifold test. Special-token rows are used by real voices, excluding them hurts. | B2 |
