@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** B1 done: 18/20 shipped voices invert to bit-exact codes, 2 land at bf16 noise without reaching bit equality. The embedding layer is now invertible, which is the half of Track B that needed proving.
+**STATUS:** B2 done: the codec decoder runs standalone on CPU and all 20 shipped voices decode to fluent, intelligible speech in their advertised language. A voice prefix is a reference recording, confirmed end to end. Only the encode direction is still missing.
 
-**NEXT ACTION:** B2, load the decoder standalone and hear the shipped voices' reference clips. Still CPU-only, no server. Ask the agent to prepare it.
+**NEXT ACTION:** B3, the paired analysis-by-synthesis test: take a B2 waveform, forget its codes, and try to re-derive them through the frozen decoder. B1 gives the ground truth to score against. Still CPU-only, no server.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -256,7 +256,7 @@ That gives Track B a free on-manifold detector: any candidate prefix can be chec
 
 Outputs: `cache/cloning/codes/<voice>.npy` (`[N, 37]` int16) plus `stats.json` with the semantic-code usage and acoustic level histogram, the prior B3/B4 asked for.
 
-### [ ] B2. Load the decoder standalone and hear the reference clips
+### [x] B2. Load the decoder standalone and hear the reference clips
 
 Instantiate `VoxtralTTSAudioTokenizer` in plain torch, load only `audio_tokenizer.decoder_blocks.*` and `output_proj` from `consolidated.safetensors`, feed it the B1 codes, write wavs. The class only reads `vllm_config.model_config.hf_config`, so a small namespace shim is enough. Watch for weight-norm parameterisation, the causal conv padding, and bf16 autocast.
 
@@ -266,7 +266,15 @@ Acceptance: `cache/cloning/B2/fr_female.wav` is intelligible speech that plainly
 
 Estimated: 3 to 5 h. This is the most engineering-heavy stage. If it stalls on plumbing, that is normal, log where and stop.
 
-**Result:**
+**Result: passed, and more cleanly than hoped.** All 20 shipped voices decode to fluent, intelligible speech in the language their name claims. `cache/cloning/B2/fr_female.wav` is 7.68 s of Madame Bovary read by a French woman ("Ce discours s'adressait plus particulierement a Emma, qui ne s'en etonna pas..."), transcribed back by the ASR service at :8002 to prove it rather than by ear. Same F0 as the server's own synthesis under `--voice fr_female` (181.8 Hz vs 187.5 Hz). So a voice prefix is literally a reference recording, and the whole encode side is now the only missing piece.
+
+Notes worth carrying forward:
+
+- The class instantiates outside vLLM through a meta-path finder that fabricates stub modules for the `vllm`, `mistral_common`, `transformers` and `aenum` roots plus every `vllm_omni.*` outside the voxtral_tts package. Two traps: import torch **before** installing the stubs (torch.library calls `inspect.getsourcefile` on whatever it finds), and do **not** stub `flash_attn` or `apex`, which the model imports under `try/except ImportError` and replaces with real fallbacks when absent. Stubbing them makes the import succeed and the stub then reaches `forward`.
+- `load_state_dict(strict=False)` legitimately misses 115 tensors: the encoder half (`input_proj.`, `encoder_blocks.`) and `audio_token_embedding.`, which only `encode_tokens` reads. None is on the decode path.
+- The B1 on-manifold test reproduces perfectly at the audio level. Every real voice has exactly one special-token frame, its last (the end-of-audio marker). The pure cut/concat derived voices have zero or one and decode to clean excerpts of the same recording (`d_frf_head60` is the first 4.8 s of the fr_female sentence, `d_frf_tail60` the tail). The 50/50 blends have 96 or 97 of 97 frames off-manifold and decode to 0.08 s of nothing. `d_frf_frm_25` loses 14 interior frames and decodes to French with words missing, which is exactly the "seam" A2 heard.
+- The two voices B1 could not invert bit-exactly, `cheerful_female` and `neutral_male`, still decode to perfectly intelligible English. Their residual is below perceptual relevance, so it stops being a blocker for B3/B4. Still unexplained, still not worth chasing.
+- Unrelated find: the ASR service now rejects a request without a `model` field, and `asr.py` has no `--model` flag, so `./asr.py file.wav` fails with 422. The transcriptions above went through curl with `model=deepdml/faster-whisper-large-v3-turbo-ct2`. Worth a separate fix.
 
 ### [ ] B3. The paired test: does analysis by synthesis land on real codes
 
@@ -341,3 +349,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A3 | A2 accepted, 6 keepers, with the seam-vs-smear failure mode understood. Found that Voxtral clones from a raw clip per request via ref_audio (LLM multimodal input, not the missing codec encoder); verified live, blocked only by soxr missing from the image. Track B put on hold. | user runs step.sh a3 |
 | 2026-09-09 | A4 | ref_audio cloning FAILED: embed_multimodal calls encode_waveforms, whose weights are absent, and the raise killed EngineCore. Fork patch 0006 refuses it with a 400 instead. My A3 claim that cloning sidesteps the encoder was wrong, corrected in place. Track B is the route. | B1 |
 | 2026-09-09 | B1 | Codes recovered: 18/20 shipped voices bit-exact, 2 at bf16 noise but never bit-exact (unresolved). Blends provably unrepresentable, giving a free on-manifold test. Special-token rows are used by real voices, excluding them hurts. | B2 |
+| 2026-09-10 | B2 | Codec decoder runs standalone on CPU via an import shim. All 20 voices decode to fluent speech in their advertised language, ASR-verified; fr_female is Madame Bovary at 181.8 Hz. B1's on-manifold test reproduces exactly at the audio level. The 2 non-bit-exact voices still sound fine. | B3 |
