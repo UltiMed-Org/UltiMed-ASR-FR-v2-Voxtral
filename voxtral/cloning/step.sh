@@ -91,12 +91,21 @@ check_fork_has_local_voice_lookup() {
 start_voxtral() {
     # `up -d` and not `restart`: the container only re-reads environment: and
     # re-loads the voice embeddings at model init.
+    #
     # --build because the Dockerfile installs vllm_omni FROM the local clone and
     # COPYs entrypoint.sh: without it, a fork or entrypoint change is silently
     # served by the old image. Layers are cached, so it is nearly free when
     # nothing changed.
-    say "starting voxtral-tts (building if the fork or entrypoint changed)"
-    sudo docker compose up -d --build voxtral-tts
+    #
+    # --force-recreate because a newly registered voice is a change to files in
+    # the MOUNTED cache, not to the compose config or the image. Plain `up -d`
+    # compares config and image only, finds them identical, prints "Running" and
+    # leaves the old process alive, which still has the old voice list from its
+    # own model init. Every stage here registers voices, so the recreate is
+    # never wasted, and a stale container would fail the stage in a way that
+    # looks exactly like a broken registration.
+    say "starting voxtral-tts (rebuild if needed, always recreate so voices reload)"
+    sudo docker compose up -d --build --force-recreate voxtral-tts
     ok "container up, waiting for the model to load (9 GB of weights, this takes minutes)"
 }
 
