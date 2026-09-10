@@ -412,6 +412,41 @@ def score(codes: torch.Tensor, truth: torch.Tensor, n_levels: int) -> dict[str, 
     }
 
 
+def log_seed_accuracy(*, label: str, predicted: torch.Tensor, truth: torch.Tensor,
+                      semantic_logits: torch.Tensor | None = None) -> None:
+    """Log how good a starting point is, before any search runs.
+
+    What decides the outcome is not the final reconstruction error but whether the seed
+    lands inside the basin B3 measured (roughly 1 sigma), since a search cannot rescue a
+    seed that starts outside it. So every init mode with something to compare against the
+    truth reports the same line, in the same units the encoder's training loop logs.
+
+    Parameters
+    ----------
+    label : str
+        Which init mode produced the seed, for the log line.
+    predicted : torch.Tensor
+        `[K, T]` quantizer-space codes of the seed.
+    truth : torch.Tensor
+        `[K, T]` quantizer-space codes of the real answer.
+    semantic_logits : torch.Tensor, optional
+        `[T, semantic_size]` per-frame semantic logits, when the seed came from something
+        that has them. Used only for top-16 and median rank, which are undefined
+        otherwise and then left out of the line.
+    """
+    truth = truth.to(predicted.device)
+    top1 = (predicted[0] == truth[0]).float().mean().item()
+    exact_acoustic = (predicted[1:] == truth[1:]).float().mean().item()
+    within1 = ((predicted[1:] - truth[1:]).abs() <= 1).float().mean().item()
+    ranked = ""
+    if semantic_logits is not None:
+        rank = (semantic_logits > semantic_logits.gather(1, truth[0][:, None])).sum(dim=-1)
+        ranked = (f"top16 {100 * (rank < 16).float().mean().item():5.1f}%  "
+                  f"median rank {rank.median().item():.0f}  ")
+    logger.info(f"{label} seed: semantic top1 {100 * top1:5.1f}%  {ranked}"
+                f"acoustic exact {100 * exact_acoustic:5.1f}% within1 {100 * within1:5.1f}%")
+
+
 def sweep_per_dim(*, model: torch.nn.Module, truth: torch.Tensor, target: torch.Tensor,
                   n_levels: int, frame: int = 12, tail: int = 2) -> None:
     """Move one code row by one step and report how far the waveform moves.
@@ -494,19 +529,26 @@ def cli() -> None:
               help="Weight of the semantic commitment term (0 disables).")
 @click.option("--wave-weight", default=1.0, show_default=True, help="Weight of the waveform L1 term (0 disables).")
 @click.option("--seed", default=0, show_default=True, help="Seed for the initial codebook rows.")
-@click.option("--init", "init_mode", type=click.Choice(["random", "truth", "centre", "encoder"]),
+@click.option("--init", "init_mode",
+              type=click.Choice(["random", "truth", "centre", "encoder", "degraded"]),
               default="random", show_default=True,
               help="Start from random codebook rows, from the truth plus noise, from the "
-                   "codebook's centre plus noise, or from the trained encoder's prediction.")
+                   "codebook's centre plus noise, from the trained encoder's prediction, "
+                   "or from the truth corrupted to a chosen accuracy.")
 @click.option("--encoder", "encoder_path", default=None,
               help="Checkpoint for --init encoder (default: cache/cloning/B6/encoder.pt).")
 @click.option("--init-noise", default=0.1, show_default=True,
               help="Relative noise added to the truth when --init truth.")
+@click.option("--degrade-semantic", default=0.25, show_default=True,
+              help="Fraction of semantic codes left correct when --init degraded.")
+@click.option("--degrade-acoustic", default=1, show_default=True,
+              help="Largest step an acoustic code drifts by when --init degraded.")
 @click.option("--device", default="cpu", show_default=True, help="Where to run.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
 def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_semantic: float,
         lr_acoustic: float, commit_weight: float, wave_weight: float, seed: int, init_mode: str,
-        init_noise: float, device: str, encoder_path: str | None, out_dir: str) -> None:
+        init_noise: float, degrade_semantic: float, degrade_acoustic: int, device: str,
+        encoder_path: str | None, out_dir: str) -> None:
     """Recover codes from a waveform and score them against the truth."""
     model = load_decoder(find_snapshot(), device=device)
     sample_rate = int(model.sampling_rate)
@@ -543,16 +585,32 @@ def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_s
             init = model.quantizer.decode(predicted[None])[0].transpose(0, 1)
         # Reported before the search runs, because it says whether the search is even
         # being given the ~1 sigma B3 requires: seeding cannot rescue a bad encoder.
-        truth_device = truth.to(predicted.device)
-        top1 = (predicted[0] == truth_device[0]).float().mean().item()
-        rank = (semantic_logits[0] > semantic_logits[0].gather(
-            1, truth_device[0][:, None])).sum(dim=-1)
-        exact_acoustic = (predicted[1:] == truth_device[1:]).float().mean().item()
-        within1 = ((predicted[1:] - truth_device[1:]).abs() <= 1).float().mean().item()
-        logger.info(f"encoder seed: semantic top1 {100 * top1:5.1f}%  "
-                    f"top16 {100 * (rank < 16).float().mean().item():5.1f}%  "
-                    f"median rank {rank.median().item():.0f}  "
-                    f"acoustic exact {100 * exact_acoustic:5.1f}% within1 {100 * within1:5.1f}%")
+        log_seed_accuracy(label="encoder", predicted=predicted, truth=truth,
+                          semantic_logits=semantic_logits[0])
+    if init_mode == "degraded":
+        # The controlled version of --init encoder: corrupt the truth to a chosen accuracy
+        # instead of asking a real encoder for its best guess. That turns "the encoder is
+        # at 23% top-16" into "an encoder would have to reach X%", which is the number
+        # that decides whether more training data is worth collecting or whether the
+        # encoder route should be dropped for direct optimisation through the decoder.
+        generator = torch.Generator().manual_seed(seed)
+        predicted = truth.clone().cpu()
+        # Semantic mistakes are drawn uniformly over the codebook, because a wrong answer
+        # from a classifier over an unordered table is an unrelated row, not a near miss.
+        # `sensitivity --per-dim` measured that: the neighbouring row is as far away
+        # acoustically as any other.
+        wrong = torch.rand(predicted.shape[1], generator=generator) >= degrade_semantic
+        table_size = model.quantizer.semantic_codebook.embedding.shape[0]
+        predicted[0][wrong] = torch.randint(table_size, (int(wrong.sum()),), generator=generator)
+        # Acoustic mistakes are near misses instead, since the FSQ scalars are an ordered
+        # grid and the encoder's acoustic head is wrong by a step, not at random.
+        drift = torch.randint(-degrade_acoustic, degrade_acoustic + 1,
+                              predicted[1:].shape, generator=generator)
+        predicted[1:] = (predicted[1:] + drift).clamp(0, model.quantizer.acoustic_codebook.n_levels - 1)
+        predicted = predicted.to(truth.device)
+        log_seed_accuracy(label="degraded", predicted=predicted, truth=truth)
+        with torch.no_grad():
+            init = model.quantizer.decode(predicted[None])[0].transpose(0, 1)
     if init_mode == "centre":
         # A random codebook row is a valid code, which means it is the bottom of its own
         # basin and descent has no reason to leave it. The codebook's centre is not a
