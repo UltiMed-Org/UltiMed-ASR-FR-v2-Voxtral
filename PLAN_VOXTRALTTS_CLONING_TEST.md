@@ -376,6 +376,16 @@ The retrain (40000 steps, batch 64, 32-frame windows, about 45 min on the 24 GB 
 
 Held-out top-1 did not move after step 3200 while the training batch climbed to 99 pct, so this is memorisation, not a data shortage that another 93x would fix. 93x the data bought 9 points of top-16.
 
+`--init encoder` was run against the retrained checkpoint for the record, on 32 frames of the held-out `fr_female`, both ways:
+
+```
+encoder seed: semantic top1 3.1%  top16 18.8%  median rank 111  acoustic exact 16.2% within1 41.4%
+semantic free:   semantic exact 0.00%  (the search deletes even a weak seed)
+semantic frozen: semantic exact 3.12%  acoustic within1 92.97%  (up from 41.4%)
+```
+
+The keeper is **median rank 111**: the true code sits in the top 111 of 8192 half the time, a 74x pruning of the discrete search, even though the encoder is useless as a predictor. That is the job it should be given, and it needs no acoustic head to do it.
+
 Acceptance therefore **fails as written** (top-16 is clear of 14 pct, but `--init encoder` cannot recover materially more than a cold start from a 4.8 pct seed). The note in the acceptance criterion turned out to be the important sentence: the second route, per-frame search over the 8192 rows with the acoustics right, is the one that works. B8.
 
 ### [x] B8. The search was miscoupled: freeze the semantic half
