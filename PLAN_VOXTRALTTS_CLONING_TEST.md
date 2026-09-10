@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** B2 done: the codec decoder runs standalone on CPU and all 20 shipped voices decode to fluent, intelligible speech in their advertised language. A voice prefix is a reference recording, confirmed end to end. Only the encode direction is still missing.
+**STATUS:** B3 measured, and it is a wall with a known shape. The waveform determines the codes exactly (the true semantic code is the unique argmin by 400x), but the semantic and acoustic halves of a frame are mutually blocking: perturb one frame's acoustics to the value a search starts from and the true semantic code drops from rank 1 to rank 241 of 8192. Gradient analysis by synthesis lands at chance on the semantic half.
 
-**NEXT ACTION:** B3, the paired analysis-by-synthesis test: take a B2 waveform, forget its codes, and try to re-derive them through the frozen decoder. B1 gives the ground truth to score against. Still CPU-only, no server.
+**NEXT ACTION:** decide between the two continuations in B3's Result before touching B4. Both want the GPU rather than CPU: fit the acoustics per semantic candidate before ranking, or fix the semantic sequence from elsewhere and solve only the 36 acoustic dims per frame.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -276,7 +276,7 @@ Notes worth carrying forward:
 - The two voices B1 could not invert bit-exactly, `cheerful_female` and `neutral_male`, still decode to perfectly intelligible English. Their residual is below perceptual relevance, so it stops being a blocker for B3/B4. Still unexplained, still not worth chasing.
 - Unrelated find: the ASR service now rejects a request without a `model` field, and `asr.py` has no `--model` flag, so `./asr.py file.wav` fails with 422. The transcriptions above went through curl with `model=deepdml/faster-whisper-large-v3-turbo-ct2`. Worth a separate fix.
 
-### [ ] B3. The paired test: does analysis by synthesis land on real codes
+### [!] B3. The paired test: does analysis by synthesis land on real codes
 
 The decisive experiment for the "off-distribution prefix" risk. B1 and B2 together give a paired example: a waveform **and** its ground-truth codes.
 
@@ -294,7 +294,28 @@ If 1 and 2 pass but 3 fails badly, the off-distribution risk is real: continue o
 
 Estimated: 4 to 6 h across possibly two sessions. Split into "get it converging" and "measure against truth" if needed.
 
-**Result:**
+**Result: the codes are identifiable, the optimizer cannot find them, and the reason is now pinned down exactly.** Written as `voxtral/cloning/invert.py` with four subcommands: `run` (gradient analysis by synthesis), `solve` (causal exhaustive search), `brute` (score all 8192 semantic codes for one frame) and `sensitivity` (how much does the audio depend on each code group). All numbers below are fr_female, the first 32 frames, on CPU.
+
+Against the acceptance criteria, in the order the plan set:
+
+1. Reconstruction perceptually close to target: **no**. Best loss 2.2 against 0.0 at the truth, which is worse than randomising a whole frame's 36 acoustic codes (1.65).
+2. Acoustic codes within one or two levels: **partially**. 70.9 percent within 1 and 81.4 percent within 2, against 13.8 percent and roughly 27 percent by chance. Real signal, not "mostly".
+3. Semantic codes on a large fraction of frames: **no**. 0 to 3 percent, i.e. chance (0.012 percent).
+
+So this is not the branch the plan anticipated (1 and 2 passing, 3 failing). What the diagnostics found instead:
+
+- **The waveform determines the codes exactly.** `brute` scores all 8192 semantic codes for one frame with everything else at the truth: the true code is the unique global minimum at loss 5.3e-5, the runner-up is at 0.021 and the median at 0.078. A factor of 400. True at frame 7 with seven frames of history, and equally true at frame 0 with none. Identifiability is not the problem.
+- **The objective is a needle, not a slope.** 8192 sharp isolated minima in a 256-dimensional space is not something a continuous relaxation can descend into, which is why every gradient variant lands at chance on the semantic half.
+- **The two halves of a frame are mutually blocking, and this is the actual wall.** Move only the probed frame's 36 acoustic dims from the truth to the mid level a search would start from, and the true semantic code falls from rank 1 to **rank 241 of 8192**, with the best impostor at half its loss (3.11 against 6.30). You need the acoustics to identify the semantic code and the semantic code to fit the acoustics. The causal frame-by-frame solver confirms it end to end: alternating the two, it got 0 of the first 4 frames right.
+- **The semantic code is 14x less audible than the acoustic ones.** `sensitivity`: a random semantic substitution in one frame moves the loss by 0.118, randomising that frame's 36 acoustic codes moves it by 1.65. And this despite the semantic half being 256 of the 292 dims and carrying 47x the magnitude (per-frame norm 145 against 3.1). The decoder projects most of it away.
+- **Two implementation findings worth keeping.** The plan's annealed softmax over negative distances is strictly worse than a VQ-VAE straight-through estimator: at a soft temperature the backward mixture describes nothing the forward pass did, and measured, it took a run holding 65 percent of the semantic codes down to 0 percent. And the two halves need learning rates two orders of magnitude apart (codebook rows sit ~107 apart, the acoustic grid step is 0.1), which a single rate cannot serve. The straight-through phase is off by default now: snapping the converged continuous solution is strictly better, and a control started at the truth plus 5 percent per-dimension noise recovers 100 percent of the semantic codes and 99.9 percent of the acoustic within 1, which is what proves the machinery and the gradient path are correct.
+
+**Where that leaves Track B.** A prior term from B1's marginal statistics, the mitigation the plan named, does not address a deadlock between two halves of the same frame. Two things would, in rough order of promise:
+
+1. **Fit the acoustics per candidate before ranking.** The rank-241 result says the true code loses only because its acoustics were not fitted; the rank-1 result says it wins by 400x once they are. So shortlist semantic candidates, fit each one's 36 acoustic dims properly, then re-rank. That is roughly 8192 small optimizations per frame, which is hours per frame on CPU and ordinary on the GPU this machine has. No learned prior needed.
+2. **Do not recover the semantic codes at all: supply them.** They are the content stream and are largely speaker independent, which is why the acoustic half is the one that carries timbre. With the semantic sequence fixed, the per-frame problem is 36 dims on a 21-level grid, and the control above already recovers that at 94 percent within 1 by gradient alone. Where a plausible semantic sequence for the reference text comes from is the open question, and stage 0 of the server generates exactly such sequences.
+
+Stopping here rather than burning more CPU: the measurement the stage existed to make is made, and both continuations want the GPU.
 
 ### [ ] B4. A real clip becomes a voice
 
@@ -350,3 +371,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-09 | A4 | ref_audio cloning FAILED: embed_multimodal calls encode_waveforms, whose weights are absent, and the raise killed EngineCore. Fork patch 0006 refuses it with a 400 instead. My A3 claim that cloning sidesteps the encoder was wrong, corrected in place. Track B is the route. | B1 |
 | 2026-09-09 | B1 | Codes recovered: 18/20 shipped voices bit-exact, 2 at bf16 noise but never bit-exact (unresolved). Blends provably unrepresentable, giving a free on-manifold test. Special-token rows are used by real voices, excluding them hurts. | B2 |
 | 2026-09-10 | B2 | Codec decoder runs standalone on CPU via an import shim. All 20 voices decode to fluent speech in their advertised language, ASR-verified; fr_female is Madame Bovary at 181.8 Hz. B1's on-manifold test reproduces exactly at the audio level. The 2 non-bit-exact voices still sound fine. | B3 |
+| 2026-09-10 | B3 | Codes are identifiable (true semantic code is the unique argmin by 400x, with or without history) but not findable: the semantic and acoustic halves of a frame block each other, rank 1 -> rank 241 when one frame's acoustics move to a search's starting value. Gradient AbS at chance on semantic, 70.9 pct within 1 on acoustic. Two GPU-shaped continuations proposed. | user picks a continuation |
