@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** B6 hit a data wall, not a method wall. The encoder B3 asked for trains fine and there is nothing to train it on: the 20 shipped voices are 2823 frames (~4 min) covering 13 pct of the 8192 semantic codes, so the network reaches 94 pct train and 2 pct held-out. Uniform random codes were measured to teach nothing (0.2 pct on the training batch itself), so the decoder's freeness cannot be spent that way.
+**STATUS:** B7 ran and the encoder route stalled at 4.8 pct held-out semantic top-1 (23.6 pct top-16) even with 93x more data, but B8 found why the whole track was stuck, and it was never the data. **The search destroys its own starting point.** Handed a seed with 100 pct correct semantic codes and acoustic codes off by at most one grid step, the optimizer drove semantic accuracy down to 43.75 pct; with the semantic half frozen (`--lr-semantic 0`) the same seed recovers **100 pct semantic and 100 pct acoustic, bit exact**. The acoustic half is not a search problem at all: it falls out of the audio by plain descent once the semantic codes are held still, and degrades gracefully (89.6 pct exact) even when the frozen semantic codes are only 25 pct right. Everything hard about this problem is one discrete choice: which of the 8192 semantic rows per frame.
 
-**NEXT ACTION:** B7, and it needs a human for one command: `sudo docker compose up -d --build voxtral-tts` (this agent has no sudo password). The **--build is required**, not optional: the Dockerfile COPYs the fork in, so an older image accepts `voxtral_dump_codes` and silently writes nothing. Then `./voxtral/cloning/mint_codes.py mint --minutes 240`, retrain, and compare held-out top-16 against B6's 14 pct.
+**NEXT ACTION:** B8's continuation. Build the alternating solver: freeze semantic, descend acoustic, then re-score the 8192 semantic candidates per frame against the solved acoustics (`invert.py brute` already does the scoring for one frame), and repeat. B3 measured that the true semantic code is a unique argmin by 400x **when the acoustics are right**, and B8 shows an acoustic solve gets them right, so the two halves now feed each other instead of fighting. The encoder is demoted to an optional shortlist and needs no acoustic head at all.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -346,7 +346,7 @@ Estimated: 3 to 4 h. Actual: 4 h, four dead ends, one hard limit.
 
 **TODO:** the fork patch to dump stage 0 codes does not exist yet.
 
-### [ ] B7. Mint real code sequences from stage 0, then retrain B6
+### [!] B7. Mint real code sequences from stage 0, then retrain B6
 
 B6's wall was data, and the generator was the server all along: stage 0 is an AR LLM whose whole job is text -> on-manifold codes in any of the 20 voices, and what it emits is the same table-space ids a voice prefix carries. Fork patch **0007** (`voxtral_tts.py::_dump_frame_codes`) makes it append those codes to `<VOXTRAL_CODE_DUMP_DIR>/<tag>.i16` for any request carrying `voxtral_dump_codes`, riding the same per-row `sampling_extra_args` route as the noise seed, so it is per request and stays correct under concurrency. Nothing is written unless a request asks and the audio is byte-identical either way. `tts.py --dump-codes TAG` is the client end; compose sets the dir to `/cache/cloning/dumps`.
 
@@ -360,7 +360,63 @@ Acceptance: held-out semantic top-16 well clear of B6's 14 pct, and `--init enco
 
 Estimated: 1 h of generation plus 2 to 3 h of training.
 
-**Result:**
+**Result: the pipeline works, the encoder still does not generalise, and that turned out not to matter (see B8).**
+
+Everything server-side ran clean. Patch 0007 dumps were verified two independent ways: frame count against wav duration (52 frames vs 50 s of audio), and a full round trip through the local decoder (correlation 0.999976, relative RMS error 0.69 pct, the residual being the server's flash-attn/bf16 against the local SDPA/fp32). Generation produced **689 utterances, 0 failed, 259,585 frames**. The training pool went from 20 voices / 2823 frames / 13.1 pct semantic coverage to **709 files / 262,408 frames / 5.8 h of speech / 46.4 pct coverage** (3798 of 8192 codes). The held-out set stopped being a 96-frame prefix holding 64 distinct codes and became **40 minted `fr_female` utterances, 9364 frames**.
+
+The retrain (40000 steps, batch 64, 32-frame windows, about 45 min on the 24 GB card) beat B6 and then flatlined:
+
+| | B6 (2823 frames) | B7 (262,408 frames) |
+|---|---|---|
+| held-out semantic top-1 | 2 pct | **4.8 pct** |
+| held-out semantic top-16 | 14 pct | **23.6 pct** |
+| held-out acoustic exact | - | 16.5 pct |
+| held-out acoustic within-1 | - | 43.9 pct |
+| training-batch semantic top-1 | 94 pct | 96 to 99 pct |
+
+Held-out top-1 did not move after step 3200 while the training batch climbed to 99 pct, so this is memorisation, not a data shortage that another 93x would fix. 93x the data bought 9 points of top-16.
+
+Acceptance therefore **fails as written** (top-16 is clear of 14 pct, but `--init encoder` cannot recover materially more than a cold start from a 4.8 pct seed). The note in the acceptance criterion turned out to be the important sentence: the second route, per-frame search over the 8192 rows with the acoustics right, is the one that works. B8.
+
+### [x] B8. The search was miscoupled: freeze the semantic half
+
+Not a planned stage. It came out of asking why the B7 encoder's acoustic head could not fit even its own training batch (about 50 pct within-1 on frames it had just seen), while the semantic head memorised them at 99 pct.
+
+First hypothesis, that the decoder is many-to-one in the 36 FSQ dims so those codes are unrecoverable by construction: **measured and killed.** `invert.py sensitivity --per-dim` perturbs one code row by one step and reports how far the waveform moves relative to its own RMS. No dead dimensions: the weakest single-step effect is 1.28 pct of RMS, the median 2.24 pct, against 0.83 pct for replacing a semantic code with an unrelated row. Every acoustic dimension is audible, so inversion is well posed.
+
+Second, `invert.py run --init degraded` was added, which corrupts the truth to a chosen accuracy instead of asking a real encoder for a guess (semantic errors uniform over the codebook, since a wrong row in an unordered table is an unrelated row; acoustic errors as near misses on the ordered grid). Sweeping the seed quality, all at 200 warmup steps on 16 frames of `fr_female`:
+
+| seed semantic | seed acoustic | search result (semantic exact) |
+|---|---|---|
+| 100 pct | exact | 100 pct |
+| 100 pct | within-1 | 43.75 pct |
+| 87.5 pct | within-1 | 31.25 pct |
+| 68.8 pct | within-1 | 25.0 pct |
+| 25.0 pct | within-1 | 18.75 pct |
+| truth + 0.1 sigma noise | - | 31.25 pct |
+
+The second row is the finding. A seed whose semantic codes were **entirely correct**, with acoustic codes off by at most one grid step, came out at 43.75 pct: the search converted acoustic error into semantic error. It sheds the most from the best seed (a 25 pct seed loses 6 points, a 100 pct seed loses 56).
+
+Then the same seed with `--lr-semantic 0`:
+
+| | semantic free | semantic frozen |
+|---|---|---|
+| semantic exact | 43.75 pct | **100 pct** |
+| acoustic exact | not recovered | **100 pct** (mean abs error 0.0) |
+
+Same seed, same steps, everything else identical. With the 256-dim semantic embeddings held still, the 36 acoustic dims descended from 35.4 pct exact to bit-exact on every dim of every frame. With them free, the gradient spends itself dragging correct semantic codes off their codebook rows, and once one crosses into a neighbouring cell nothing pulls it back.
+
+The halves separate cleanly, which is what makes the alternating scheme viable:
+
+| frozen semantic accuracy | acoustic recovered exactly |
+|---|---|
+| 100 pct | 100.0 pct |
+| 87.5 pct | 99.65 pct |
+| 25 pct | 89.6 pct |
+
+Consequences: B3's "identifiable but not findable" was measuring an optimizer that unfreezes the one half that must be held still, so that conclusion is superseded rather than merely refined. The encoder needs **no acoustic head**, so more than half of what B6 and B7 trained was never needed. And the remaining problem is discrete, not continuous.
+
+Not yet done, and the reason this stage is `[x]` for the diagnosis but not for the fix: the alternating solver itself is unbuilt, and the open question is whether re-scoring the 8192 semantic candidates against *solved* acoustics ranks the truth first (B3 measured rank 1 against *true* acoustics and rank 241 against a search's starting values, so the interesting case sits between two known numbers).
 
 ### [ ] B4. A real clip becomes a voice
 
@@ -420,3 +476,5 @@ Newest at the bottom. One row per working session.
 | 2026-09-10 | B3 GPU | Fixed a wrong semantic learning rate (1.0 -> 0.05), which widened the measured basin to 100 pct at 0.3 sigma and 50 pct at 1.0 sigma. Cold starts still fail everywhere: random codebook row, codebook centre, 256 restarts, shortlist-then-fit (no fitter gets within 400x of the floor). Conclusion: inversion needs an approximate encoder to seed it, and one can be distilled from the decoder. | train that encoder |
 | 2026-09-10 | B6 | Encoder trains, data does not exist. Four dead ends: regression to 0.54 sigma recovers 0 pct (the mean of codes is not a code); uniform random codes give 0.2 pct on the training batch itself (inverting dense noise generalises like inverting a hash); a codebook-geometry head is worse than a free one (flat logits, flat gradient); real data gives 94 pct train and 2 pct held out because 20 voices are 2823 frames covering 13 pct of the 8192 semantic codes. | mint real codes from stage 0 |
 | 2026-09-10 | B7 built | Fork patch 0007 dumps stage-0 codes per request (tag in extra_params, same route as the noise seed, correct under concurrency); tts.py --dump-codes, VOXTRAL_CODE_DUMP_DIR in compose, mint_codes.py to drive it, unit tests for the dump. Not yet run: needs `sudo docker compose up -d --build voxtral-tts`, which needs a password. | generate and retrain |
+| 2026-09-10 | B7 run | Minted 689 utterances / 259,585 frames from stage 0 (0 failed), taking the pool from 2823 frames at 13.1 pct semantic coverage to 262,408 at 46.4 pct, with a real 40-utterance held-out set. Retrain beat B6 (top-16 14 -> 23.6 pct, top-1 2 -> 4.8 pct) then flatlined from step 3200 while the training batch hit 99 pct. 93x the data bought 9 points. | why the acoustic head cannot fit |
+| 2026-09-10 | B8 | **The search was destroying its seed.** Killed the many-to-one-decoder hypothesis by measurement (no dead dims, weakest single-step effect 1.28 pct of RMS). Added --init degraded and found a 100 pct-correct semantic seed comes out at 43.75 pct; frozen (--lr-semantic 0) the same seed recovers 100 pct semantic and 100 pct acoustic bit-exact. The acoustic half is free once semantic is held still, even at 25 pct frozen accuracy (89.6 pct exact). B3's conclusion is superseded; the encoder needs no acoustic head. | build the alternating solver |
