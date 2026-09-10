@@ -163,6 +163,15 @@ services:
     environment:
       - HOME=/cache
       - HF_HOME=/cache/huggingface
+      # Where the fork appends the stage-0 codes of any request that carries
+      # `voxtral_dump_codes` (./tts.py --dump-codes TAG -> <dir>/TAG.i16, raw
+      # int16, one row of 37 per 12.5 Hz frame). Nothing is written unless a
+      # request asks, so this is free to leave set. It exists because the open
+      # checkpoint ships no audio encoder: stage 0 IS the text -> on-manifold
+      # codes map, so having it dump what it emits is the only way to get real
+      # audio/codes pairs to train one on (see voxtral/cloning/, plan stage B6).
+      # Inside ./cache, which is already mounted and host-owned.
+      - VOXTRAL_CODE_DUMP_DIR=/cache/cloning/dumps
       - XDG_CACHE_HOME=/cache
       # Do NOT set HF_HUB_OFFLINE=1 here. It looks like the fix for the
       # locally-added-voice problem below, and it is not: vLLM's own

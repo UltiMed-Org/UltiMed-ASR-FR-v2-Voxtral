@@ -1,0 +1,274 @@
+From 4265bca3ca3f0aff7748ae7867114f58b1064f24 Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 12:21:09 +0200
+Subject: [PATCH] voxtral-tts: dump stage-0 codes per request, on request
+
+The open checkpoint ships no audio encoder, so the only source of real
+audio/codes pairs to train one on is this model generating them: stage 0 IS
+the text -> on-manifold-codes map, and what it emits here is exactly the
+table-space ids a voice prefix carries, so a dump is usable as a voice with
+no conversion.
+
+A request sets voxtral_dump_codes in extra_params and the frames are appended
+to <VOXTRAL_CODE_DUMP_DIR>/<tag>.i16 as raw int16 rows. The tag rides the same
+per-row sampling_extra_args route as the noise seed, so it is per request and
+stays correct under concurrency; appending is the only format that survives a
+request being preempted or cancelled mid-utterance. Nothing is written, and
+the env var need not exist, unless a request asks.
+---
+ .../models/voxtral_tts/test_code_dump.py      | 136 ++++++++++++++++++
+ .../models/voxtral_tts/voxtral_tts.py         |  76 ++++++++++
+ 2 files changed, 212 insertions(+)
+ create mode 100644 tests/model_executor/models/voxtral_tts/test_code_dump.py
+
+diff --git a/tests/model_executor/models/voxtral_tts/test_code_dump.py b/tests/model_executor/models/voxtral_tts/test_code_dump.py
+new file mode 100644
+index 0000000..fce852a
+--- /dev/null
++++ b/tests/model_executor/models/voxtral_tts/test_code_dump.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++Tests for the per-request stage-0 code dump (local fork).
++
++These cover ``VoxtralTTSForConditionalGeneration._dump_frame_codes``, which
++appends the codes stage 0 emits to a file when a request carries
++``voxtral_dump_codes`` in its ``extra_params``. It exists because the open
++checkpoint ships no audio encoder, so the model generating its own codes is the
++only source of real audio/codes pairs to train one on.
++
++The properties worth pinning down:
++
++* a batch that asked for nothing must write nothing, and must not need the env
++  var to be set at all (this runs on every decode step of every request);
++* rows must be matched to tags by batch position, so one request's codes never
++  land in another's file, which is the same property the noise seed needs;
++* frames must accumulate in emission order across steps, since an utterance is
++  built one 12.5 Hz frame per step;
++* a tag must not be able to name a file outside the dump directory.
++"""
++
++import functools
++
++import numpy as np
++import pytest
++import torch
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++N_CODEBOOKS = 37
++
++
++@functools.lru_cache(maxsize=1)
++def _voxtral_tts_class():
++    # Same import dance as the other voxtral_tts tests: pin vLLM's layer
++    # custom-op modules first so ``direct_register_custom_op`` does not run twice.
++    from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
++
++    bootstrap_vllm_layer_custom_op_modules()
++    import vllm.model_executor.models.utils  # noqa: F401
++
++    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
++        VoxtralTTSForConditionalGeneration,
++    )
++
++    return VoxtralTTSForConditionalGeneration
++
++
++def _make_model():
++    """Build an instance without running the real ``__init__``.
++
++    The method under test reads only class-level key names, so nothing from the
++    ~9GB checkpoint or a VllmConfig is needed.
++    """
++    cls = _voxtral_tts_class()
++    model = cls.__new__(cls)
++    torch.nn.Module.__init__(model)
++    return model
++
++
++def _outputs(rows: list[list[int]]) -> dict:
++    """Shape one decode step's codes the way ``compute_mm_logits`` does."""
++    return {"audio": [torch.tensor(row, dtype=torch.int32).reshape(1, 1, -1) for row in rows]}
++
++
++def _read(directory, tag: str) -> np.ndarray:
++    return np.fromfile(directory / f"{tag}.i16", dtype="<i2").reshape(-1, N_CODEBOOKS)
++
++
++def test_nothing_asked_for_writes_nothing(tmp_path, monkeypatch):
++    monkeypatch.setenv("VOXTRAL_CODE_DUMP_DIR", str(tmp_path))
++    model = _make_model()
++    model._dump_frame_codes(_outputs([list(range(N_CODEBOOKS))]), None)
++    model._dump_frame_codes(_outputs([list(range(N_CODEBOOKS))]), [])
++    model._dump_frame_codes(_outputs([list(range(N_CODEBOOKS))]), [{"cfg_alpha": 1.3}])
++    assert list(tmp_path.iterdir()) == []
++
++
++def test_missing_env_var_is_not_fatal(tmp_path, monkeypatch):
++    # A request can ask for a dump on a server that was never configured for one;
++    # that must cost a warning, not an exception on every frame.
++    monkeypatch.delenv("VOXTRAL_CODE_DUMP_DIR", raising=False)
++    model = _make_model()
++    model._dump_frame_codes(_outputs([list(range(N_CODEBOOKS))]), [{"voxtral_dump_codes": "x"}])
++    assert list(tmp_path.iterdir()) == []
++
++
++def test_frames_accumulate_in_order(tmp_path, monkeypatch):
++    monkeypatch.setenv("VOXTRAL_CODE_DUMP_DIR", str(tmp_path))
++    model = _make_model()
++    for frame in range(5):
++        model._dump_frame_codes(
++            _outputs([[frame] * N_CODEBOOKS]),
++            [{"voxtral_dump_codes": "utterance"}],
++        )
++    written = _read(tmp_path, "utterance")
++    assert written.shape == (5, N_CODEBOOKS)
++    assert written[:, 0].tolist() == [0, 1, 2, 3, 4]
++
++
++def test_rows_go_to_their_own_tag(tmp_path, monkeypatch):
++    # The property that makes this safe under concurrency: a batch mixes requests,
++    # and each row's codes must follow its own tag rather than its neighbour's.
++    monkeypatch.setenv("VOXTRAL_CODE_DUMP_DIR", str(tmp_path))
++    model = _make_model()
++    for frame in range(3):
++        model._dump_frame_codes(
++            _outputs([[10 + frame] * N_CODEBOOKS, [20 + frame] * N_CODEBOOKS, [30 + frame] * N_CODEBOOKS]),
++            [{"voxtral_dump_codes": "left"}, {"cfg_alpha": 1.2}, {"voxtral_dump_codes": "right"}],
++        )
++    assert _read(tmp_path, "left")[:, 0].tolist() == [10, 11, 12]
++    assert _read(tmp_path, "right")[:, 0].tolist() == [30, 31, 32]
++    assert sorted(path.name for path in tmp_path.iterdir()) == ["left.i16", "right.i16"]
++
++
++def test_tag_cannot_escape_the_dump_directory(tmp_path, monkeypatch):
++    monkeypatch.setenv("VOXTRAL_CODE_DUMP_DIR", str(tmp_path / "dumps"))
++    (tmp_path / "dumps").mkdir()
++    model = _make_model()
++    model._dump_frame_codes(
++        _outputs([list(range(N_CODEBOOKS))]),
++        [{"voxtral_dump_codes": "../escaped"}],
++    )
++    assert not (tmp_path / "escaped.i16").exists()
++    assert [path.name for path in (tmp_path / "dumps").iterdir()] == [".._escaped.i16"]
++
++
++@pytest.mark.parametrize("tag", ["", ".", ".."])
++def test_degenerate_tags_write_nothing(tmp_path, monkeypatch, tag):
++    # A tag that sanitises down to nothing, or to a directory entry that is not a
++    # name, is dropped rather than turned into some arbitrary file.
++    monkeypatch.setenv("VOXTRAL_CODE_DUMP_DIR", str(tmp_path))
++    model = _make_model()
++    model._dump_frame_codes(_outputs([list(range(N_CODEBOOKS))]), [{"voxtral_dump_codes": tag}])
++    assert list(tmp_path.iterdir()) == []
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+index 9f9e812..59a8b3c 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+@@ -1,3 +1,4 @@
++import os
+ from collections.abc import Iterable
+ from dataclasses import replace
+ from functools import cached_property
+@@ -346,6 +347,10 @@ class VoxtralTTSForConditionalGeneration(
+     # order, the same list `_extract_cfg_alpha` already reads.
+     _NOISE_SEED_KEY = "voxtral_noise_seed"
+     _EULER_STEPS_KEY = "voxtral_euler_steps"
++    _DUMP_CODES_KEY = "voxtral_dump_codes"
++    # Set once when a dump is asked for but cannot be written, so a misconfigured
++    # run logs one line rather than one per 12.5 Hz frame.
++    _dump_warned = False
+     # Server-side frame counter (leading underscore: not a client field), stored
+     # beside the request's own seed. This works because the runner hands over the
+     # request's ACTUAL extra_args dict (worker/gpu_model_runner.py::
+@@ -382,6 +387,74 @@ class VoxtralTTSForConditionalGeneration(
+         state = ((state ^ (state >> 27)) * 0x94D049BB133111EB) & cls._MASK64
+         return state ^ (state >> 31)
+ 
++    def _dump_frame_codes(self, multimodal_outputs: dict | None, sampling_extra_args: list[dict] | None) -> None:
++        """Append this decode step's audio codes to a per-request file, on request.
++
++        Local fork, and a data-collection tool rather than a serving feature. The
++        open checkpoint ships no audio encoder, so the only source of real
++        audio <-> codes pairs is this model generating them: stage 0 IS the map
++        from text to on-manifold codes, and the codes it emits here are the same
++        table-space ids (offset by the two special tokens) that a voice prefix
++        carries, so a dump needs no conversion to be usable as a voice.
++
++        Nothing is written unless a request sets ``voxtral_dump_codes`` in its
++        ``extra_params`` to a tag, and the env var ``VOXTRAL_CODE_DUMP_DIR``
++        points somewhere writable. The tag rides the same per-row
++        ``sampling_extra_args`` route as the noise seed, so it is per request and
++        stays correct under concurrency: rows are matched to tags by batch
++        position, exactly as ``_make_frame_noise`` matches them to seeds.
++
++        Frames are appended as raw little-endian int16, one row of
++        ``1 + n_acoustic_codebook`` values per decode step, because appending is
++        the only format that survives a request being cut off, preempted or
++        cancelled mid-utterance. The reader reshapes to ``(-1, n_codebooks)``.
++
++        Parameters
++        ----------
++        multimodal_outputs : dict | None
++            ``{"audio": [ (1, 1, C) tensor per row ]}`` as built by
++            ``compute_mm_logits``, in batch order.
++        sampling_extra_args : list[dict] | None
++            Per-request extra_args dicts in batch order, or None when stage 0's
++            default extra_args are empty (which switches off per-request extras
++            altogether, cfg_alpha included).
++        """
++        if not sampling_extra_args or not multimodal_outputs:
++            return
++        tags = [row.get(self._DUMP_CODES_KEY) if isinstance(row, dict) else None for row in sampling_extra_args]
++        if all(tag is None for tag in tags):
++            return
++
++        directory = os.environ.get("VOXTRAL_CODE_DUMP_DIR")
++        if not directory:
++            if not type(self)._dump_warned:
++                type(self)._dump_warned = True
++                logger.warning(
++                    "%s was requested but VOXTRAL_CODE_DUMP_DIR is unset, so no codes are being written",
++                    self._DUMP_CODES_KEY,
++                )
++            return
++
++        audio = multimodal_outputs.get("audio")
++        if audio is None:
++            return
++        for index, tag in enumerate(tags):
++            if tag is None or index >= len(audio):
++                continue
++            # Only characters that cannot escape the dump directory survive, so a
++            # tag can never name a file outside it.
++            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(tag))[:128]
++            if not safe or safe.strip(".") == "":
++                continue
++            codes = audio[index].reshape(-1).to(torch.int16).cpu().numpy()
++            try:
++                with open(os.path.join(directory, safe + ".i16"), "ab") as handle:
++                    handle.write(codes.tobytes())
++            except OSError as error:
++                if not type(self)._dump_warned:
++                    type(self)._dump_warned = True
++                    logger.warning("could not write %s codes to %s: %s", self._DUMP_CODES_KEY, directory, error)
++
+     def _make_frame_noise(
+         self, input_hidden_states: torch.Tensor, sampling_extra_args: list[dict] | None
+     ) -> torch.Tensor | None:
+@@ -553,6 +626,9 @@ class VoxtralTTSForConditionalGeneration(
+                         input_hidden_states, cfg_alpha=cfg_alpha, noise=noise, n_steps=n_steps
+                     )
+                 hidden_states[logits_index, 0] = fake_eos
++                # Local fork: no-op unless a request asked for a dump. See
++                # _dump_frame_codes.
++                self._dump_frame_codes(multimodal_outputs, sampling_extra_args)
+                 return OmniOutput(
+                     text_hidden_states=hidden_states,
+                     multimodal_outputs=multimodal_outputs,
+-- 
+2.43.0
+

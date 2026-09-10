@@ -156,7 +156,7 @@ TADA_ONLY_KNOBS = (
     "temperature", "top_p", "top_k", "repetition_penalty", "do_sample",
     "num_candidates", "num_steps", "cfg_scale", "noise_temp",
 )
-VOXTRAL_ONLY_KNOBS = ("cfg_alpha", "euler_steps", "noise_seed", "max_new_tokens")
+VOXTRAL_ONLY_KNOBS = ("cfg_alpha", "euler_steps", "noise_seed", "dump_codes", "max_new_tokens")
 
 
 def warn_on_mixed_backend_knobs(args: argparse.Namespace) -> None:
@@ -246,6 +246,7 @@ def build_speech_body(
     cfg_alpha: float | None = None,
     euler_steps: int | None = None,
     noise_seed: int | None = None,
+    dump_codes: str | None = None,
     noise_temp: float | None = None,
     max_new_tokens: int | None = None,
     consent_attestation: str | None = None,
@@ -349,6 +350,15 @@ def build_speech_body(
         patched vllm_omni; stock vllm-omni merges the key, finds no reader, and
         leaves the take unreproducible. Unrelated to `seed` above, which Voxtral
         cannot act on at all.
+    dump_codes : str or None
+        Voxtral: ask the server to append the codes stage 0 emits for THIS
+        request to `<VOXTRAL_CODE_DUMP_DIR>/<tag>.i16`, sent nested in
+        `extra_params` as `voxtral_dump_codes`. A data-collection tool, not a
+        synthesis knob: the audio is unaffected. It exists because the open
+        checkpoint ships no audio encoder, so the model generating its own codes
+        is the only source of real audio/codes pairs to train one on. Needs our
+        patched vllm_omni and the env var set on the service; stock vllm-omni
+        merges the key, finds no reader, and writes nothing.
     noise_temp : float or None
         TADA acoustic noise temperature (server field `noise_temp`, default
         0.9). Env `TADA_NOISE_TEMP`.
@@ -424,6 +434,7 @@ def build_speech_body(
         "cfg_alpha": cfg_alpha,
         "voxtral_euler_steps": euler_steps,
         "voxtral_noise_seed": noise_seed,
+        "voxtral_dump_codes": dump_codes,
     }
     extra_params = {k: v for k, v in extra_params.items() if v is not None}
     if extra_params:
@@ -492,6 +503,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         cfg_alpha=args.cfg_alpha,
         euler_steps=args.euler_steps,
         noise_seed=args.noise_seed,
+        dump_codes=args.dump_codes,
         noise_temp=args.noise_temp,
         max_new_tokens=args.max_new_tokens,
         consent_attestation=args.consent_attestation,
@@ -903,6 +915,13 @@ def main() -> int:
                               "same text plus the same value gives identical audio with no "
                               "restart. The only route to a reproducible Voxtral take; not "
                               "the same as --seed, which Voxtral cannot act on.")
+    voxtral.add_argument("--dump-codes", type=str, default=None, metavar="TAG",
+                         help="Ask the server to append the codes stage 0 emits for THIS "
+                              "request to <VOXTRAL_CODE_DUMP_DIR>/TAG.i16 (raw int16, one "
+                              "row of 37 per 12.5 Hz frame). Does not change the audio: it "
+                              "is how audio/codes training pairs are collected, the open "
+                              "checkpoint having shipped no encoder to produce them. Needs "
+                              "the patched image and the env var set on the service.")
     voxtral.add_argument("--max-new-tokens", type=int, default=None,
                          help="Max audio frames for THIS request, i.e. seconds x 12.5 "
                               "(deploy default 2048 = 163.84 s, server hard cap 4096 = "

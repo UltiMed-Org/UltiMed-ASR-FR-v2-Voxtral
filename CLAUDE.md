@@ -181,8 +181,9 @@ hand-run recipe.)
 - **Per-request fields Voxtral actually honors:** `input`, `voice` (or `ref_audio` for
   cloning), `response_format`, `speed` (post-processing playback rate, non-streaming
   only), `max_new_tokens` (see the length section below), and `extra_params`, which is
-  how `cfg_alpha`, `voxtral_noise_seed` and `voxtral_euler_steps` travel (`tts.py
-  --cfg-alpha / --noise-seed / --euler-steps`; the last two need the fork). Our fork also
+  how `cfg_alpha`, `voxtral_noise_seed`, `voxtral_euler_steps` and `voxtral_dump_codes`
+  travel (`tts.py --cfg-alpha / --noise-seed / --euler-steps / --dump-codes`; all but
+  the first need the fork). Our fork also
   accepts `cfg_alpha`, `euler_steps`, `acoustic_temperature` and `seed` as flat fields,
   but `tts.py` deliberately uses `extra_params` because that route also works against a
   stock server. It **ignores** `instructions`, `language` and `task_type`: those
@@ -367,6 +368,19 @@ hand-run recipe.)
     is. **Compose runs 6144**: 4096 frames plus ~2048 tokens of prompt room, because
     leaving it at 4096 alongside `max_tokens=4096` would make the last frames unreachable
     (the entrypoint warns when `max_tokens >= max_model_len`).
+  - `VOXTRAL_CODE_DUMP_DIR` -> where the **fork** appends the codes stage 0 emits for any
+    request carrying `voxtral_dump_codes` (`./tts.py --dump-codes TAG` writes
+    `<dir>/TAG.i16`: raw int16, one row of 37 per 12.5 Hz frame, appended so a cancelled
+    request still leaves usable frames). Compose sets `/cache/cloning/dumps`. Unlike the
+    knobs above this is **not** read by `entrypoint.sh` and does not appear in its boot
+    line: the model file reads it directly, so an unpatched image ignores it silently.
+    Nothing is written unless a request asks, and the audio is byte-identical either way.
+    It exists because the open checkpoint ships **no audio encoder**, which makes stage 0
+    the only thing that can produce real audio/codes pairs: it *is* the text ->
+    on-manifold-codes map, and what it emits is the same table-space ids a voice prefix
+    carries. That is the input to `voxtral/cloning/train_encoder.py` (plan stage B6),
+    whose hard limit was that the 20 shipped voices are only 2823 frames covering 13% of
+    the 8192 semantic codes.
   - `HF_TOKEN` (if the HF repo is gated), `VLLM_EXTRA_ARGS` (extra `vllm serve` flags).
     Weights (~9GB) download into the mounted `./cache` via `HF_HOME`.
 - **Status:** upgraded to the prebuilt `vllm/vllm-omni:v0.22.0` image and the 0.22 deploy
