@@ -427,17 +427,19 @@ def cli() -> None:
               help="Weight of the semantic commitment term (0 disables).")
 @click.option("--wave-weight", default=1.0, show_default=True, help="Weight of the waveform L1 term (0 disables).")
 @click.option("--seed", default=0, show_default=True, help="Seed for the initial codebook rows.")
-@click.option("--init", "init_mode", type=click.Choice(["random", "truth", "centre"]),
+@click.option("--init", "init_mode", type=click.Choice(["random", "truth", "centre", "encoder"]),
               default="random", show_default=True,
-              help="Start from random codebook rows, from the truth plus noise, or from the "
-                   "codebook's centre plus noise.")
+              help="Start from random codebook rows, from the truth plus noise, from the "
+                   "codebook's centre plus noise, or from the trained encoder's prediction.")
+@click.option("--encoder", "encoder_path", default=None,
+              help="Checkpoint for --init encoder (default: cache/cloning/B6/encoder.pt).")
 @click.option("--init-noise", default=0.1, show_default=True,
               help="Relative noise added to the truth when --init truth.")
 @click.option("--device", default="cpu", show_default=True, help="Where to run.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
 def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_semantic: float,
         lr_acoustic: float, commit_weight: float, wave_weight: float, seed: int, init_mode: str,
-        init_noise: float, device: str, out_dir: str) -> None:
+        init_noise: float, device: str, encoder_path: str | None, out_dir: str) -> None:
     """Recover codes from a waveform and score them against the truth."""
     model = load_decoder(find_snapshot(), device=device)
     sample_rate = int(model.sampling_rate)
@@ -445,6 +447,45 @@ def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_s
     logger.info(f"{voice}: {frames} frames, target {target.numel() / sample_rate:.2f} s")
 
     init = None
+    if init_mode == "encoder":
+        # Imported here rather than at module scope because train_encoder imports
+        # quantize_emb from this file; a top-level import either way would be circular.
+        from train_encoder import OUT_DIR as ENCODER_DIR, FrameEncoder
+
+        checkpoint = torch.load(encoder_path or (ENCODER_DIR / "encoder.pt"),
+                                map_location=device, weights_only=False)
+        encoder = FrameEncoder(semantic_codebook=model.quantizer.semantic_codebook.embedding,
+                               acoustic_dim=model.quantizer.acoustic_codebook.dim,
+                               n_levels=model.quantizer.acoustic_codebook.n_levels).to(device)
+        encoder.load_state_dict(checkpoint["state_dict"])
+        encoder.eval()
+        if checkpoint.get("holdout") == voice:
+            logger.info(f"encoder was trained with {voice} held out, so this is an honest test")
+        else:
+            logger.warning(f"encoder held out {checkpoint.get('holdout')!r}, not {voice!r}: "
+                           "this voice was in its training set, treat the score as optimistic")
+        with torch.no_grad():
+            semantic_logits, acoustic_logits = encoder(target[None], frames)
+        # The seed must be a *code*, not the encoder's soft opinion about one: B3 found
+        # descent helpless anywhere between codebook rows, and averaging the top few rows
+        # would land exactly there. So take the argmax and hand descent a point that is
+        # already on the manifold, which is the whole reason the heads are classifiers.
+        predicted = torch.cat([semantic_logits[0].argmax(dim=-1)[None],
+                               acoustic_logits[0].argmax(dim=-1).transpose(0, 1)], dim=0)
+        with torch.no_grad():
+            init = model.quantizer.decode(predicted[None])[0].transpose(0, 1)
+        # Reported before the search runs, because it says whether the search is even
+        # being given the ~1 sigma B3 requires: seeding cannot rescue a bad encoder.
+        truth_device = truth.to(predicted.device)
+        top1 = (predicted[0] == truth_device[0]).float().mean().item()
+        rank = (semantic_logits[0] > semantic_logits[0].gather(
+            1, truth_device[0][:, None])).sum(dim=-1)
+        exact_acoustic = (predicted[1:] == truth_device[1:]).float().mean().item()
+        within1 = ((predicted[1:] - truth_device[1:]).abs() <= 1).float().mean().item()
+        logger.info(f"encoder seed: semantic top1 {100 * top1:5.1f}%  "
+                    f"top16 {100 * (rank < 16).float().mean().item():5.1f}%  "
+                    f"median rank {rank.median().item():.0f}  "
+                    f"acoustic exact {100 * exact_acoustic:5.1f}% within1 {100 * within1:5.1f}%")
     if init_mode == "centre":
         # A random codebook row is a valid code, which means it is the bottom of its own
         # basin and descent has no reason to leave it. The codebook's centre is not a

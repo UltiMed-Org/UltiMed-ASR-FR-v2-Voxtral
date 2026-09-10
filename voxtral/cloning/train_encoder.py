@@ -26,6 +26,16 @@ What it predicts
 The codes, as classification: one 8192-way softmax for the semantic code and 36
 21-way softmaxes for the acoustic levels.
 
+The semantic softmax is not a free 8192-way linear layer, though that was tried first
+and stalls just below the uniform-guess loss (30 percent top-16 and no further). A free
+layer has to discover from scratch what the codebook already states: the 8192 classes
+are points in a 256-dim space, neighbours in it sound nearly alike, and the decoder is
+smooth between them. So the head instead emits a 256-dim vector and the logits are
+minus its squared distance to each real codebook row. Learning then only has to place a
+point near the right region rather than pick a label out of 8192 unrelated ones, a
+near miss is a nearby-sounding row instead of an arbitrary one, and the argmax is still
+exactly a code, which is what the seeding in `invert.py` needs.
+
 Regressing the decoder's continuous 292-dim input instead is the obvious first idea and
 it was tried first. It trains well, reaching 0.54 sigma from the truth on a held-out
 voice, comfortably inside the band where B3 says descent recovers 75 to 100 percent of
@@ -77,6 +87,7 @@ OUT_DIR = REPO_ROOT / "cache" / "cloning" / "B6"
 # 1920 = 4 * 4 * 4 * 5 * 3 * 2, the decoder's samples per 12.5 Hz frame. The encoder
 # walks that back down in the same number of stages.
 STRIDES = (4, 4, 4, 5, 3, 2)
+SAMPLES_PER_FRAME = 1920
 CHANNELS = (32, 64, 128, 256, 384, 512)
 CONTEXT_LAYERS = 4
 
@@ -92,7 +103,7 @@ class FrameEncoder(nn.Module):
     is causal, unlike the decoder, since this network only ever analyses complete audio.
     """
 
-    def __init__(self, semantic_size: int = 8192, acoustic_dim: int = 36,
+    def __init__(self, semantic_codebook: torch.Tensor, acoustic_dim: int = 36,
                  n_levels: int = 21) -> None:
         super().__init__()
         layers: list[nn.Module] = []
@@ -121,7 +132,18 @@ class FrameEncoder(nn.Module):
         self.across_frames = nn.Sequential(*context)
         self.acoustic_dim = acoustic_dim
         self.n_levels = n_levels
-        self.semantic_head = nn.Conv1d(in_channels, semantic_size, kernel_size=1)
+        # Standardised per dimension so squared distances are O(semantic_dim) whatever the
+        # codebook's raw scale (its rows have norm ~145), which keeps the learned
+        # temperature near its initialisation instead of having to absorb that scale.
+        codebook = semantic_codebook.float()
+        self.register_buffer("codebook_mean", codebook.mean(dim=0))
+        self.register_buffer("codebook_std", codebook.std(dim=0) + 1e-6)
+        self.register_buffer("codebook", (codebook - codebook.mean(dim=0))
+                             / (codebook.std(dim=0) + 1e-6))
+        self.semantic_head = nn.Conv1d(in_channels, codebook.shape[1], kernel_size=1)
+        # Divided by the dimension at use, so 0 here means "distances of the size a
+        # random pair of rows has" map to logits of order 1.
+        self.log_temperature = nn.Parameter(torch.zeros(()))
         self.acoustic_head = nn.Conv1d(in_channels, acoustic_dim * n_levels, kernel_size=1)
 
     def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
@@ -151,7 +173,10 @@ class FrameEncoder(nn.Module):
                 x = x[..., :length]
         x = x.reshape(batch, frames, -1).transpose(1, 2)
         x = self.across_frames(x)
-        semantic = self.semantic_head(x).transpose(1, 2)
+        point = self.semantic_head(x).transpose(1, 2)
+        distance = torch.cdist(point.reshape(batch * frames, -1), self.codebook).pow(2)
+        semantic = (-distance * self.log_temperature.exp() / self.codebook.shape[1]
+                    ).reshape(batch, frames, -1)
         acoustic = self.acoustic_head(x).transpose(1, 2)
         return semantic, acoustic.reshape(batch, frames, self.acoustic_dim, self.n_levels)
 
@@ -272,6 +297,8 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tenso
 @click.option("--steps", default=4000, show_default=True, help="Adam steps.")
 @click.option("--batch", default=16, show_default=True, help="Clips per step.")
 @click.option("--frames", default=32, show_default=True, help="Frames per clip.")
+@click.option("--buffer", default=4096, show_default=True, help="Clips held in the replay buffer.")
+@click.option("--refresh", default=8, show_default=True, help="Clips decoded fresh each step.")
 @click.option("--lr", default=3e-4, show_default=True, help="Adam learning rate.")
 @click.option("--contiguous", default=0.2, show_default=True,
               help="Fraction of clips drawn as real contiguous runs.")
@@ -281,8 +308,9 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tenso
 @click.option("--device", default="cuda", show_default=True, help="Where to run.")
 @click.option("--seed", default=0, show_default=True, help="Seed for the data draw.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write the weights.")
-def main(steps: int, batch: int, frames: int, lr: float, contiguous: float,
-         random_fraction: float, holdout: str, device: str, seed: int, out_dir: str) -> None:
+def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: float,
+         contiguous: float, random_fraction: float, holdout: str, device: str, seed: int,
+         out_dir: str) -> None:
     """Train the audio -> decoder-input encoder on decoder-generated pairs."""
     decoder = load_decoder(find_snapshot(), device=device)
     for param in decoder.parameters():
@@ -294,8 +322,9 @@ def main(steps: int, batch: int, frames: int, lr: float, contiguous: float,
     logger.info(f"{len(voices)} training voices, {pool.shape[1]} frames, holding out {holdout}")
 
     n_levels = decoder.quantizer.acoustic_codebook.n_levels
-    semantic_size = decoder.quantizer.semantic_codebook.embedding.shape[0]
-    model = FrameEncoder(semantic_size=semantic_size,
+    semantic_codebook = decoder.quantizer.semantic_codebook.embedding
+    semantic_size = semantic_codebook.shape[0]
+    model = FrameEncoder(semantic_codebook=semantic_codebook,
                          acoustic_dim=decoder.quantizer.acoustic_codebook.dim,
                          n_levels=n_levels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -303,11 +332,36 @@ def main(steps: int, batch: int, frames: int, lr: float, contiguous: float,
     generator = torch.Generator(device=device).manual_seed(seed)
     held = codes_from_table_space(np.load(CODES_DIR / f"{holdout}.npy")).to(device)[None]
 
-    for step in range(steps):
-        codes = sample_codes(voices, pool, batch, frames, contiguous, random_fraction,
+    # Decoding a fresh batch every step makes the *decoder* the cost of training (0.57 s a
+    # step at batch 64, where the encoder's own forward and backward are a fraction of
+    # that), which is absurd when the data is free in principle. So clips live in a replay
+    # buffer and only `refresh` of them are decoded per step: each clip is then seen about
+    # `batch * buffer / (refresh * buffer) = batch / refresh` times over its life, which
+    # is far from the repetition that made the real-frames-only run memorise, while the
+    # decoder does a fraction of the work.
+    buffer_waveform = torch.empty(buffer, frames * SAMPLES_PER_FRAME, dtype=torch.float16,
+                                  device=device)
+    buffer_codes = torch.empty(buffer, pool.shape[0], frames, dtype=torch.long, device=device)
+
+    def refill(slots: torch.Tensor) -> None:
+        """Decode fresh clips into the given buffer slots."""
+        fresh = sample_codes(voices, pool, len(slots), frames, contiguous, random_fraction,
                              semantic_size, n_levels, generator)
         with torch.no_grad():
-            waveform = decoder.decode(codes)[:, 0]
+            buffer_waveform[slots] = decoder.decode(fresh)[:, 0].half()
+        buffer_codes[slots] = fresh
+
+    logger.info(f"filling the {buffer}-clip replay buffer")
+    for start in range(0, buffer, batch):
+        refill(torch.arange(start, min(start + batch, buffer), device=device))
+
+    for step in range(steps):
+        # The refreshed slots march through the buffer rather than being drawn at random,
+        # so every clip has the same lifetime and none can linger.
+        first = (step * refresh) % buffer
+        refill((torch.arange(refresh, device=device) + first) % buffer)
+        drawn = torch.randint(buffer, (batch,), generator=generator, device=device)
+        waveform, codes = buffer_waveform[drawn].float(), buffer_codes[drawn]
         semantic, acoustic = model(waveform, frames)
         # Cross-entropy on both halves. The acoustic one is a plain 21-way choice per
         # dimension rather than a regression for the same reason as the semantic one:
