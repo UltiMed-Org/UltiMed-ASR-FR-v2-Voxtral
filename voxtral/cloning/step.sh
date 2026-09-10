@@ -492,6 +492,18 @@ stage_b7() {
     fi
     rm -f "$dump"
 
+    # The check above proves a dump appeared with the right shape. It does NOT prove
+    # the codes in it are the ones that made that audio: a dump written from the
+    # wrong tensor, off by a frame, or in the wrong code space would pass it and then
+    # poison every hour of collection that follows, silently, because wrong codes are
+    # still valid codes. This decodes one dump locally and compares waveforms.
+    say "round trip: are the dumped codes really the codes behind the audio?"
+    if ! ./voxtral/cloning/verify_dump.py --voice fr_male; then
+        fail "the dump does not reproduce the server's audio"
+        warn "collecting with it would produce valid-looking, wrong training data"
+        exit 1
+    fi
+
     say "generating ${minutes} minutes of speech across 19 voices (holding out fr_female)"
     say "this is the long part; watch the seconds-per-call line to judge the rate"
     ./voxtral/cloning/mint_codes.py mint --minutes "$minutes"
