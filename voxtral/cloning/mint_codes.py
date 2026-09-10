@@ -49,6 +49,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -67,6 +69,12 @@ CORPUS_DIR = REPO_ROOT / "cache" / "cloning" / "corpus"
 # Host side of the container's VOXTRAL_CODE_DUMP_DIR (compose mounts ./cache at /cache).
 DUMP_DIR = REPO_ROOT / "cache" / "cloning" / "dumps"
 CODES_DIR = REPO_ROOT / "cache" / "cloning" / "codes"
+
+# Wikipedia asks API clients to identify themselves. Deliberately no contact
+# address: this is a local data-collection run, not a service worth mailing about.
+USER_AGENT = "CrispASR-cloning/1.0 (local Voxtral TTS encoder training)"
+# Seconds between article batches, and the base of the retry backoff.
+BASE_DELAY = 1.0
 
 # 1 semantic + 36 acoustic, the width of one stage-0 frame.
 N_CODEBOOKS = 37
@@ -106,6 +114,11 @@ def fetch_articles(language: str, articles: int) -> list[str]:
     -------
     list[str]
         Plain-text extracts, empty ones dropped.
+
+    Raises
+    ------
+    OSError
+        If a batch keeps failing after the retries below.
     """
     out: list[str] = []
     while len(out) < articles:
@@ -115,9 +128,26 @@ def fetch_articles(language: str, articles: int) -> list[str]:
             "exintro": 1, "exlimit": "max", "format": "json",
         })
         url = f"https://{language}.wikipedia.org/w/api.php?{query}"
-        request = urllib.request.Request(url, headers={"User-Agent": "CrispASR-cloning/1.0"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            pages = json.load(response).get("query", {}).get("pages", {})
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        # Wikipedia rate-limits bursts with 429, which is expected here rather than
+        # exceptional: hundreds of articles is dozens of batches back to back. Back
+        # off and retry instead of losing the language.
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    pages = json.load(response).get("query", {}).get("pages", {})
+                break
+            except urllib.error.HTTPError as error:
+                if error.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                    raise
+                delay = BASE_DELAY * 2 ** attempt
+                logger.debug(f"{language}: HTTP {error.code}, retrying in {delay:.1f}s")
+                time.sleep(delay)
+        else:  # pragma: no cover - the loop always breaks or raises
+            break
+        # Courtesy pause between batches, which is also what keeps the retries above
+        # from being needed on every one.
+        time.sleep(BASE_DELAY)
         batch = [page.get("extract", "").strip() for page in pages.values()]
         out.extend(text for text in batch if text)
         if not batch:

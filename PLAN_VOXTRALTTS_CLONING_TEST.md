@@ -2,7 +2,7 @@
 
 **STATUS:** B6 hit a data wall, not a method wall. The encoder B3 asked for trains fine and there is nothing to train it on: the 20 shipped voices are 2823 frames (~4 min) covering 13 pct of the 8192 semantic codes, so the network reaches 94 pct train and 2 pct held-out. Uniform random codes were measured to teach nothing (0.2 pct on the training batch itself), so the decoder's freeness cannot be spent that way.
 
-**NEXT ACTION:** mint real code sequences from the server's own stage 0. Patch the fork to dump the codes it emits alongside the audio, bring `voxtral-tts` back up, generate an hour or so of speech over varied text and all 20 voices (one 163 s call is 2048 frames, most of a shipped voice), then retrain B6 on that. Needs the GPU, which the container and the training take in turn.
+**NEXT ACTION:** B7, and it needs a human for one command: `sudo docker compose up -d --build voxtral-tts` (this agent has no sudo password). The **--build is required**, not optional: the Dockerfile COPYs the fork in, so an older image accepts `voxtral_dump_codes` and silently writes nothing. Then `./voxtral/cloning/mint_codes.py mint --minutes 240`, retrain, and compare held-out top-16 against B6's 14 pct.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -346,6 +346,22 @@ Estimated: 3 to 4 h. Actual: 4 h, four dead ends, one hard limit.
 
 **TODO:** the fork patch to dump stage 0 codes does not exist yet.
 
+### [ ] B7. Mint real code sequences from stage 0, then retrain B6
+
+B6's wall was data, and the generator was the server all along: stage 0 is an AR LLM whose whole job is text -> on-manifold codes in any of the 20 voices, and what it emits is the same table-space ids a voice prefix carries. Fork patch **0007** (`voxtral_tts.py::_dump_frame_codes`) makes it append those codes to `<VOXTRAL_CODE_DUMP_DIR>/<tag>.i16` for any request carrying `voxtral_dump_codes`, riding the same per-row `sampling_extra_args` route as the noise seed, so it is per request and stays correct under concurrency. Nothing is written unless a request asks and the audio is byte-identical either way. `tts.py --dump-codes TAG` is the client end; compose sets the dir to `/cache/cloning/dumps`.
+
+`voxtral/cloning/mint_codes.py` drives it: `corpus` fetches random Wikipedia article intros in the language each voice actually speaks (random topics on purpose, since semantic-code coverage follows phonetic variety and an encyclopedia wanders further than a novel), `mint` sends them across all 19 non-holdout voices and collects the dumps into `cache/cloning/codes/m_<voice>_<n>.npy`, which `train_encoder.py` already reads. The audio is deliberately not kept: the trainer decodes the codes locally to get exactly the audio they stand for. `load_pool` now treats the holdout as a voice rather than a filename, so minted utterances of it cannot quietly make the honest test dishonest.
+
+Written and statically checked; **not yet run against a live server**, since `sudo docker` needs a password this agent does not have. The build is required, not optional: `voxtral/Dockerfile` COPYs the fork in, so an image built before patch 0007 accepts `voxtral_dump_codes` and writes nothing.
+
+Steps: (1) `sudo docker compose up -d --build voxtral-tts`; (2) `./voxtral/cloning/mint_codes.py mint --minutes 240`; (3) retrain and compare held-out top-1/top-16 against B6's 2 pct / 14 pct; (4) if the encoder ranks the truth usefully, `invert.py run --init encoder` on `fr_female` and read the recovery.
+
+Acceptance: held-out semantic top-16 well clear of B6's 14 pct, and `--init encoder` recovering a materially larger fraction of codes than any cold start (which is 0 pct). Note the target may be lower than it looks: B3 found the true semantic code is a unique, sharp argmin **once the acoustics are right**, so a good acoustic prediction plus a per-frame search over the 8192 rows is a second route that does not need the semantic head to win outright.
+
+Estimated: 1 h of generation plus 2 to 3 h of training.
+
+**Result:**
+
 ### [ ] B4. A real clip becomes a voice
 
 Pick one clean French reference clip (8 to 20 s, single speaker, no music, no clipping, resampled to 24 kHz mono). Run `invert.py` on it, embed the codes with the B1 machinery, register with `voices_tool.py add`, restart, synthesize.
@@ -403,3 +419,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-10 | B3 | Codes are identifiable (true semantic code is the unique argmin by 400x, with or without history) but not findable: the semantic and acoustic halves of a frame block each other, rank 1 -> rank 241 when one frame's acoustics move to a search's starting value. Gradient AbS at chance on semantic, 70.9 pct within 1 on acoustic. Two GPU-shaped continuations proposed. | user picks a continuation |
 | 2026-09-10 | B3 GPU | Fixed a wrong semantic learning rate (1.0 -> 0.05), which widened the measured basin to 100 pct at 0.3 sigma and 50 pct at 1.0 sigma. Cold starts still fail everywhere: random codebook row, codebook centre, 256 restarts, shortlist-then-fit (no fitter gets within 400x of the floor). Conclusion: inversion needs an approximate encoder to seed it, and one can be distilled from the decoder. | train that encoder |
 | 2026-09-10 | B6 | Encoder trains, data does not exist. Four dead ends: regression to 0.54 sigma recovers 0 pct (the mean of codes is not a code); uniform random codes give 0.2 pct on the training batch itself (inverting dense noise generalises like inverting a hash); a codebook-geometry head is worse than a free one (flat logits, flat gradient); real data gives 94 pct train and 2 pct held out because 20 voices are 2823 frames covering 13 pct of the 8192 semantic codes. | mint real codes from stage 0 |
+| 2026-09-10 | B7 built | Fork patch 0007 dumps stage-0 codes per request (tag in extra_params, same route as the noise seed, correct under concurrency); tts.py --dump-codes, VOXTRAL_CODE_DUMP_DIR in compose, mint_codes.py to drive it, unit tests for the dump. Not yet run: needs `sudo docker compose up -d --build voxtral-tts`, which needs a password. | generate and retrain |
