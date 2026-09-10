@@ -53,7 +53,22 @@ require_sudo() {
     # a password prompt hidden behind the tee.
     say "sudo access"
     sudo -v
-    ok "sudo ready"
+
+    # Then KEEP it alive. Prompting up front is not enough on its own: sudo's
+    # credential timestamp expires after ~15 minutes, and B7 spends 45 of them
+    # generating before it needs sudo again to stop the container. The second
+    # prompt then lands with its output swallowed by the `exec > >(tee ...)`
+    # above, so the pane just sits there with no prompt, looking wedged, holding
+    # the GPU. That happened on the 2026-09-10 run. Refresh every 60s instead,
+    # and stop when this script does.
+    while true; do
+        sudo -n true 2>/dev/null || true
+        sleep 60
+        kill -0 "$$" 2>/dev/null || exit
+    done &
+    SUDO_KEEPALIVE=$!
+    trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null || true' EXIT
+    ok "sudo ready (refreshed every 60s for the life of this run)"
 }
 
 check_port_clash() {

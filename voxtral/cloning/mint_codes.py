@@ -214,7 +214,7 @@ def utterances(texts: list[str], max_chars: int) -> list[str]:
     return out
 
 
-def collect_dumps(dump_dir: Path, codes_dir: Path) -> tuple[int, int]:
+def collect_dumps(dump_dir: Path, codes_dir: Path, tags: list[str] | None = None) -> tuple[int, int]:
     """Turn raw `.i16` dumps into the `[T, 37]` npy files the trainer reads.
 
     A dump whose length is not a whole number of frames is truncated rather than
@@ -227,6 +227,11 @@ def collect_dumps(dump_dir: Path, codes_dir: Path) -> tuple[int, int]:
         Where the server appended `<tag>.i16`.
     codes_dir : Path
         Where `train_encoder.py` looks for `*.npy`.
+    tags : list[str] | None
+        Collect only these tags. Necessary because the server writes every dump to
+        its own VOXTRAL_CODE_DUMP_DIR whatever the client asks, so one directory
+        holds every run's output: a test set minted for the held-out voice sits in
+        the same place as the training material, and globbing would sweep it in.
 
     Returns
     -------
@@ -235,7 +240,11 @@ def collect_dumps(dump_dir: Path, codes_dir: Path) -> tuple[int, int]:
     """
     codes_dir.mkdir(parents=True, exist_ok=True)
     files = frames = 0
-    for path in sorted(dump_dir.glob("*.i16")):
+    paths = [dump_dir / f"{tag}.i16" for tag in tags] if tags is not None else sorted(dump_dir.glob("*.i16"))
+    for path in paths:
+        if not path.exists():
+            logger.warning(f"{path.name}: no dump, the request produced no codes")
+            continue
         raw = np.fromfile(path, dtype="<i2")
         usable = raw.size - raw.size % N_CODEBOOKS
         if usable == 0:
@@ -302,7 +311,9 @@ def corpus(articles: int, languages: tuple[str, ...], delay: float, out_dir: str
 @click.option("--timeout", default=600.0, show_default=True, help="Seconds per request.")
 @click.option("--corpus-dir", default=str(CORPUS_DIR), show_default=True, help="Where the text is.")
 @click.option("--dump-dir", default=str(DUMP_DIR), show_default=True,
-              help="Host side of the container's VOXTRAL_CODE_DUMP_DIR.")
+              help="Host side of the container's VOXTRAL_CODE_DUMP_DIR. This must MATCH the "
+                   "service's setting: the server writes where its own env var says, so pointing "
+                   "this elsewhere finds nothing rather than redirecting anything.")
 @click.option("--codes-dir", default=str(CODES_DIR), show_default=True, help="Where to collect the codes.")
 def mint(minutes: float, url: str, max_chars: int, concurrency: int, holdout: str,
          only_voices: tuple[str, ...], timeout: float, corpus_dir: str, dump_dir: str,
@@ -381,7 +392,9 @@ def mint(minutes: float, url: str, max_chars: int, concurrency: int, holdout: st
         list(pool_executor.map(run, jobs))
     logger.info(f"generation finished: {done['ok']} ok, {done['failed']} failed")
 
-    files, frames = collect_dumps(destination, Path(codes_dir))
+    # Only this run's tags: the dump directory accumulates every run, including test
+    # sets minted for the held-out voice, and a glob would sweep those into training.
+    files, frames = collect_dumps(destination, Path(codes_dir), tags=[job[0] for job in jobs])
     logger.success(f"collected {files} files, {frames} frames "
                    f"({frames / 12.5 / 60:.1f} min of speech) into {codes_dir}")
 
