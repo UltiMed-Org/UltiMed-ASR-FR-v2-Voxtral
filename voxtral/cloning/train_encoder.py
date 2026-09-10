@@ -26,15 +26,14 @@ What it predicts
 The codes, as classification: one 8192-way softmax for the semantic code and 36
 21-way softmaxes for the acoustic levels.
 
-The semantic softmax is not a free 8192-way linear layer, though that was tried first
-and stalls just below the uniform-guess loss (30 percent top-16 and no further). A free
-layer has to discover from scratch what the codebook already states: the 8192 classes
-are points in a 256-dim space, neighbours in it sound nearly alike, and the decoder is
-smooth between them. So the head instead emits a 256-dim vector and the logits are
-minus its squared distance to each real codebook row. Learning then only has to place a
-point near the right region rather than pick a label out of 8192 unrelated ones, a
-near miss is a nearby-sounding row instead of an arbitrary one, and the argmax is still
-exactly a code, which is what the seeding in `invert.py` needs.
+The semantic head is a plain 8192-way linear layer. Replacing it with the codebook's own
+geometry (emit a 256-dim point, logits = minus its squared distance to each real row) is
+an appealing idea, since neighbouring rows do sound alike, and it was tried and is
+**worse**: 4 percent top-16 after 1200 steps against the free layer's 30 percent after
+200. The reason is flatness. Standardised rows sit about 22 apart, so the squared
+distances that separate two candidates differ by an amount that maps to logits of order
+one, the softmax stays near uniform and the gradient stays tiny, whereas a free layer
+sets its own scale from the first step.
 
 Regressing the decoder's continuous 292-dim input instead is the obvious first idea and
 it was tried first. It trains well, reaching 0.54 sigma from the truth on a held-out
@@ -53,12 +52,23 @@ of them, which is nowhere near enough: trained on those alone the network drives
 training loss down and still scores about 10 percent top-16 on a held-out voice, i.e.
 it memorises the frames it was shown. But realism is not required here. The decoder is
 the same deterministic function at every point of the code space, so codes can simply
-be drawn uniformly and the pair is still exact. Clips therefore come three ways, in
-tunable proportions: uniformly random codes, which give unlimited genuinely new
-material and are the cure for that memorisation; frames resampled from the real pool,
-which keep the real marginal statistics; and contiguous runs from one voice, which are
-the only source of real temporal structure. One voice is held out entirely so the
-acceptance test is honest.
+be drawn anywhere and the pair is still exact.
+
+Uniformly random codes are the obvious way to exploit that and they are **useless**:
+the network reaches 0.2 percent semantic top-1 on the very batch it just trained on,
+i.e. it does not learn the training task at all, let alone transfer it. That is not a
+capacity problem (the same network fits 32 fixed frames to 100 percent on both heads).
+It is that uniform codes put 37 independent dimensions of noise into every frame, and
+inverting dense noise is close to inverting a hash: nothing generalises from one draw
+to the next. Real speech codes lie on a thin manifold where the mapping is smooth, and
+that is the only place the encoder is ever asked to work.
+
+So clips are drawn near the real material rather than anywhere: contiguous runs from
+one voice, which carry real temporal structure; frames resampled from the whole pool,
+which keep the real marginal statistics; and jittered runs, real frames whose acoustic
+levels are nudged by a few steps, which stay speech-like while giving unlimited
+distinct labels and are the answer to the 2920-frame shortage. One voice is held out
+entirely so the acceptance test is honest.
 
 Usage
 -----
@@ -132,18 +142,7 @@ class FrameEncoder(nn.Module):
         self.across_frames = nn.Sequential(*context)
         self.acoustic_dim = acoustic_dim
         self.n_levels = n_levels
-        # Standardised per dimension so squared distances are O(semantic_dim) whatever the
-        # codebook's raw scale (its rows have norm ~145), which keeps the learned
-        # temperature near its initialisation instead of having to absorb that scale.
-        codebook = semantic_codebook.float()
-        self.register_buffer("codebook_mean", codebook.mean(dim=0))
-        self.register_buffer("codebook_std", codebook.std(dim=0) + 1e-6)
-        self.register_buffer("codebook", (codebook - codebook.mean(dim=0))
-                             / (codebook.std(dim=0) + 1e-6))
-        self.semantic_head = nn.Conv1d(in_channels, codebook.shape[1], kernel_size=1)
-        # Divided by the dimension at use, so 0 here means "distances of the size a
-        # random pair of rows has" map to logits of order 1.
-        self.log_temperature = nn.Parameter(torch.zeros(()))
+        self.semantic_head = nn.Conv1d(in_channels, semantic_codebook.shape[0], kernel_size=1)
         self.acoustic_head = nn.Conv1d(in_channels, acoustic_dim * n_levels, kernel_size=1)
 
     def forward(self, waveform: torch.Tensor, frames: int) -> torch.Tensor:
@@ -173,10 +172,7 @@ class FrameEncoder(nn.Module):
                 x = x[..., :length]
         x = x.reshape(batch, frames, -1).transpose(1, 2)
         x = self.across_frames(x)
-        point = self.semantic_head(x).transpose(1, 2)
-        distance = torch.cdist(point.reshape(batch * frames, -1), self.codebook).pow(2)
-        semantic = (-distance * self.log_temperature.exp() / self.codebook.shape[1]
-                    ).reshape(batch, frames, -1)
+        semantic = self.semantic_head(x).transpose(1, 2)
         acoustic = self.acoustic_head(x).transpose(1, 2)
         return semantic, acoustic.reshape(batch, frames, self.acoustic_dim, self.n_levels)
 
@@ -206,7 +202,8 @@ def load_pool(holdout: str) -> tuple[list[torch.Tensor], torch.Tensor]:
 
 
 def sample_codes(voices: list[torch.Tensor], pool: torch.Tensor, batch: int, frames: int,
-                 contiguous: float, random: float, semantic_size: int, n_levels: int,
+                 contiguous: float, random: float, jitter: float, jitter_levels: int,
+                 semantic_size: int, n_levels: int,
                  generator: torch.Generator) -> torch.Tensor:
     """Draw a batch of code sequences.
 
@@ -223,8 +220,14 @@ def sample_codes(voices: list[torch.Tensor], pool: torch.Tensor, batch: int, fra
     contiguous : float
         Fraction drawn as a real contiguous run.
     random : float
-        Fraction drawn uniformly from the whole code space. Whatever is left over after
-        this and `contiguous` is resampled frame-by-frame from the real pool.
+        Fraction drawn uniformly from the whole code space. Kept because it is the clean
+        way to sample the decoder's whole domain, but measured to teach the network
+        nothing, so it defaults to zero: see the module docstring.
+    jitter : float
+        Fraction drawn as a contiguous run whose acoustic levels are then nudged. Whatever
+        is left over after the three is resampled frame-by-frame from the real pool.
+    jitter_levels : int
+        How far a jittered acoustic level may move, in grid steps.
     semantic_size : int
         Semantic codebook size, the range of the uniform semantic draw.
     n_levels : int
@@ -251,7 +254,25 @@ def sample_codes(voices: list[torch.Tensor], pool: torch.Tensor, batch: int, fra
                                      device=pool.device)
             out.append(torch.cat([semantic, acoustic], dim=0))
             continue
-        if roll < random + contiguous:
+        if roll < random + jitter:
+            # A real run, then acoustic levels nudged a step or two. The semantic code is
+            # left alone: it selects one of 8192 rows with no ordering, so "nearby" is not
+            # defined for it and any change is a jump to unrelated audio.
+            start = int(torch.randint(len(voices), (), generator=generator,
+                                      device=pool.device))
+            voice = voices[start]
+            offset = int(torch.randint(max(1, voice.shape[1] - frames), (),
+                                       generator=generator, device=pool.device))
+            clip = voice[:, offset:offset + frames].clone()
+            if clip.shape[1] < frames:
+                clip = pool[:, torch.randint(pool.shape[1], (frames,), generator=generator,
+                                             device=pool.device)]
+            nudge = torch.randint(-jitter_levels, jitter_levels + 1, clip[1:].shape,
+                                  generator=generator, device=pool.device)
+            clip[1:] = (clip[1:] + nudge).clamp(0, n_levels - 1)
+            out.append(clip)
+            continue
+        if roll < random + jitter + contiguous:
             voice = voices[int(torch.randint(len(voices), (), generator=generator,
                                              device=pool.device))]
             start = int(torch.randint(max(1, voice.shape[1] - frames), (), generator=generator,
@@ -302,15 +323,19 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tenso
 @click.option("--lr", default=3e-4, show_default=True, help="Adam learning rate.")
 @click.option("--contiguous", default=0.2, show_default=True,
               help="Fraction of clips drawn as real contiguous runs.")
-@click.option("--random", "random_fraction", default=0.6, show_default=True,
-              help="Fraction of clips drawn uniformly from the whole code space.")
+@click.option("--random", "random_fraction", default=0.0, show_default=True,
+              help="Fraction of clips drawn uniformly from the whole code space (measured useless).")
+@click.option("--jitter", default=0.5, show_default=True,
+              help="Fraction of clips drawn as real runs with nudged acoustic levels.")
+@click.option("--jitter-levels", default=2, show_default=True,
+              help="How far --jitter may move an acoustic level, in grid steps.")
 @click.option("--holdout", default="fr_female", show_default=True, help="Voice excluded from training.")
 @click.option("--device", default="cuda", show_default=True, help="Where to run.")
 @click.option("--seed", default=0, show_default=True, help="Seed for the data draw.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write the weights.")
 def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: float,
-         contiguous: float, random_fraction: float, holdout: str, device: str, seed: int,
-         out_dir: str) -> None:
+         contiguous: float, random_fraction: float, jitter: float, jitter_levels: int,
+         holdout: str, device: str, seed: int, out_dir: str) -> None:
     """Train the audio -> decoder-input encoder on decoder-generated pairs."""
     decoder = load_decoder(find_snapshot(), device=device)
     for param in decoder.parameters():
@@ -346,7 +371,7 @@ def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: flo
     def refill(slots: torch.Tensor) -> None:
         """Decode fresh clips into the given buffer slots."""
         fresh = sample_codes(voices, pool, len(slots), frames, contiguous, random_fraction,
-                             semantic_size, n_levels, generator)
+                             jitter, jitter_levels, semantic_size, n_levels, generator)
         with torch.no_grad():
             buffer_waveform[slots] = decoder.decode(fresh)[:, 0].half()
         buffer_codes[slots] = fresh
@@ -380,6 +405,15 @@ def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: flo
             model.eval()
             scores = measure(model, decoder, held)
             model.train()
+            # The same two accuracies on the batch just trained on. Held-out numbers alone
+            # cannot say whether a flat curve means the network is learning nothing or is
+            # learning the mostly-random training clips and failing to transfer to speech.
+            with torch.no_grad():
+                train_top1 = (semantic.argmax(dim=-1) == codes[:, 0]).float().mean().item()
+                train_within1 = ((acoustic.argmax(dim=-1) - codes[:, 1:].transpose(1, 2)
+                                  ).abs() <= 1).float().mean().item()
+            logger.info(f"step {step:5d}  loss {loss.item():7.4f}  train: semantic top1 "
+                        f"{100 * train_top1:5.1f}% acoustic within1 {100 * train_within1:5.1f}%")
             logger.info(f"step {step:5d}  loss {loss.item():7.4f}  {holdout}: semantic "
                         f"top1 {scores['semantic_top1_pct']:5.1f}% top16 {scores['semantic_topk_pct']:5.1f}%  "
                         f"acoustic exact {scores['acoustic_exact_pct']:5.1f}% "
