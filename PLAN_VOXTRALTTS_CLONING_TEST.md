@@ -1,8 +1,8 @@
 # Voxtral TTS: adding voices (plan and running log)
 
-**STATUS:** B7 ran and the encoder route stalled at 4.8 pct held-out semantic top-1 (23.6 pct top-16) even with 93x more data, but B8 found why the whole track was stuck, and it was never the data. **The search destroys its own starting point.** Handed a seed with 100 pct correct semantic codes and acoustic codes off by at most one grid step, the optimizer drove semantic accuracy down to 43.75 pct; with the semantic half frozen (`--lr-semantic 0`) the same seed recovers **100 pct semantic and 100 pct acoustic, bit exact**. The acoustic half is not a search problem at all: it falls out of the audio by plain descent once the semantic codes are held still, and degrades gracefully (89.6 pct exact) even when the frozen semantic codes are only 25 pct right. Everything hard about this problem is one discrete choice: which of the 8192 semantic rows per frame.
+**STATUS:** B8 found a real bug in the search and a real limit behind it. The bug: joint descent converts acoustic residual into semantic error, so it destroys its own starting point (a 100 pct correct semantic seed comes out at 43.75 pct). Freezing the semantic half fixes that, and the alternating solver built on it (`invert.py alternate`) recovers all 37 code rows **bit exact** from a seed that is 62.5 pct semantically correct with acoustics within one grid step. The limit: that basin is narrow and the two halves are circular. The rescore needs near-exact acoustics (given perfect semantic codes but acoustics off by 10 levels, it discards all of them), and the acoustic solve needs correct semantics to reach near-exact. Cold starts still recover 0 pct. The encoder is therefore back on the critical path, not demoted.
 
-**NEXT ACTION:** B8's continuation. Build the alternating solver: freeze semantic, descend acoustic, then re-score the 8192 semantic candidates per frame against the solved acoustics (`invert.py brute` already does the scoring for one frame), and repeat. B3 measured that the true semantic code is a unique argmin by 400x **when the acoustics are right**, and B8 shows an acoustic solve gets them right, so the two halves now feed each other instead of fighting. The encoder is demoted to an optional shortlist and needs no acoustic head at all.
+**NEXT ACTION:** Test whether the acoustic solve is step-limited rather than stuck. In both cold-acoustic runs it was still climbing monotonically when it ran out of budget (16.7 -> 38.9 -> 49.7 -> 58.7 pct exact), so raise `--warmup` per round from 200 to 1000-2000 and add rounds. If it reaches near-exact acoustics from a cold acoustic start, the circularity breaks and the encoder only has to supply a semantic shortlist (median rank 111 to 167, a 50 to 74x pruning of the 8192). If it plateaus near 60 pct, the basin is genuinely that narrow, and the honest read is that inversion needs a real encoder, which the open weights do not ship. That is also the point to weigh the kill criteria against Track A's 6 keepers.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -426,7 +426,35 @@ The halves separate cleanly, which is what makes the alternating scheme viable:
 
 Consequences: B3's "identifiable but not findable" was measuring an optimizer that unfreezes the one half that must be held still, so that conclusion is superseded rather than merely refined. The encoder needs **no acoustic head**, so more than half of what B6 and B7 trained was never needed. And the remaining problem is discrete, not continuous.
 
-Not yet done, and the reason this stage is `[x]` for the diagnosis but not for the fix: the alternating solver itself is unbuilt, and the open question is whether re-scoring the 8192 semantic candidates against *solved* acoustics ranks the truth first (B3 measured rank 1 against *true* acoustics and rank 241 against a search's starting values, so the interesting case sits between two known numbers).
+**The alternating solver was then built (`invert.py alternate`) and it works, but only inside a basin narrower than the diagnosis suggested.**
+
+Each round freezes the semantic codes and descends the acoustic dims, then freezes those and scores all 8192 semantic rows per frame (via `frame_context`, so only a 16-frame prefix is decoded and only the last two frames of audio are judged), left to right, and stops at a fixed point. From a seed 62.5 pct semantically correct with acoustics within one grid step, on 8 frames of `fr_female`:
+
+```
+round 0: acoustic solve -> acoustic exact 100.0%; rescore -> semantic 100.0%
+         (true code is the argmin on 100 pct of frames, median rank 0), 3 codes changed
+round 1: nothing changes, fixed point
+final:   semantic exact 100.00%  acoustic exact 100.00%
+```
+
+Bit exact on all 37 rows. That also answers the question B3 left open: after an acoustic solve the true semantic code is the argmin on **100 pct** of frames, against rank 1 with *true* acoustics and rank 241 with a search's starting values. The good end, not the bad one.
+
+Then the probes that bound it. A cold start (`--init random`, acoustics at mid level) does not converge at all: ranks oscillate around the middle of the table (4786, 6835, 2967, 4515, 4678) with no trend across five rounds, acoustic exact stuck near 10 pct. Four more, 8 frames, 4 rounds, 200 warmup steps per round:
+
+| seed | acoustic solve reaches | semantic after rescore | final semantic |
+|---|---|---|---|
+| encoder (semantic 0 pct, median rank 167) | 74.3 pct exact | 0 pct | 0 pct |
+| semantic **100 pct**, acoustics +-10 | 16.7 pct exact | **0 pct** | 12.5 pct |
+| semantic 62.5 pct, acoustics +-10 | 66.3 pct exact | 0 pct | 37.5 pct |
+| semantic 25 pct, acoustics +-1 | 84.4 pct exact | 0 pct | 0 pct |
+
+Row two is the damaging one: handed **perfectly correct** semantic codes, the rescore threw all eight away. Wrong rows genuinely score better than the true one when the acoustics are not near exact, so this is not an acceptance rule that can be patched (the current code is always in the candidate set, so the argmin can only lower the loss). The dependency is circular: the rescore needs near-exact acoustics, and the acoustic solve needs correct semantics to reach them.
+
+**Correction to the earlier claim in this stage.** "The acoustic half is free once the semantic half is held still" was measured with `--init degraded`, which always starts the acoustic codes **within one grid step of the truth**. That measured recovery from an already-near start, not from cold. Cold, the same solve reaches 10 pct. The 89.6 pct-from-a-25-pct-seed number in the table above is real but describes a much smaller basin than the wording implied, and the bit-exact run cleared both bars at once rather than demonstrating that either half is free.
+
+So the encoder is **not** demoted after all: it is back on the critical path, because something has to put both halves inside the basin simultaneously.
+
+One lead is open and untested. In both `+-10` runs the acoustic solve was still climbing monotonically when it ran out of steps (16.7 -> 38.9 -> 49.7 -> 58.7 pct exact across rounds), which looks like a step budget rather than a wall. If a much larger `--warmup` per round reaches near-exact acoustics from a cold acoustic start, the circularity breaks at the acoustic end and the encoder only has to supply a semantic shortlist (its median rank is 111 to 167, a 50 to 74x pruning). If it plateaus near 60 pct, the basin really is that narrow and the honest conclusion is that inversion needs a genuine encoder, which is exactly what the open weights do not ship.
 
 ### [ ] B4. A real clip becomes a voice
 
@@ -488,3 +516,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-10 | B7 built | Fork patch 0007 dumps stage-0 codes per request (tag in extra_params, same route as the noise seed, correct under concurrency); tts.py --dump-codes, VOXTRAL_CODE_DUMP_DIR in compose, mint_codes.py to drive it, unit tests for the dump. Not yet run: needs `sudo docker compose up -d --build voxtral-tts`, which needs a password. | generate and retrain |
 | 2026-09-10 | B7 run | Minted 689 utterances / 259,585 frames from stage 0 (0 failed), taking the pool from 2823 frames at 13.1 pct semantic coverage to 262,408 at 46.4 pct, with a real 40-utterance held-out set. Retrain beat B6 (top-16 14 -> 23.6 pct, top-1 2 -> 4.8 pct) then flatlined from step 3200 while the training batch hit 99 pct. 93x the data bought 9 points. | why the acoustic head cannot fit |
 | 2026-09-10 | B8 | **The search was destroying its seed.** Killed the many-to-one-decoder hypothesis by measurement (no dead dims, weakest single-step effect 1.28 pct of RMS). Added --init degraded and found a 100 pct-correct semantic seed comes out at 43.75 pct; frozen (--lr-semantic 0) the same seed recovers 100 pct semantic and 100 pct acoustic bit-exact. The acoustic half is free once semantic is held still, even at 25 pct frozen accuracy (89.6 pct exact). B3's conclusion is superseded; the encoder needs no acoustic head. | build the alternating solver |
+| 2026-09-10 | B8 solver | Built `invert.py alternate` (freeze semantic, descend acoustic, rescore all 8192 rows per frame, repeat). Bit exact from a 62.5 pct seed with acoustics within one step, and it answers B3's open question: after an acoustic solve the true code is the argmin on 100 pct of frames. But cold starts still fail, and given perfect semantic codes with acoustics off by 10 levels the rescore discards all of them, so the two halves are circular. Corrected my earlier over-claim that the acoustic half is free: `--init degraded` always starts acoustics within one step, so that measured a near start, not a cold one. | step-budget test on the acoustic solve |
