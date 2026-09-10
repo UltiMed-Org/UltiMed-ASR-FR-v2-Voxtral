@@ -195,7 +195,12 @@ def load_pool(holdout: str) -> tuple[list[torch.Tensor], torch.Tensor]:
     for path in sorted(CODES_DIR.glob("*.npy")):
         # The derived voices from A2 are blends and cuts of the real ones; the blends
         # are off the code manifold entirely (B1), so they are not training material.
-        if path.stem.startswith("d_") or path.stem == holdout:
+        if path.stem.startswith("d_"):
+            continue
+        # The holdout is a *voice*, not a file: mint_codes.py writes `m_<voice>_<n>`
+        # per utterance, and letting those through would quietly make the honest test
+        # dishonest while the file named after the voice still looked excluded.
+        if path.stem == holdout or path.stem.startswith(f"m_{holdout}_"):
             continue
         voices.append(codes_from_table_space(np.load(path)))
     return voices, torch.cat(voices, dim=1)
