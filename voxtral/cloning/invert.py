@@ -77,6 +77,8 @@ OUT_DIR = REPO_ROOT / "cache" / "cloning" / "B3"
 # harmonic structure (2048) and the transients (512) that a single resolution smears.
 STFT_SCALES = ((512, 128), (1024, 256), (2048, 512))
 N_MELS = 80
+# 24 kHz at the codec's 12.5 Hz frame rate, i.e. how many samples one code row owns.
+SAMPLES_PER_FRAME = 1920
 
 
 def hz_to_mel(hz: torch.Tensor | float) -> torch.Tensor | float:
@@ -162,7 +164,8 @@ def spectral_loss(pred: torch.Tensor, target: torch.Tensor, sample_rate: int,
     return total if batched else total[0]
 
 
-def build_targets(model: torch.nn.Module, voice: str, frames: int) -> tuple[torch.Tensor, torch.Tensor]:
+def build_targets(model: torch.nn.Module, voice: str, frames: int,
+                  codes_dir: Path | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Load a voice's ground-truth codes and the waveform they decode to.
 
     Parameters
@@ -175,6 +178,9 @@ def build_targets(model: torch.nn.Module, voice: str, frames: int) -> tuple[torc
         How many leading frames to use. The decoder is causal with a 16-frame
         sliding window, so a short excerpt is representative of the full clip and
         keeps a CPU optimization tractable.
+    codes_dir : Path, optional
+        Where to look for `<voice>.npy`. Defaults to the B1 codes directory; the B7
+        minted holdout clips live elsewhere and are passed explicitly.
 
     Returns
     -------
@@ -182,7 +188,8 @@ def build_targets(model: torch.nn.Module, voice: str, frames: int) -> tuple[torc
         `[K, frames]` ground-truth codes and the `[samples]` target waveform.
     """
     device = next(model.parameters()).device
-    truth = codes_from_table_space(np.load(CODES_DIR / f"{voice}.npy"))[:, :frames].to(device)
+    source = (codes_dir or CODES_DIR) / f"{voice}.npy"
+    truth = codes_from_table_space(np.load(source))[:, :frames].to(device)
     with torch.no_grad():
         target = model.decode(truth[None])[0, 0]
     return truth, target
@@ -403,6 +410,66 @@ def score(codes: torch.Tensor, truth: torch.Tensor, n_levels: int) -> dict[str, 
         # draw, i.e. (3 * n_levels - 2) / n_levels ** 2 in units of probability.
         "acoustic_within1_chance_pct": (3 * n_levels - 2) / n_levels**2 * 100,
     }
+
+
+def sweep_per_dim(*, model: torch.nn.Module, truth: torch.Tensor, target: torch.Tensor,
+                  n_levels: int, frame: int = 12, tail: int = 2) -> None:
+    """Move one code row by one step and report how far the waveform moves.
+
+    A row whose single-step perturbation leaves the audio essentially unchanged is a row
+    no encoder can ever learn to predict, because the information is not in the signal.
+    The comparison window covers the perturbed frame plus `tail` following ones, since
+    the decoder's receptive field extends past the frame it is emitting and a
+    same-frame-only window would understate the effect.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The loaded audio tokenizer.
+    truth : torch.Tensor
+        `[K, T]` ground-truth codes in quantizer space.
+    target : torch.Tensor
+        The waveform `truth` decodes to, used as the reference.
+    n_levels : int
+        Number of FSQ levels per acoustic dimension.
+    frame : int
+        Which frame to perturb.
+    tail : int
+        How many following frames to include in the comparison window.
+    """
+    if frame + 1 + tail > truth.shape[1]:
+        raise click.ClickException(f"frame {frame} leaves no tail inside {truth.shape[1]} frames")
+    scale = target.pow(2).mean().sqrt().item()
+    window = slice(frame * SAMPLES_PER_FRAME, (frame + 1 + tail) * SAMPLES_PER_FRAME)
+    table_size = model.quantizer.semantic_codebook.embedding.shape[0]
+
+    def moved(row: int, delta: int) -> float | None:
+        perturbed = truth.clone()
+        if row == 0:
+            # The semantic codebook has no ordering, so "+1" is an arbitrary other row.
+            # It is a scale reference, not a step size comparable to the acoustic ones.
+            perturbed[0, frame] = (perturbed[0, frame] + delta) % table_size
+        else:
+            perturbed[row, frame] = (perturbed[row, frame] + delta).clamp(0, n_levels - 1)
+            if perturbed[row, frame] == truth[row, frame]:
+                return None  # clamped at the edge of the grid, nothing was perturbed
+        with torch.no_grad():
+            after = model.decode(perturbed[None])[0, 0]
+        return (after - target)[window].pow(2).mean().sqrt().item() / scale
+
+    logger.info(f"per-dim sweep on frame {frame} plus {tail} following, reference rms {scale:.4f}")
+    logger.info(f"semantic +1 (an unrelated codebook row): {100 * moved(0, 1):6.2f}% of rms")
+    for delta in (1, 10):
+        measured = sorted((v, row) for row in range(1, truth.shape[0])
+                          if (v := moved(row, delta)) is not None)
+        values = torch.tensor([v for v, _ in measured])
+        logger.info(f"acoustic +{delta} step(s), {len(values)} dims: "
+                    f"median {100 * values.median():.2f}%  "
+                    f"min {100 * values.min():.3f}% (dim {measured[0][1]})  "
+                    f"max {100 * values.max():.2f}% (dim {measured[-1][1]})")
+        for threshold in (0.01, 0.001):
+            logger.info(f"  dims moving the audio by less than {100 * threshold}% of rms: "
+                        f"{int((values < threshold).sum())} of {len(values)}")
 
 
 @click.group()
@@ -1039,7 +1106,13 @@ def brute(voice: str, frames: int, frame_index: int | None, chunk: int, acoustic
 @click.option("--frames", default=32, show_default=True, help="Leading frames to probe.")
 @click.option("--trials", default=20, show_default=True, help="Random perturbations per group.")
 @click.option("--seed", default=0, show_default=True, help="Seed for the perturbations.")
-def sensitivity(voice: str, frames: int, trials: int, seed: int) -> None:
+@click.option("--per-dim", is_flag=True,
+              help="Also sweep each code row on its own, reporting how far the waveform "
+                   "moves relative to its own RMS.")
+@click.option("--codes-dir", default=None, type=click.Path(exists=True, path_type=Path),
+              help="Where to find <voice>.npy (default: the B1 codes directory).")
+def sensitivity(voice: str, frames: int, trials: int, seed: int, per_dim: bool,
+                codes_dir: Path | None) -> None:
     """Ask whether the audio even depends on the codes, group by group.
 
     Inverting a waveform can only recover a code the waveform actually reflects. This
@@ -1047,13 +1120,27 @@ def sensitivity(voice: str, frames: int, trials: int, seed: int) -> None:
     moves, in the same units the optimizer minimizes. If flipping a semantic code barely
     changes the audio, no amount of optimization will recover it, and a low semantic
     match rate in `run` is a property of the codec rather than of the search.
+
+    `--per-dim` asks the sharper version of that question, one code row at a time and in
+    relative waveform terms rather than spectral loss. It exists because the B7 encoder
+    memorises the semantic head on its training batch (98% top-1) but not the acoustic
+    one (about 52% within-1 on those same frames), and the natural suspicion was that the
+    decoder is many-to-one in the 36 FSQ dimensions, which would make those codes
+    unrecoverable by construction and the whole "predict the codes" objective wrong.
+    Measured on 2026-09-10 (Claude Code) against a minted fr_female clip: no dead
+    dimensions. The weakest single-step effect was 1.28% of RMS and the median 2.24%,
+    against 0.83% for replacing a semantic code with an unrelated row. So inversion is
+    well posed and the acoustic head's failure to fit is a learning problem.
     """
     generator = torch.Generator().manual_seed(seed)
     model = load_decoder(find_snapshot())
     sample_rate = int(model.sampling_rate)
     mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate) for n_fft, _ in STFT_SCALES}
-    truth, target = build_targets(model, voice, frames)
+    truth, target = build_targets(model, voice, frames, codes_dir=codes_dir)
     n_levels = model.quantizer.acoustic_codebook.n_levels
+
+    if per_dim:
+        sweep_per_dim(model=model, truth=truth, target=target, n_levels=n_levels)
 
     def distance(codes: torch.Tensor) -> float:
         with torch.no_grad():
