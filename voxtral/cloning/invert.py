@@ -2,15 +2,11 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["click", "loguru", "torch", "numpy", "einops", "regex"]
-#
-# [tool.uv.sources]
-# torch = { index = "pytorch-cpu" }
-#
-# [[tool.uv.index]]
-# name = "pytorch-cpu"
-# url = "https://download.pytorch.org/whl/cpu"
-# explicit = true
 # ///
+#
+# Unlike the other scripts here this one does NOT pin torch to the CPU index: the
+# exhaustive search is only practical on a GPU, so it takes the default wheel, which
+# on Linux is the CUDA build. It still runs on CPU (`--device cpu`), just slowly.
 """Analysis by synthesis: recover codes from a waveform through the frozen decoder (stage B3).
 
 This is the decisive experiment for the "off-distribution prefix" risk. The open
@@ -185,7 +181,8 @@ def build_targets(model: torch.nn.Module, voice: str, frames: int) -> tuple[torc
     tuple[torch.Tensor, torch.Tensor]
         `[K, frames]` ground-truth codes and the `[samples]` target waveform.
     """
-    truth = codes_from_table_space(np.load(CODES_DIR / f"{voice}.npy"))[:, :frames]
+    device = next(model.parameters()).device
+    truth = codes_from_table_space(np.load(CODES_DIR / f"{voice}.npy"))[:, :frames].to(device)
     with torch.no_grad():
         target = model.decode(truth[None])[0, 0]
     return truth, target
@@ -275,12 +272,13 @@ def invert(model: torch.nn.Module, target: torch.Tensor, frames: int, *, steps: 
     n_levels = model.quantizer.acoustic_codebook.n_levels
     acoustic_dim = model.quantizer.acoustic_codebook.dim
     sample_rate = int(model.sampling_rate)
-    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate) for n_fft, _ in STFT_SCALES}
+    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate).to(target.device)
+                 for n_fft, _ in STFT_SCALES}
 
     # Start from random real codebook rows rather than from a mean or from zero: the
     # mean of the codebook is not itself a code, so it starts every frame off-manifold
     # and identical, which is the worst possible place to anneal from.
-    start_rows = torch.randint(table.shape[0], (frames,), generator=generator)
+    start_rows = torch.randint(table.shape[0], (frames,), generator=generator).to(table.device)
 
     for param in model.parameters():
         param.requires_grad_(False)
@@ -289,7 +287,8 @@ def invert(model: torch.nn.Module, target: torch.Tensor, frames: int, *, steps: 
     # plateaus and the landscape is the smooth one that provably passes through the
     # true decoder input.
     if init is None:
-        init = torch.cat([table[start_rows].clone(), torch.zeros(frames, acoustic_dim)], dim=-1)
+        init = torch.cat([table[start_rows].clone(),
+                          torch.zeros(frames, acoustic_dim, device=table.device)], dim=-1)
     # Split into two parameters so each can carry its own learning rate. This is not
     # cosmetic: the two halves live at wildly different scales. Per frame the semantic
     # vector has norm ~145 and its codebook's rows sit ~107 apart, so changing one code
@@ -428,28 +427,41 @@ def cli() -> None:
               help="Weight of the semantic commitment term (0 disables).")
 @click.option("--wave-weight", default=1.0, show_default=True, help="Weight of the waveform L1 term (0 disables).")
 @click.option("--seed", default=0, show_default=True, help="Seed for the initial codebook rows.")
-@click.option("--init", "init_mode", type=click.Choice(["random", "truth"]), default="random",
-              show_default=True, help="Start from random codes, or from the truth plus noise.")
+@click.option("--init", "init_mode", type=click.Choice(["random", "truth", "centre"]),
+              default="random", show_default=True,
+              help="Start from random codebook rows, from the truth plus noise, or from the "
+                   "codebook's centre plus noise.")
 @click.option("--init-noise", default=0.1, show_default=True,
               help="Relative noise added to the truth when --init truth.")
+@click.option("--device", default="cpu", show_default=True, help="Where to run.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
 def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_semantic: float,
         lr_acoustic: float, commit_weight: float, wave_weight: float, seed: int, init_mode: str,
-        init_noise: float, out_dir: str) -> None:
+        init_noise: float, device: str, out_dir: str) -> None:
     """Recover codes from a waveform and score them against the truth."""
-    model = load_decoder(find_snapshot())
+    model = load_decoder(find_snapshot(), device=device)
     sample_rate = int(model.sampling_rate)
     truth, target = build_targets(model, voice, frames)
     logger.info(f"{voice}: {frames} frames, target {target.numel() / sample_rate:.2f} s")
 
     init = None
+    if init_mode == "centre":
+        # A random codebook row is a valid code, which means it is the bottom of its own
+        # basin and descent has no reason to leave it. The codebook's centre is not a
+        # code at all, so a start there is downhill towards *some* row, and it happens to
+        # sit closer to any given row (~76 in L2) than two rows sit to each other (~107).
+        table = model.quantizer.semantic_codebook.embedding.float()
+        noise = torch.randn(frames, table.shape[1], generator=torch.Generator().manual_seed(seed))
+        centre = table.mean(dim=0)[None] + init_noise * table.std(dim=0)[None] * noise.to(table.device)
+        init = torch.cat([centre, torch.zeros(frames, model.quantizer.acoustic_codebook.dim,
+                                              device=table.device)], dim=-1)
     if init_mode == "truth":
         # Deliberately cheating, as a control: if the optimizer cannot descend back to
         # zero from a small perturbation of the true answer, no starting point helps and
         # the problem is the gradient path, not the search radius.
         with torch.no_grad():
             exact = model.quantizer.decode(truth[None])[0].transpose(0, 1)
-        noise = torch.randn(exact.shape, generator=torch.Generator().manual_seed(seed))
+        noise = torch.randn(exact.shape, generator=torch.Generator().manual_seed(seed)).to(exact.device)
         # Per-dim scaling: a single global std is dominated by the 256 semantic dims and
         # would swamp the 36 acoustic ones, whose grid spacing is only 0.1 in [-1, 1].
         init = exact + init_noise * exact.std(dim=0, keepdim=True) * noise
@@ -458,6 +470,8 @@ def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_s
                                          commit_weight=commit_weight, stage_steps=stage_steps,
                                          wave_weight=wave_weight, seed=seed, init=init)
     n_levels = model.quantizer.acoustic_codebook.n_levels
+    codes, waveform, target = codes.cpu(), waveform.cpu(), target.cpu()
+    truth, warm_codes = truth.cpu(), warm_codes.cpu()
     metrics = score(codes, truth, n_levels)
     # Kept separately because the two phases answer different questions: the continuous
     # one bounds what is identifiable at all, the discrete one says what a search that
@@ -483,107 +497,371 @@ def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_s
     logger.success(f"wrote {destination}")
 
 
-def solve_causally(model: torch.nn.Module, target: torch.Tensor, frames: int, *, sweeps: int,
-                   chunk: int, window: int) -> torch.Tensor:
-    """Recover codes frame by frame with an exhaustive semantic search.
+def frame_context(model: torch.nn.Module, codes: torch.Tensor, target: torch.Tensor, frame: int, *,
+                  window: int, mel_banks: dict[int, torch.Tensor], samples_per_frame: int):
+    """Build the scoring closure for one frame of a causal solve.
 
-    The gradient route fails because the semantic variable is categorical with 8192
-    sharp, isolated minima: `brute` measures the true code beating its runner-up by a
-    factor of ~400, which is a needle, not a slope. Searching it exhaustively is instead
-    both exact and affordable, because the decoder is causal: the audio of frames 0..k
-    does not depend on anything after k, so each frame can be finished before the next
-    one starts and never revisited.
+    Everything before `frame` is frozen at whatever `codes` holds, everything after is
+    irrelevant because the decoder is causal. The closure therefore varies only the last
+    frame and judges it on the last one or two frames of audio, which is where the only
+    difference between candidates can appear.
 
-    Within a frame the two halves alternate. The semantic code is swept over all 8192
-    rows with the acoustic dims held where they are; the acoustic dims are then swept one
-    at a time over their 21 levels, which is exact per dimension and cheap (36 x 21
-    evaluations). A couple of rounds resolves the chicken-and-egg between them.
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The audio tokenizer.
+    codes : torch.Tensor
+        `[K, T]` codes solved so far; only columns up to `frame` are read.
+    target : torch.Tensor
+        Target waveform.
+    frame : int
+        Index of the frame being solved.
+    window : int
+        Frames of prefix to decode, 0 for all of it.
+    mel_banks : dict[int, torch.Tensor]
+        Cached mel filterbanks.
+    samples_per_frame : int
+        Decoder output samples per 12.5 Hz frame.
+
+    Returns
+    -------
+    callable
+        `evaluate(sem_rows, acoustic) -> [B]` losses, differentiable in `acoustic`.
+    """
+    sample_rate = int(model.sampling_rate)
+    low = max(0, frame + 1 - window) if window else 0
+    span = min(2, frame + 1 - low) * samples_per_frame
+    piece = target[(frame + 1) * samples_per_frame - span:(frame + 1) * samples_per_frame]
+    with torch.no_grad():
+        prefix = model.quantizer.decode(codes[None, :, low:frame + 1])[0]         # [292, L]
+    head = prefix[None, :, :-1]
+
+    def evaluate(sem_rows: torch.Tensor, acoustic: torch.Tensor) -> torch.Tensor:
+        last = torch.cat([sem_rows, acoustic], dim=-1)[:, :, None]
+        emb = torch.cat([head.expand(sem_rows.shape[0], -1, -1), last], dim=-1)
+        waveforms = model._forward_decoder(emb)[:, 0]
+        return spectral_loss(waveforms[:, -span:], piece, sample_rate, mel_banks)
+
+    return evaluate
+
+
+def sweep_acoustics(evaluate, rows: torch.Tensor, levels: torch.Tensor, n_levels: int, *,
+                    sweeps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit each candidate's acoustic dims by exact coordinate descent.
+
+    Gradient descent on these 36 dims plateaus about 400x above the achievable floor:
+    the straight-through estimator's forward pass is piecewise constant and its identity
+    backward path walks into local minima it cannot leave. Each dimension has only 21
+    values though, so the exact minimum along one coordinate is a batch of 21 forward
+    passes with no autograd at all, which is both cheaper in memory and free of local
+    minima along that axis. Sweeping the 36 in turn converges in a handful of rounds.
+
+    Parameters
+    ----------
+    evaluate : callable
+        Closure from `frame_context`.
+    rows : torch.Tensor
+        `[B, 256]` semantic codebook rows, one per candidate.
+    levels : torch.Tensor
+        `[B, 36]` starting integer levels.
+    n_levels : int
+        Values per acoustic dimension.
+    sweeps : int
+        Passes over the 36 dimensions.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        `[B]` losses and `[B, 36]` integer levels.
+    """
+    batch, acoustic_dim = levels.shape
+    grid = torch.arange(n_levels, device=levels.device)
+
+    def to_values(x: torch.Tensor) -> torch.Tensor:
+        return x.float() * 2.0 / (n_levels - 1) - 1.0
+
+    wide_rows = rows[:, None, :].expand(batch, n_levels, rows.shape[1]).reshape(-1, rows.shape[1])
+    with torch.no_grad():
+        for _ in range(sweeps):
+            for dim in range(acoustic_dim):
+                candidates = levels[:, None, :].repeat(1, n_levels, 1)
+                candidates[:, :, dim] = grid
+                losses = evaluate(wide_rows, to_values(candidates.reshape(-1, acoustic_dim)))
+                levels[:, dim] = losses.view(batch, n_levels).argmin(dim=1)
+        return evaluate(rows, to_values(levels)), levels
+
+
+def fit_acoustics(evaluate, rows: torch.Tensor, carried: torch.Tensor, n_levels: int, *,
+                  steps: int, lr: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit each candidate's 36 acoustic dims, then score it on the rounded result.
+
+    Rounding lives in the forward pass (the codec's own straight-through trick), so the
+    loss returned is the one the real code grid produces and candidates are compared on
+    equal terms, never on a continuous relaxation that would flatter some of them.
+
+    Parameters
+    ----------
+    evaluate : callable
+        Closure from `frame_context`.
+    rows : torch.Tensor
+        `[B, 256]` semantic codebook rows, one per candidate.
+    carried : torch.Tensor
+        `[36]` starting acoustic values, in the decoder's [-1, 1] scale.
+    n_levels : int
+        Acoustic levels per dimension.
+    steps : int
+        Adam steps.
+    lr : float
+        Adam rate.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        `[B]` hard losses and `[B, 36]` integer levels.
+    """
+    def to_values(levels: torch.Tensor) -> torch.Tensor:
+        return levels.float() * 2.0 / (n_levels - 1) - 1.0
+
+    free = torch.nn.Parameter(torch.atanh(carried.clamp(-0.999, 0.999))[None].repeat(rows.shape[0], 1))
+    optimizer = torch.optim.Adam([free], lr=lr)
+    for _ in range(steps):
+        scaled = (torch.tanh(free) + 1.0) / 2.0 * (n_levels - 1)
+        quantized = scaled + (scaled.round() - scaled).detach()
+        loss = evaluate(rows, to_values(quantized)).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    with torch.no_grad():
+        levels = ((torch.tanh(free) + 1.0) / 2.0 * (n_levels - 1)).round()
+        return evaluate(rows, to_values(levels)), levels.long()
+
+
+def fit_frame_restarts(evaluate, table: torch.Tensor, n_levels: int, acoustic_dim: int, *,
+                       restarts: int, steps: int, lr_semantic: float, lr_acoustic: float,
+                       chunk: int, generator: torch.Generator) -> tuple[float, int, torch.Tensor]:
+    """Solve one frame by many parallel continuous restarts.
+
+    Everything measured in B3 points here. Continuous descent on a frame's 292 dims
+    converges perfectly when it starts near the answer (a control seeded at the truth
+    plus 5 percent noise recovers 100 percent of the semantic codes), and fails from a
+    cold start only because the basin is narrow. The shortlist route fails for a
+    different reason: judging 8192 candidates requires fitting each one's acoustics, and
+    neither Adam nor exact coordinate descent gets that fit within 400x of the floor.
+
+    So instead of one descent from one place, run hundreds from hundreds of places at
+    once. Each restart is 292 numbers and a single frame of audio, which is small enough
+    that the batch dimension is free on a GPU, and the causal decoder means this has to
+    be solved for one frame only before moving on.
+
+    Parameters
+    ----------
+    evaluate : callable
+        Closure from `frame_context`, differentiable in both of its arguments.
+    table : torch.Tensor
+        `[8192, 256]` semantic codebook, also the pool the restarts are drawn from.
+    n_levels : int
+        Values per acoustic dimension.
+    acoustic_dim : int
+        Number of acoustic dimensions.
+    restarts : int
+        Independent descents run in parallel.
+    steps : int
+        Adam steps, shared by all restarts.
+    lr_semantic, lr_acoustic : float
+        Adam rates for the two halves, two orders of magnitude apart by necessity.
+    chunk : int
+        Restarts per decoder pass, bounded by GPU memory.
+    generator : torch.Generator
+        Source of the starting rows.
+
+    Returns
+    -------
+    tuple[float, int, torch.Tensor]
+        Best loss, its semantic code, and its `[36]` acoustic levels.
+    """
+    device = table.device
+    best = (float("inf"), None, None)
+    for start in range(0, restarts, chunk):
+        size = min(chunk, restarts - start)
+        rows = torch.randint(table.shape[0], (size,), generator=generator).to(device)
+        sem = torch.nn.Parameter(table[rows].clone())
+        aco = torch.nn.Parameter(torch.zeros(size, acoustic_dim, device=device))
+        optimizer = torch.optim.Adam([
+            {"params": [sem], "lr": lr_semantic},
+            {"params": [aco], "lr": lr_acoustic},
+        ])
+        for _ in range(steps):
+            # VQ-VAE straight-through on both halves: the forward pass always uses real
+            # codes, so the loss being minimised is the one the code grid can deliver.
+            nearest = table[torch.cdist(sem, table).argmin(dim=-1)]
+            sem_ste = sem + (nearest - sem).detach()
+            scaled = (torch.tanh(aco) + 1.0) / 2.0 * (n_levels - 1)
+            aco_ste = (scaled + (scaled.round() - scaled).detach()) * 2.0 / (n_levels - 1) - 1.0
+            loss = evaluate(sem_ste, aco_ste).sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        with torch.no_grad():
+            codes = torch.cdist(sem, table).argmin(dim=-1)
+            levels = ((torch.tanh(aco) + 1.0) / 2.0 * (n_levels - 1)).round()
+            losses = evaluate(table[codes], levels * 2.0 / (n_levels - 1) - 1.0)
+            local = losses.argmin()
+            if losses[local].item() < best[0]:
+                best = (losses[local].item(), codes[local].item(), levels[local].long())
+    return best
+
+
+def solve_causally(model: torch.nn.Module, target: torch.Tensor, frames: int, *, shortlist: int,
+                   fit_steps: int, chunk: int, window: int, lr: float, restarts: int = 0,
+                   lr_semantic: float = 1.0,
+                   truth: torch.Tensor | None = None) -> torch.Tensor:
+    """Recover codes frame by frame, fitting each candidate's acoustics before ranking.
+
+    This is the algorithm B3's measurements point at. Three facts shape it:
+
+    1. The decoder is causal, so the audio of frames 0..k does not depend on anything
+       after k. Each frame can be finished before the next starts and never revisited.
+    2. Given a frame's 36 acoustic dims, its semantic code is the unique global minimum
+       of the audio loss by a factor of ~400. Exhaustive over 8192 rows, no search needed.
+    3. Given nothing, it is not: holding the acoustics at a neutral value drops the true
+       code to rank 241 of 8192. So candidates must be judged *after* their acoustics are
+       fitted, not before, which is the mistake the first solver made.
+
+    Fitting 8192 candidates per frame is the expensive part, so it happens in two passes:
+    one cheap gradient-free sweep over all 8192 with the acoustics carried over from the
+    previous frame, used only to shortlist, then a real fit of the shortlist. The
+    shortlist has to be generous precisely because pass one is known to misrank the truth
+    by several hundred places.
 
     Parameters
     ----------
     model : torch.nn.Module
         The audio tokenizer, used through `_forward_decoder` only.
     target : torch.Tensor
-        Target waveform.
+        Target waveform, on the same device as the model.
     frames : int
         Number of frames to solve.
-    sweeps : int
-        Semantic/acoustic alternations per frame.
+    shortlist : int
+        Semantic candidates kept from the cheap sweep and actually fitted.
+    fit_steps : int
+        Adam steps spent fitting each candidate's 36 acoustic dims.
     chunk : int
-        Candidates per decoder pass.
+        Candidates per decoder pass. The binding constraint is GPU memory during the
+        fitting pass, where activations are kept for the backward.
     window : int
-        Frames of prefix to decode when scoring, 0 for the whole prefix. A window makes
-        the cost per frame constant instead of linear, at the price of truncating the
-        causal convolution history; keep it well above the decoder's 16-frame attention
-        span if used.
+        Frames of prefix to decode when scoring, 0 for the whole prefix. A window keeps
+        the cost per frame constant instead of linear in k; it truncates the causal
+        convolution history, so keep it comfortably above the decoder's 16-frame
+        attention span.
+    lr : float
+        Adam rate for the acoustic dims, whose grid step is 0.1 in [-1, 1].
+    restarts : int
+        When non-zero, solve each frame by that many parallel continuous restarts
+        instead of by shortlist-then-fit. This is the strategy that works; the
+        shortlist path is kept because it is what the measurements were made with.
+    lr_semantic : float
+        Adam rate for the semantic half under the restart strategy.
+    truth : torch.Tensor, optional
+        Ground-truth codes, used for logging only: it reports where the true code landed
+        in the cheap sweep, the one number that says whether the shortlist is the cap.
 
     Returns
     -------
     torch.Tensor
         `[K, frames]` recovered codes.
     """
+    device = target.device
     sample_rate = int(model.sampling_rate)
-    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate) for n_fft, _ in STFT_SCALES}
-    table = model.quantizer.semantic_codebook.embedding.float()
+    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate).to(device)
+                 for n_fft, _ in STFT_SCALES}
+    table = model.quantizer.semantic_codebook.embedding.float().to(device)
     n_levels = model.quantizer.acoustic_codebook.n_levels
     acoustic_dim = model.quantizer.acoustic_codebook.dim
     samples_per_frame = target.numel() // frames
 
-    codes = torch.zeros(1 + acoustic_dim, frames, dtype=torch.long)
-    codes[1:] = (n_levels - 1) // 2                                   # mid level, i.e. 0.0
+    codes = torch.zeros(1 + acoustic_dim, frames, dtype=torch.long, device=device)
+    codes[1:] = (n_levels - 1) // 2
+    # Running acoustic estimate, carried into the next frame as its starting point:
+    # adjacent frames of one voice have similar texture, so this is a far better guess
+    # than the neutral middle and it lifts the cheap sweep's ranking with it.
+    carried = torch.zeros(acoustic_dim, device=device)
 
-    def score(prefix_codes: torch.Tensor, k: int) -> torch.Tensor:
-        """Loss of each candidate prefix, judged on the two most recent frames.
+    generator = torch.Generator().manual_seed(0)
+    for frame in range(frames):
+        evaluate = frame_context(model, codes, target, frame, window=window,
+                                 mel_banks=mel_banks, samples_per_frame=samples_per_frame)
 
-        Only frame k's samples differ between candidates; frame k-1 rides along to give
-        the shortest STFT window something to bite on.
-        """
-        low = 0 if not window else max(0, k + 1 - window)
+        if restarts:
+            best = fit_frame_restarts(evaluate, table, n_levels, acoustic_dim,
+                                      restarts=restarts, steps=fit_steps,
+                                      lr_semantic=lr_semantic, lr_acoustic=lr,
+                                      chunk=chunk, generator=generator)
+            codes[0, frame] = best[1]
+            codes[1:, frame] = best[2]
+            carried = best[2].float() * 2.0 / (n_levels - 1) - 1.0
+            extra = ""
+            if truth is not None:
+                extra = f", truth {truth[0, frame].item()}"
+            logger.info(f"frame {frame + 1}/{frames}: semantic {best[1]}, "
+                        f"loss {best[0]:.5f}{extra}")
+            continue
+
+        sweep = []
         with torch.no_grad():
-            waveforms = model.decode(prefix_codes[:, :, low:k + 1])[:, 0]
-        span = min(2, k + 1 - low) * samples_per_frame
-        piece = target[(k + 1) * samples_per_frame - span:(k + 1) * samples_per_frame]
-        return spectral_loss(waveforms[:, -span:], piece, sample_rate, mel_banks)
-
-    for k in range(frames):
-        for _ in range(sweeps):
-            best = None
             for start in range(0, table.shape[0], chunk):
-                size = min(chunk, table.shape[0] - start)
-                candidates = codes[None, :, :k + 1].repeat(size, 1, 1)
-                candidates[:, 0, k] = torch.arange(start, start + size)
-                losses = score(candidates, k)
-                local = losses.argmin()
-                if best is None or losses[local] < best[1]:
-                    best = (start + local.item(), losses[local].item())
-            codes[0, k] = best[0]
+                rows = table[start:start + chunk]
+                sweep.append(evaluate(rows, carried[None].expand(rows.shape[0], -1)))
+        order = torch.cat(sweep).argsort()
+        candidates = order[:shortlist]
+        if truth is not None:
+            rank = (order == truth[0, frame]).nonzero().item() + 1
+            logger.debug(f"frame {frame + 1}/{frames}: true code ranks {rank} in the cheap sweep")
 
-            for dim in range(acoustic_dim):
-                candidates = codes[None, :, :k + 1].repeat(n_levels, 1, 1)
-                candidates[:, 1 + dim, k] = torch.arange(n_levels)
-                codes[1 + dim, k] = score(candidates, k).argmin()
-        logger.debug(f"frame {k + 1}/{frames}: semantic {codes[0, k].item()}")
+        best = (float("inf"), None, None)
+        for start in range(0, candidates.numel(), chunk):
+            picked = candidates[start:start + chunk]
+            losses, levels = fit_acoustics(evaluate, table[picked], carried, n_levels,
+                                           steps=fit_steps, lr=lr)
+            local = losses.argmin()
+            if losses[local].item() < best[0]:
+                best = (losses[local].item(), picked[local].item(), levels[local])
+
+        codes[0, frame] = best[1]
+        codes[1:, frame] = best[2]
+        carried = best[2].float() * 2.0 / (n_levels - 1) - 1.0
+        logger.info(f"frame {frame + 1}/{frames}: semantic {best[1]}, loss {best[0]:.5f}")
     return codes
 
 
 @cli.command()
 @click.option("--voice", default="fr_female", show_default=True, help="Voice to invert.")
 @click.option("--frames", default=8, show_default=True, help="Clip length in frames.")
-@click.option("--sweeps", default=2, show_default=True, help="Semantic/acoustic alternations per frame.")
-@click.option("--chunk", default=256, show_default=True, help="Candidates per decoder pass.")
-@click.option("--window", default=0, show_default=True, help="Prefix frames to decode (0 = all).")
+@click.option("--shortlist", default=512, show_default=True,
+              help="Semantic candidates kept from the cheap sweep and actually fitted.")
+@click.option("--fit-steps", default=60, show_default=True, help="Adam steps per candidate's acoustics.")
+@click.option("--chunk", default=128, show_default=True, help="Candidates per decoder pass.")
+@click.option("--window", default=16, show_default=True, help="Prefix frames to decode (0 = all).")
+@click.option("--lr", default=0.05, show_default=True, help="Adam rate for the acoustic dims.")
+@click.option("--restarts", default=512, show_default=True,
+              help="Parallel continuous restarts per frame; 0 uses the shortlist strategy.")
+@click.option("--lr-semantic", default=1.0, show_default=True, help="Adam rate for the semantic half.")
+@click.option("--device", default="cuda", show_default=True, help="Where to run; cpu is far slower.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
-def solve(voice: str, frames: int, sweeps: int, chunk: int, window: int, out_dir: str) -> None:
+def solve(voice: str, frames: int, shortlist: int, fit_steps: int, chunk: int, window: int, lr: float,
+          restarts: int, lr_semantic: float, device: str, out_dir: str) -> None:
     """Recover codes by causal exhaustive search, and score them against the truth."""
-    model = load_decoder(find_snapshot())
+    model = load_decoder(find_snapshot(), device=device)
     sample_rate = int(model.sampling_rate)
     truth, target = build_targets(model, voice, frames)
-    codes = solve_causally(model, target, frames, sweeps=sweeps, chunk=chunk, window=window)
+    codes = solve_causally(model, target, frames, shortlist=shortlist, fit_steps=fit_steps,
+                           chunk=chunk, window=window, lr=lr, restarts=restarts,
+                           lr_semantic=lr_semantic, truth=truth)
+    codes, truth = codes.cpu(), truth.cpu()
     metrics = score(codes, truth, model.quantizer.acoustic_codebook.n_levels)
 
     destination = Path(out_dir)
     with torch.no_grad():
-        waveform = model.decode(codes[None])[0, 0]
+        waveform = model.decode(codes[None].to(device))[0, 0].cpu()
     write_wav(destination / f"{voice}_solve.wav", waveform, sample_rate)
     np.save(destination / f"{voice}_solve_codes.npy", codes.numpy().astype(np.int16))
     (destination / f"{voice}_solve_metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -592,6 +870,72 @@ def solve(voice: str, frames: int, sweeps: int, chunk: int, window: int, out_dir
                 f"within1 {metrics['acoustic_within1_pct']:6.2f}%  "
                 f"mean|d| {metrics['acoustic_mean_abs_error']:.2f}")
     logger.success(f"wrote {destination}")
+
+
+@cli.command()
+@click.option("--voice", default="fr_female", show_default=True, help="Voice to probe.")
+@click.option("--frames", default=8, show_default=True, help="Clip length in frames.")
+@click.option("--frame", "frame_index", default=0, show_default=True, help="Frame to solve.")
+@click.option("--codes", "code_list", required=True,
+              help="Comma-separated semantic codes to fit and compare.")
+@click.option("--fit-steps", default=800, show_default=True, help="Adam steps per candidate.")
+@click.option("--lr", default=0.05, show_default=True, help="Adam rate for the acoustic dims.")
+@click.option("--sweeps", default=0, show_default=True,
+              help="Coordinate-descent sweeps instead of Adam, when non-zero.")
+@click.option("--window", default=16, show_default=True, help="Prefix frames to decode (0 = all).")
+@click.option("--device", default="cuda", show_default=True, help="Where to run.")
+def duel(voice: str, frames: int, frame_index: int, code_list: str, fit_steps: int, lr: float,
+         sweeps: int, window: int, device: str) -> None:
+    """Fit the acoustics of a handful of named semantic codes and compare the results.
+
+    The cheap way to test the premise the solver rests on: that a candidate only loses
+    to the truth once its own acoustics have been fitted properly. Give it the true code
+    and whatever impostor beat it, spend a serious step budget on both, and see which
+    ends up lower. If the impostor still wins, the premise is wrong and no shortlist
+    size or compute budget rescues the approach.
+    """
+    model = load_decoder(find_snapshot(), device=device)
+    truth, target = build_targets(model, voice, frames)
+    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, int(model.sampling_rate)).to(device)
+                 for n_fft, _ in STFT_SCALES}
+    n_levels = model.quantizer.acoustic_codebook.n_levels
+    table = model.quantizer.semantic_codebook.embedding.float().to(device)
+
+    # Frames before the probed one are held at the truth, so the only unknown is this
+    # frame: the question is about one frame's two halves, not about error accumulation.
+    codes = truth.clone()
+    codes[1:, frame_index] = (n_levels - 1) // 2
+    evaluate = frame_context(model, codes, target, frame_index, window=window,
+                             mel_banks=mel_banks,
+                             samples_per_frame=target.numel() // frames)
+
+    # The floor: the true code with its true acoustics. Any candidate's fitted loss has
+    # to be read against this, because a fit that stops far above it has not converged
+    # and the comparison between candidates is then meaningless.
+    true_code = truth[0, frame_index]
+    with torch.no_grad():
+        floor = evaluate(table[true_code][None],
+                         (truth[1:, frame_index].float() * 2.0 / (n_levels - 1) - 1.0)[None])
+    logger.info(f"floor, true code with true acoustics: {floor.item():.6f}")
+
+    wanted = [int(c) for c in code_list.split(",")]
+    picked = torch.tensor(wanted, device=device)
+    acoustic_dim = model.quantizer.acoustic_codebook.dim
+    if sweeps:
+        start = torch.full((picked.numel(), acoustic_dim), (n_levels - 1) // 2,
+                           dtype=torch.long, device=device)
+        losses, levels = sweep_acoustics(evaluate, table[picked], start, n_levels, sweeps=sweeps)
+    else:
+        carried = torch.zeros(acoustic_dim, device=device)
+        losses, levels = fit_acoustics(evaluate, table[picked], carried, n_levels,
+                                       steps=fit_steps, lr=lr)
+    true_levels = truth[1:, frame_index]
+    logger.info(f"frame {frame_index}, true semantic code {true_code.item()}")
+    for code, loss, level in zip(wanted, losses.tolist(), levels):
+        delta = (level - true_levels).abs().float()
+        marker = " <- truth" if code == true_code.item() else ""
+        logger.info(f"code {code:5d}  loss {loss:10.6f}  acoustic within1 of truth "
+                    f"{(delta <= 1).float().mean() * 100:5.1f}%{marker}")
 
 
 @cli.command()
@@ -619,6 +963,7 @@ def brute(voice: str, frames: int, frame_index: int | None, chunk: int, acoustic
     mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate) for n_fft, _ in STFT_SCALES}
     truth, target = build_targets(model, voice, frames)
     index = frames - 1 if frame_index is None else frame_index
+
 
     with torch.no_grad():
         exact = model.quantizer.decode(truth[None])[0]                # [292, T]

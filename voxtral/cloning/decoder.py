@@ -126,6 +126,11 @@ def _stub_module(name: str) -> types.ModuleType:
     module = types.ModuleType(name)
     module.__path__ = []      # a real list: the import machinery iterates it
     module.__all__ = []
+    # A real string: torch's warning and autograd machinery calls
+    # `inspect.getmodule`, which does path arithmetic on every `sys.modules`
+    # entry's `__file__`. Left to `__getattr__` this would hand it a class and
+    # crash inside `os.path.splitext`, far from anything to do with stubs.
+    module.__file__ = f"<stub {name}>"
     module.__getattr__ = lambda attr: _StubMeta(attr, (object,), {"__module__": name})
     return module
 
@@ -276,7 +281,8 @@ def read_audio_tokenizer_weights(snapshot: Path) -> dict[str, torch.Tensor]:
     return weights
 
 
-def load_decoder(snapshot: Path | None = None, dtype: torch.dtype = torch.float32):
+def load_decoder(snapshot: Path | None = None, dtype: torch.dtype = torch.float32,
+                 device: str | torch.device = "cpu", drop_encoder: bool = True):
     """Instantiate the audio tokenizer and load the decoder half of its weights.
 
     The encoder submodules are built by the constructor and left at their random
@@ -291,11 +297,17 @@ def load_decoder(snapshot: Path | None = None, dtype: torch.dtype = torch.float3
     dtype : torch.dtype
         Compute dtype. float32 on CPU: bfloat16 matmuls are slower there and the
         decoder is small enough that precision is free.
+    device : str or torch.device
+        Where to put the weights. "cuda" is what makes the exhaustive search in
+        `invert.py` practical; everything else here is happy on CPU.
+    drop_encoder : bool
+        Delete the modules `decode` never uses. They carry no checkpoint weights, so
+        this only frees memory; it does make `encode_tokens` unavailable.
 
     Returns
     -------
     torch.nn.Module
-        The tokenizer, in eval mode, on CPU.
+        The tokenizer, in eval mode.
     """
     snapshot = snapshot or find_snapshot()
     module = import_audio_tokenizer()
@@ -313,7 +325,17 @@ def load_decoder(snapshot: Path | None = None, dtype: torch.dtype = torch.float3
     if result.unexpected_keys:
         logger.warning(f"{len(result.unexpected_keys)} unexpected tensors: "
                        f"{result.unexpected_keys[:5]}")
-    return model.to(dtype).eval()
+    if drop_encoder:
+        # 709 MB of the 1.3 GB parameter budget belongs to modules `decode` never
+        # touches, and the checkpoint ships weights for none of them, so they hold
+        # random noise: `encoder_blocks` and `input_proj` are the waveform -> codes
+        # direction, `audio_token_embedding` is only read by `encode_tokens`. Dropping
+        # them matters when the GPU is shared with a running server and the search has
+        # a couple of gigabytes to work in.
+        for name in ("encoder_blocks", "input_proj", "audio_token_embedding"):
+            if hasattr(model, name):
+                delattr(model, name)
+    return model.to(dtype).to(device).eval()
 
 
 def codes_from_table_space(codes: np.ndarray | torch.Tensor) -> torch.Tensor:
