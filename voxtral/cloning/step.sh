@@ -15,6 +15,7 @@
 # Usage:
 #     ./voxtral/cloning/step.sh            # run CURRENT_STAGE
 #     ./voxtral/cloning/step.sh a1         # run a specific stage
+#     ./voxtral/cloning/step.sh b7         # mint training codes (the current stage)
 #     ./voxtral/cloning/step.sh diag       # post-mortem after a failed boot (starts nothing)
 #     ./voxtral/cloning/step.sh logs       # tail the voxtral-tts container logs
 #     ./voxtral/cloning/step.sh down       # stop voxtral-tts (frees the GPU)
@@ -25,7 +26,7 @@
 set -euo pipefail
 
 # The stage the agent last prepared. Updated as part of the session protocol.
-CURRENT_STAGE="a3"
+CURRENT_STAGE="b7"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -86,6 +87,22 @@ check_fork_has_local_voice_lookup() {
         exit 1
     fi
     ok "fork has the local-first voice lookup"
+}
+
+check_fork_can_dump_codes() {
+    # Preflight for B7. Patch 0007 adds the per-request stage-0 code dump, and an
+    # image built before it fails in the worst possible way: vllm-omni merges any
+    # unknown extra_params key without complaint, so every request returns 200
+    # with audio and writes no codes at all. An hour of generation would look
+    # perfect and produce nothing. Check the source the image is built from.
+    if ! grep -q "_dump_frame_codes" \
+        voxtral/vllm-omni/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py 2>/dev/null; then
+        fail "voxtral/vllm-omni is missing the stage-0 code dump (patch 0007)"
+        warn "requests would return 200 and silently write nothing"
+        warn "re-apply voxtral/patches/*.patch, see voxtral/patches/README.md"
+        exit 1
+    fi
+    ok "fork has the stage-0 code dump"
 }
 
 start_voxtral() {
@@ -383,6 +400,117 @@ stage_a2() {
     echo "    to drop the losers:  ./voxtral/cloning/derive_voices.py clean"
 }
 
+stage_b7() {
+    # Mint real code sequences to train the missing audio encoder on.
+    #
+    # Why: B6 established that the encoder trains fine and there is nothing to
+    # train it on. The 20 shipped voices are 2823 frames, about four minutes,
+    # holding 1071 distinct semantic codes, 13 percent of the 8192. A network
+    # cannot learn a map whose output space it has seen an eighth of, and it does
+    # not: 94 percent on the training frames, 2 percent on a held-out voice.
+    # Sampling the code space uniformly instead is free and useless (0.2 percent
+    # on the training batch itself), because uniform codes are 37 dimensions of
+    # noise per frame.
+    #
+    # The generator we need is the server. Stage 0 is an AR LLM whose whole job is
+    # text -> on-manifold codes, and patch 0007 makes it write out what it emits.
+    # So this stage is just: build, prove the dump works, generate, collect.
+    #
+    # Cost, so nothing here is a surprise:
+    #   - GPU: yes, for the generation, and exclusively. The container takes ~17 GB
+    #     (VOXTRAL_GPU_MEM_UTIL 0.7 of a 24 GB card) and the encoder training needs
+    #     the GPU too, so the two cannot overlap. This stage STOPS the container
+    #     when it is done, which is what frees the card for the agent to train.
+    #   - Time: build a few minutes (layers are cached, only the fork's install
+    #     layer rebuilds), boot several minutes (9 GB of weights, already in
+    #     ./cache), generation is the long pole. It runs 4 requests at a time and
+    #     prints seconds-per-call every 20, so the true rate is visible early;
+    #     budget an hour for --minutes 240 and read the first report to refine it.
+    #   - Disk: negligible, and deliberately so. The audio is NOT kept: the trainer
+    #     decodes the codes locally to get exactly the audio they stand for, so
+    #     saving the server's copy would only mean storing it twice. Codes are 74
+    #     bytes a frame, so 240 minutes of speech is about 13 MB of dumps plus
+    #     ~53 MB of npy. The image rebuild is the only real disk cost.
+    #   - Network: the text corpus is already fetched (cache/cloning/corpus).
+    local minutes="${B7_MINUTES:-240}"
+    local smoke_text="Bonjour, ceci est un test de collecte de codes."
+    local smoke_tag="b7_smoke_$(date +%Y%m%d%H%M%S)"
+    local dump_dir="cache/cloning/dumps"
+
+    check_fork_can_dump_codes
+    check_fork_has_local_voice_lookup
+
+    say "corpus"
+    if [[ ! -d cache/cloning/corpus ]] || [[ -z "$(ls -A cache/cloning/corpus 2>/dev/null)" ]]; then
+        fail "no corpus in cache/cloning/corpus"
+        warn "run: ./voxtral/cloning/mint_codes.py corpus --articles 500 --delay 5"
+        exit 1
+    fi
+    ls -l cache/cloning/corpus
+
+    mkdir -p "$dump_dir"
+    check_port_clash
+    start_voxtral
+    wait_for_health
+
+    # The whole run hinges on the dump working, and the failure mode is silent, so
+    # spend one short call proving it before spending an hour on the assumption.
+    say "smoke test: does a request actually write codes?"
+    ./tts.py -t "$smoke_text" --voice fr_male --noise-seed 7 \
+        --dump-codes "$smoke_tag" -o "$OUT_DIR/b7_smoke.wav"
+
+    local dump="$dump_dir/$smoke_tag.i16"
+    if [[ ! -s "$dump" ]]; then
+        fail "no codes written to $dump"
+        warn "the request succeeded, so this is the stale-image failure: the running"
+        warn "container predates patch 0007, or VOXTRAL_CODE_DUMP_DIR is not set on it"
+        say "what the container thinks its environment is"
+        sudo docker compose exec voxtral-tts printenv VOXTRAL_CODE_DUMP_DIR || \
+            warn "VOXTRAL_CODE_DUMP_DIR is unset inside the container"
+        sudo docker compose logs --tail 40 voxtral-tts | grep -i "PATCHED\|STOCK" || \
+            warn "no PATCHED/STOCK line in the recent logs"
+        exit 1
+    fi
+
+    # 74 bytes a frame (37 int16). Frames should match the wav's own duration at
+    # 12.5 Hz, which catches a dump that is written but misaligned or truncated.
+    local bytes frames expected wav_bytes
+    bytes=$(stat -c%s "$dump")
+    wav_bytes=$(stat -c%s "$OUT_DIR/b7_smoke.wav")
+    frames=$((bytes / 74))
+    expected=$(( (wav_bytes - 44) / 3840 ))
+    printf '  %s bytes, %s frames; wav implies %s frames\n' "$bytes" "$frames" "$expected"
+    if (( bytes % 74 != 0 )); then
+        fail "dump is not a whole number of frames, the row width is wrong"
+        exit 1
+    fi
+    if (( frames < expected - 2 || frames > expected + 2 )); then
+        warn "frame count and audio duration disagree by more than 2 frames"
+        warn "generation will still run, but check the collected codes before training"
+    else
+        ok "codes written and aligned with the audio, the dump path works"
+    fi
+    rm -f "$dump"
+
+    say "generating ${minutes} minutes of speech across 19 voices (holding out fr_female)"
+    say "this is the long part; watch the seconds-per-call line to judge the rate"
+    ./voxtral/cloning/mint_codes.py mint --minutes "$minutes"
+
+    say "what was collected"
+    ls -1 cache/cloning/codes | wc -l | xargs printf '  %s npy files in cache/cloning/codes\n'
+    du -sh cache/cloning/codes "$dump_dir"
+
+    # The GPU is the point of stopping here: the encoder training needs the whole
+    # card, and nothing else in this stage does.
+    say "stopping voxtral-tts to free the GPU for training"
+    sudo docker compose stop voxtral-tts
+    ok "GPU free"
+
+    say "B7 generation done. Hand back to the agent to train:"
+    echo "    ./voxtral/cloning/train_encoder.py --steps 30000 --batch 64 --frames 32"
+    echo "    ./voxtral/cloning/invert.py run --voice fr_female --init encoder"
+}
+
 # ------------------------------------------------------------------- main ----
 
 case "$STAGE" in
@@ -394,7 +522,7 @@ case "$STAGE" in
         sudo docker compose stop voxtral-tts
         ok "voxtral-tts stopped, GPU freed"
         ;;
-    diag | a1 | a2 | a3)
+    diag | a1 | a2 | a3 | b7)
         require_sudo
         say "stage $STAGE (log: $LOG_FILE)"
         "stage_$STAGE"
