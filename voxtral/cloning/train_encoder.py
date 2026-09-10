@@ -64,11 +64,18 @@ to the next. Real speech codes lie on a thin manifold where the mapping is smoot
 that is the only place the encoder is ever asked to work.
 
 So clips are drawn near the real material rather than anywhere: contiguous runs from
-one voice, which carry real temporal structure; frames resampled from the whole pool,
-which keep the real marginal statistics; and jittered runs, real frames whose acoustic
-levels are nudged by a few steps, which stay speech-like while giving unlimited
-distinct labels and are the answer to the 2920-frame shortage. One voice is held out
-entirely so the acceptance test is honest.
+one voice, which carry real temporal structure; jittered runs, real frames whose
+acoustic levels are nudged by a few steps, which stay speech-like while giving
+unlimited distinct labels; and frames resampled from the whole pool, which keep the
+real marginal statistics but scramble the order.
+
+That last one is off by default now, and the reason is the same lesson again at a
+smaller scale. A resampled clip is frames from unrelated voices and utterances glued
+together: the audio is not speech, and the temporal context is noise, which is exactly
+what the four across-frame layers exist to read. It was there to stretch 2823 frames,
+and B7 replaced that shortage with roughly 225,000 real ones minted from stage 0, so
+it now costs realism to buy coverage that is already bought. One voice is held out
+entirely, and test utterances are minted for it, so the acceptance test is honest.
 
 Usage
 -----
@@ -350,11 +357,11 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, clips: list[torch.
 @click.option("--buffer", default=4096, show_default=True, help="Clips held in the replay buffer.")
 @click.option("--refresh", default=8, show_default=True, help="Clips decoded fresh each step.")
 @click.option("--lr", default=3e-4, show_default=True, help="Adam learning rate.")
-@click.option("--contiguous", default=0.2, show_default=True,
+@click.option("--contiguous", default=0.7, show_default=True,
               help="Fraction of clips drawn as real contiguous runs.")
 @click.option("--random", "random_fraction", default=0.0, show_default=True,
               help="Fraction of clips drawn uniformly from the whole code space (measured useless).")
-@click.option("--jitter", default=0.5, show_default=True,
+@click.option("--jitter", default=0.3, show_default=True,
               help="Fraction of clips drawn as real runs with nudged acoustic levels.")
 @click.option("--jitter-levels", default=2, show_default=True,
               help="How far --jitter may move an acoustic level, in grid steps.")
