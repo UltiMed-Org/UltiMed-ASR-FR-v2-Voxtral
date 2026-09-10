@@ -507,54 +507,52 @@ def sweep_per_dim(*, model: torch.nn.Module, truth: torch.Tensor, target: torch.
                         f"{int((values < threshold).sum())} of {len(values)}")
 
 
-@click.group()
-def cli() -> None:
-    """Invert waveforms back to codes, and probe whether that is even possible."""
+def build_seed(*, model: torch.nn.Module, init_mode: str, truth: torch.Tensor,
+               target: torch.Tensor, frames: int, seed: int, voice: str,
+               encoder_path: str | None = None, init_noise: float = 0.1,
+               degrade_semantic: float = 0.25, degrade_acoustic: int = 1,
+               device: str = "cpu") -> torch.Tensor | None:
+    """Build the continuous starting point a search descends from.
 
+    Shared by every command that needs a seed, because what a seed is worth is the
+    question the whole track turns on and the modes have to stay comparable: `random`
+    and `centre` are the cold starts B3 measured at 0 pct, `truth` is its positive
+    control, `encoder` is the B7 checkpoint's guess, and `degraded` is the truth
+    corrupted to a chosen accuracy so the basin can be probed without an encoder.
 
-@cli.command()
-@click.option("--voice", default="fr_female", show_default=True, help="Voice to invert.")
-@click.option("--frames", default=32, show_default=True, help="Leading frames to solve for (12.5 Hz).")
-@click.option("--steps", default=0, show_default=True,
-              help="Adam steps of the discrete straight-through phase. Off by default: it "
-                   "measured strictly worse than snapping the continuous solution.")
-@click.option("--warmup", default=800, show_default=True, help="Adam steps of the continuous phase.")
-@click.option("--stage-steps", default=80, show_default=True,
-              help="Adam steps per prefix length in the progressive schedule (0 disables).")
-@click.option("--lr-semantic", default=1.0, show_default=True,
-              help="Adam rate for the semantic half; its codebook rows sit ~107 apart.")
-@click.option("--lr-acoustic", default=0.01, show_default=True,
-              help="Adam rate for the acoustic half; its grid step is 0.1 in [-1, 1].")
-@click.option("--commit-weight", default=1.0, show_default=True,
-              help="Weight of the semantic commitment term (0 disables).")
-@click.option("--wave-weight", default=1.0, show_default=True, help="Weight of the waveform L1 term (0 disables).")
-@click.option("--seed", default=0, show_default=True, help="Seed for the initial codebook rows.")
-@click.option("--init", "init_mode",
-              type=click.Choice(["random", "truth", "centre", "encoder", "degraded"]),
-              default="random", show_default=True,
-              help="Start from random codebook rows, from the truth plus noise, from the "
-                   "codebook's centre plus noise, from the trained encoder's prediction, "
-                   "or from the truth corrupted to a chosen accuracy.")
-@click.option("--encoder", "encoder_path", default=None,
-              help="Checkpoint for --init encoder (default: cache/cloning/B6/encoder.pt).")
-@click.option("--init-noise", default=0.1, show_default=True,
-              help="Relative noise added to the truth when --init truth.")
-@click.option("--degrade-semantic", default=0.25, show_default=True,
-              help="Fraction of semantic codes left correct when --init degraded.")
-@click.option("--degrade-acoustic", default=1, show_default=True,
-              help="Largest step an acoustic code drifts by when --init degraded.")
-@click.option("--device", default="cpu", show_default=True, help="Where to run.")
-@click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
-def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_semantic: float,
-        lr_acoustic: float, commit_weight: float, wave_weight: float, seed: int, init_mode: str,
-        init_noise: float, degrade_semantic: float, degrade_acoustic: int, device: str,
-        encoder_path: str | None, out_dir: str) -> None:
-    """Recover codes from a waveform and score them against the truth."""
-    model = load_decoder(find_snapshot(), device=device)
-    sample_rate = int(model.sampling_rate)
-    truth, target = build_targets(model, voice, frames)
-    logger.info(f"{voice}: {frames} frames, target {target.numel() / sample_rate:.2f} s")
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The audio tokenizer, for its codebooks and quantizer.
+    init_mode : str
+        One of `random`, `truth`, `centre`, `encoder`, `degraded`.
+    truth : torch.Tensor
+        `[K, T]` ground-truth codes, read by every mode except `random` and `centre`.
+    target : torch.Tensor
+        Target waveform, read only by `encoder`.
+    frames : int
+        Number of frames being solved for.
+    seed : int
+        Seed for whatever randomness the mode uses.
+    voice : str
+        Voice name, used only to check the encoder checkpoint's holdout honestly.
+    encoder_path : str, optional
+        Checkpoint for `encoder` mode; defaults to the B6 output directory.
+    init_noise : float
+        Relative noise for `truth` and `centre`.
+    degrade_semantic : float
+        Fraction of semantic codes left correct in `degraded` mode.
+    degrade_acoustic : int
+        Largest step an acoustic code drifts by in `degraded` mode.
+    device : str
+        Where the encoder checkpoint is loaded.
 
+    Returns
+    -------
+    torch.Tensor or None
+        `[T, 292]` continuous decoder input, or None for `random`, which lets the
+        caller fall back to its own random codebook rows.
+    """
     init = None
     if init_mode == "encoder":
         # Imported here rather than at module scope because train_encoder imports
@@ -631,6 +629,61 @@ def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_s
         # Per-dim scaling: a single global std is dominated by the 256 semantic dims and
         # would swamp the 36 acoustic ones, whose grid spacing is only 0.1 in [-1, 1].
         init = exact + init_noise * exact.std(dim=0, keepdim=True) * noise
+    return init
+
+
+@click.group()
+def cli() -> None:
+    """Invert waveforms back to codes, and probe whether that is even possible."""
+
+
+@cli.command()
+@click.option("--voice", default="fr_female", show_default=True, help="Voice to invert.")
+@click.option("--frames", default=32, show_default=True, help="Leading frames to solve for (12.5 Hz).")
+@click.option("--steps", default=0, show_default=True,
+              help="Adam steps of the discrete straight-through phase. Off by default: it "
+                   "measured strictly worse than snapping the continuous solution.")
+@click.option("--warmup", default=800, show_default=True, help="Adam steps of the continuous phase.")
+@click.option("--stage-steps", default=80, show_default=True,
+              help="Adam steps per prefix length in the progressive schedule (0 disables).")
+@click.option("--lr-semantic", default=1.0, show_default=True,
+              help="Adam rate for the semantic half; its codebook rows sit ~107 apart.")
+@click.option("--lr-acoustic", default=0.01, show_default=True,
+              help="Adam rate for the acoustic half; its grid step is 0.1 in [-1, 1].")
+@click.option("--commit-weight", default=1.0, show_default=True,
+              help="Weight of the semantic commitment term (0 disables).")
+@click.option("--wave-weight", default=1.0, show_default=True, help="Weight of the waveform L1 term (0 disables).")
+@click.option("--seed", default=0, show_default=True, help="Seed for the initial codebook rows.")
+@click.option("--init", "init_mode",
+              type=click.Choice(["random", "truth", "centre", "encoder", "degraded"]),
+              default="random", show_default=True,
+              help="Start from random codebook rows, from the truth plus noise, from the "
+                   "codebook's centre plus noise, from the trained encoder's prediction, "
+                   "or from the truth corrupted to a chosen accuracy.")
+@click.option("--encoder", "encoder_path", default=None,
+              help="Checkpoint for --init encoder (default: cache/cloning/B6/encoder.pt).")
+@click.option("--init-noise", default=0.1, show_default=True,
+              help="Relative noise added to the truth when --init truth.")
+@click.option("--degrade-semantic", default=0.25, show_default=True,
+              help="Fraction of semantic codes left correct when --init degraded.")
+@click.option("--degrade-acoustic", default=1, show_default=True,
+              help="Largest step an acoustic code drifts by when --init degraded.")
+@click.option("--device", default="cpu", show_default=True, help="Where to run.")
+@click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
+def run(voice: str, frames: int, steps: int, warmup: int, stage_steps: int, lr_semantic: float,
+        lr_acoustic: float, commit_weight: float, wave_weight: float, seed: int, init_mode: str,
+        init_noise: float, degrade_semantic: float, degrade_acoustic: int, device: str,
+        encoder_path: str | None, out_dir: str) -> None:
+    """Recover codes from a waveform and score them against the truth."""
+    model = load_decoder(find_snapshot(), device=device)
+    sample_rate = int(model.sampling_rate)
+    truth, target = build_targets(model, voice, frames)
+    logger.info(f"{voice}: {frames} frames, target {target.numel() / sample_rate:.2f} s")
+
+    init = build_seed(model=model, init_mode=init_mode, truth=truth, target=target,
+                      frames=frames, seed=seed, voice=voice, encoder_path=encoder_path,
+                      init_noise=init_noise, degrade_semantic=degrade_semantic,
+                      degrade_acoustic=degrade_acoustic, device=device)
     codes, waveform, warm_codes = invert(model, target, frames, steps=steps, warmup=warmup,
                                          lr_semantic=lr_semantic, lr_acoustic=lr_acoustic,
                                          commit_weight=commit_weight, stage_steps=stage_steps,
