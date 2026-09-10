@@ -507,6 +507,57 @@ def sweep_per_dim(*, model: torch.nn.Module, truth: torch.Tensor, target: torch.
                         f"{int((values < threshold).sum())} of {len(values)}")
 
 
+def encoder_logits(model: torch.nn.Module, *, target: torch.Tensor, frames: int, voice: str,
+                   encoder_path: str | None = None,
+                   device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the B7 encoder over a waveform and return its per-frame opinions.
+
+    Shared by the seeding path and the shortlist path, which need the same forward pass
+    for different reasons: one takes the argmax as a starting point, the other keeps the
+    ranking and throws the argmax away. Both must load the same checkpoint and report the
+    same holdout warning, so neither gets to reimplement it.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The audio tokenizer, for the codebook shapes the encoder was built against.
+    target : torch.Tensor
+        Target waveform.
+    frames : int
+        Number of frames to predict.
+    voice : str
+        Voice name, checked against the checkpoint's holdout so an optimistic score
+        cannot pass silently as an honest one.
+    encoder_path : str, optional
+        Checkpoint path; defaults to the B6 output directory.
+    device : str
+        Where to load and run it.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        `[1, T, 8192]` semantic logits and `[1, T, 36, n_levels]` acoustic logits.
+    """
+    # Imported here rather than at module scope because train_encoder imports
+    # quantize_emb from this file; a top-level import either way would be circular.
+    from train_encoder import OUT_DIR as ENCODER_DIR, FrameEncoder
+
+    checkpoint = torch.load(encoder_path or (ENCODER_DIR / "encoder.pt"),
+                            map_location=device, weights_only=False)
+    encoder = FrameEncoder(semantic_codebook=model.quantizer.semantic_codebook.embedding,
+                           acoustic_dim=model.quantizer.acoustic_codebook.dim,
+                           n_levels=model.quantizer.acoustic_codebook.n_levels).to(device)
+    encoder.load_state_dict(checkpoint["state_dict"])
+    encoder.eval()
+    if checkpoint.get("holdout") == voice:
+        logger.info(f"encoder was trained with {voice} held out, so this is an honest test")
+    else:
+        logger.warning(f"encoder held out {checkpoint.get('holdout')!r}, not {voice!r}: "
+                       "this voice was in its training set, treat the score as optimistic")
+    with torch.no_grad():
+        return encoder(target[None], frames)
+
+
 def build_seed(*, model: torch.nn.Module, init_mode: str, truth: torch.Tensor,
                target: torch.Tensor, frames: int, seed: int, voice: str,
                encoder_path: str | None = None, init_noise: float = 0.1,
@@ -555,24 +606,9 @@ def build_seed(*, model: torch.nn.Module, init_mode: str, truth: torch.Tensor,
     """
     init = None
     if init_mode == "encoder":
-        # Imported here rather than at module scope because train_encoder imports
-        # quantize_emb from this file; a top-level import either way would be circular.
-        from train_encoder import OUT_DIR as ENCODER_DIR, FrameEncoder
-
-        checkpoint = torch.load(encoder_path or (ENCODER_DIR / "encoder.pt"),
-                                map_location=device, weights_only=False)
-        encoder = FrameEncoder(semantic_codebook=model.quantizer.semantic_codebook.embedding,
-                               acoustic_dim=model.quantizer.acoustic_codebook.dim,
-                               n_levels=model.quantizer.acoustic_codebook.n_levels).to(device)
-        encoder.load_state_dict(checkpoint["state_dict"])
-        encoder.eval()
-        if checkpoint.get("holdout") == voice:
-            logger.info(f"encoder was trained with {voice} held out, so this is an honest test")
-        else:
-            logger.warning(f"encoder held out {checkpoint.get('holdout')!r}, not {voice!r}: "
-                           "this voice was in its training set, treat the score as optimistic")
-        with torch.no_grad():
-            semantic_logits, acoustic_logits = encoder(target[None], frames)
+        semantic_logits, acoustic_logits = encoder_logits(
+            model, target=target, frames=frames, voice=voice,
+            encoder_path=encoder_path, device=device)
         # The seed must be a *code*, not the encoder's soft opinion about one: B3 found
         # descent helpless anywhere between codebook rows, and averaging the top few rows
         # would land exactly there. So take the argmax and hand descent a point that is
@@ -1289,6 +1325,9 @@ def sensitivity(voice: str, frames: int, trials: int, seed: int, per_dim: bool,
 @click.option("--lr-acoustic", default=0.01, show_default=True,
               help="Adam rate for the acoustic half; the grid step is 0.1 in [-1, 1].")
 @click.option("--chunk", default=256, show_default=True, help="Semantic candidates per decoder pass.")
+@click.option("--shortlist", default=0, show_default=True,
+              help="Score only the encoder's top-K rows per frame instead of all 8192 "
+                   "(0 = exhaustive). Asks only that the truth be in the shortlist.")
 @click.option("--window", default=16, show_default=True,
               help="Frames of prefix to decode when scoring one frame (0 = all).")
 @click.option("--seed", default=0, show_default=True, help="Seed for the starting point.")
@@ -1306,8 +1345,9 @@ def sensitivity(voice: str, frames: int, trials: int, seed: int, per_dim: bool,
 @click.option("--device", default="cuda", show_default=True, help="Where to run; cpu is far slower.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
 def alternate(voice: str, frames: int, rounds: int, warmup: int, lr_acoustic: float, chunk: int,
-              window: int, seed: int, init_mode: str, encoder_path: str | None, init_noise: float,
-              degrade_semantic: float, degrade_acoustic: int, device: str, out_dir: str) -> None:
+              shortlist: int, window: int, seed: int, init_mode: str, encoder_path: str | None,
+              init_noise: float, degrade_semantic: float, degrade_acoustic: int, device: str,
+              out_dir: str) -> None:
     """Solve the two halves in turn instead of together (stage B8).
 
     B8 measured that joint descent destroys its own starting point: handed codes whose
@@ -1327,9 +1367,14 @@ def alternate(voice: str, frames: int, rounds: int, warmup: int, lr_acoustic: fl
     when the acoustics come from a solve, which is the quantity that decides whether the
     alternation converges or stalls.
 
-    Scoring is exhaustive over all 8192 rows. The B7 encoder's median rank of 111 means a
-    few-hundred-row shortlist would cover the truth more than half the time, which is the
-    obvious speedup once the exhaustive version has said whether this works at all.
+    Scoring is exhaustive over all 8192 rows unless `--shortlist K` restricts it to the B7
+    encoder's top K per frame. That is not a speedup, it is the point: the measured failure
+    mode is that wrong rows genuinely outscore the true one while the acoustics are still
+    imperfect, and a shortlist removes most wrong rows from consideration. It also asks far
+    less of the encoder than seeding does, since the truth only has to be somewhere in the
+    list rather than ranked first, and the encoder's median rank of 111 to 167 means a
+    256-row list covers it more than half the time. The log reports that coverage, which
+    bounds what any shortlist size can achieve.
     """
     model = load_decoder(find_snapshot(), device=device)
     sample_rate = int(model.sampling_rate)
@@ -1356,6 +1401,17 @@ def alternate(voice: str, frames: int, rounds: int, warmup: int, lr_acoustic: fl
         with torch.no_grad():
             init = model.quantizer.decode(picked[None])[0].transpose(0, 1)
     codes = quantize_emb(model, init).to(device)
+
+    candidates = None
+    if shortlist:
+        semantic_logits, _ = encoder_logits(model, target=target, frames=frames, voice=voice,
+                                            encoder_path=encoder_path, device=device)
+        candidates = semantic_logits[0].topk(shortlist, dim=-1).indices               # [T, K]
+        covered = (candidates == truth[0][:, None]).any(dim=-1).float().mean().item()
+        # The ceiling on this run: a frame whose true row is missing from its shortlist can
+        # never be solved, however good the acoustics get.
+        logger.info(f"shortlist {shortlist} of {table.shape[0]}: truth present on "
+                    f"{100 * covered:.0f}% of frames")
     history = []
 
     for round_index in range(rounds):
@@ -1376,15 +1432,25 @@ def alternate(voice: str, frames: int, rounds: int, warmup: int, lr_acoustic: fl
             evaluate = frame_context(model, codes, target, frame, window=window,
                                      mel_banks=mel_banks, samples_per_frame=samples_per_frame)
             values = codes[1:, frame].float() * 2.0 / (n_levels - 1) - 1.0
+            pool = candidates[frame] if candidates is not None else None
+            rows_all = table if pool is None else table[pool]
             losses = []
             with torch.no_grad():
-                for low in range(0, table.shape[0], chunk):
-                    rows = table[low:low + chunk]
+                for low in range(0, rows_all.shape[0], chunk):
+                    rows = rows_all[low:low + chunk]
                     losses.append(evaluate(rows, values[None].expand(rows.shape[0], -1)))
             losses = torch.cat(losses)
-            best = int(losses.argmin())
+            pick = int(losses.argmin())
+            best = pick if pool is None else int(pool[pick])
             true_code = int(truth[0, frame])
-            ranks.append(int((losses < losses[true_code]).sum()))
+            if pool is None:
+                ranks.append(int((losses < losses[true_code]).sum()))
+            else:
+                # A truth outside the shortlist has no rank within it; count it as the worst
+                # possible so the median cannot flatter a run whose ceiling was already lost.
+                where = (pool == true_code).nonzero()
+                ranks.append(int((losses < losses[where[0, 0]]).sum()) if where.numel()
+                             else shortlist)
             changed += int(best != int(codes[0, frame]))
             codes[0, frame] = best
         after_semantic = score(codes.cpu(), truth.cpu(), n_levels)
