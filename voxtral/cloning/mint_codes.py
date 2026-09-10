@@ -100,7 +100,7 @@ def voice_language(voice: str) -> str:
     return prefix if len(prefix) == 2 else DEFAULT_LANGUAGE
 
 
-def fetch_articles(language: str, articles: int) -> list[str]:
+def fetch_articles(language: str, articles: int, delay: float = BASE_DELAY) -> list[str]:
     """Fetch random article intros from one Wikipedia.
 
     Parameters
@@ -109,6 +109,8 @@ def fetch_articles(language: str, articles: int) -> list[str]:
         Wikipedia language code.
     articles : int
         Roughly how many to fetch; the API caps a batch at 20.
+    delay : float
+        Seconds to pause between batches, and the base of the retry backoff.
 
     Returns
     -------
@@ -140,14 +142,14 @@ def fetch_articles(language: str, articles: int) -> list[str]:
             except urllib.error.HTTPError as error:
                 if error.code not in (429, 500, 502, 503, 504) or attempt == 5:
                     raise
-                delay = BASE_DELAY * 2 ** attempt
-                logger.debug(f"{language}: HTTP {error.code}, retrying in {delay:.1f}s")
-                time.sleep(delay)
+                backoff = delay * 2 ** attempt
+                logger.debug(f"{language}: HTTP {error.code}, retrying in {backoff:.1f}s")
+                time.sleep(backoff)
         else:  # pragma: no cover - the loop always breaks or raises
             break
         # Courtesy pause between batches, which is also what keeps the retries above
         # from being needed on every one.
-        time.sleep(BASE_DELAY)
+        time.sleep(delay)
         batch = [page.get("extract", "").strip() for page in pages.values()]
         out.extend(text for text in batch if text)
         if not batch:
@@ -257,15 +259,24 @@ def cli() -> None:
 @click.option("--articles", default=400, show_default=True, help="Articles per language.")
 @click.option("--language", "languages", multiple=True,
               help="Language codes to fetch. Default: every language the 20 voices speak.")
+@click.option("--delay", default=BASE_DELAY, show_default=True,
+              help="Seconds between batches, and the base of the retry backoff. Raise it if a "
+                   "language keeps failing with 429: sustained fetching is rate-limited harder "
+                   "than a single burst.")
 @click.option("--out-dir", default=str(CORPUS_DIR), show_default=True, help="Where to write the text.")
-def corpus(articles: int, languages: tuple[str, ...], out_dir: str) -> None:
+def corpus(articles: int, languages: tuple[str, ...], delay: float, out_dir: str) -> None:
     """Fetch random Wikipedia article intros as generation material."""
     wanted = list(languages) or sorted({voice_language(voice) for voice in tts.VOXTRAL_VOICES})
     destination = Path(out_dir)
     destination.mkdir(parents=True, exist_ok=True)
     for language in wanted:
+        # Never overwrite a language already fetched: a rerun is normally there to
+        # fill in the ones a rate limit skipped.
+        if (destination / f"{language}.txt").exists():
+            logger.info(f"{language}: already fetched, skipped")
+            continue
         try:
-            texts = [clean(text) for text in fetch_articles(language, articles)]
+            texts = [clean(text) for text in fetch_articles(language, articles, delay=delay)]
         except OSError as error:
             logger.warning(f"{language}: fetch failed ({error}), skipped")
             continue
