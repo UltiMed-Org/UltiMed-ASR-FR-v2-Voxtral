@@ -93,6 +93,8 @@ from decoder import codes_from_table_space, find_snapshot, load_decoder  # noqa:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CODES_DIR = REPO_ROOT / "cache" / "cloning" / "codes"
 OUT_DIR = REPO_ROOT / "cache" / "cloning" / "B6"
+# Minted utterances of the held-out voice: same distribution as training, never in it.
+TEST_DIR = REPO_ROOT / "cache" / "cloning" / "codes_test"
 
 # 1920 = 4 * 4 * 4 * 5 * 3 * 2, the decoder's samples per 12.5 Hz frame. The encoder
 # walks that back down in the same number of stages.
@@ -293,9 +295,23 @@ def sample_codes(voices: list[torch.Tensor], pool: torch.Tensor, batch: int, fra
     return torch.stack(out)
 
 
-def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tensor,
+def measure(model: torch.nn.Module, decoder: torch.nn.Module, clips: list[torch.Tensor],
             top_k: int = 16) -> dict[str, float]:
-    """Score a prediction against the truth it was generated from.
+    """Score predictions against the truth they were generated from.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The encoder under test.
+    decoder : torch.nn.Module
+        Codec decoder, used to make each clip's audio.
+    clips : list[torch.Tensor]
+        `[1, K, T]` held-out code sequences. A list rather than one tensor because they
+        have different lengths, and because averaging over several utterances is the
+        point: the shipped `fr_female` prefix alone is 96 frames holding 64 distinct
+        semantic codes, far too small and too repetitive to read a percentage off.
+    top_k : int
+        Shortlist size for the top-k figure.
 
     Returns
     -------
@@ -305,18 +321,26 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tenso
         from, so a frame whose truth is second is nearly as good as one where it is
         first, and a frame where it is nowhere is lost.
     """
+    totals = {"semantic_top1_pct": 0.0, "semantic_topk_pct": 0.0,
+              "acoustic_exact_pct": 0.0, "acoustic_within1_pct": 0.0}
+    frames = 0
     with torch.no_grad():
-        waveform = decoder.decode(codes)[0, 0]
-        semantic, acoustic = model(waveform[None], codes.shape[-1])
-        truth_semantic, truth_acoustic = codes[0, 0], codes[0, 1:]
-        ranked = semantic[0].topk(top_k, dim=-1).indices                  # [T, k]
-        levels = acoustic[0].argmax(dim=-1).transpose(0, 1)               # [36, T]
-        return {
-            "semantic_top1_pct": (ranked[:, 0] == truth_semantic).float().mean().item() * 100,
-            "semantic_topk_pct": (ranked == truth_semantic[:, None]).any(dim=-1).float().mean().item() * 100,
-            "acoustic_exact_pct": (levels == truth_acoustic).float().mean().item() * 100,
-            "acoustic_within1_pct": ((levels - truth_acoustic).abs() <= 1).float().mean().item() * 100,
-        }
+        for codes in clips:
+            waveform = decoder.decode(codes)[0, 0]
+            semantic, acoustic = model(waveform[None], codes.shape[-1])
+            truth_semantic, truth_acoustic = codes[0, 0], codes[0, 1:]
+            ranked = semantic[0].topk(top_k, dim=-1).indices                  # [T, k]
+            levels = acoustic[0].argmax(dim=-1).transpose(0, 1)               # [36, T]
+            # Summed rather than averaged per clip, then divided by the total below, so
+            # a long utterance counts for more than a short one.
+            totals["semantic_top1_pct"] += (ranked[:, 0] == truth_semantic).float().sum().item()
+            totals["semantic_topk_pct"] += (
+                ranked == truth_semantic[:, None]).any(dim=-1).float().sum().item()
+            totals["acoustic_exact_pct"] += (levels == truth_acoustic).float().mean(dim=0).sum().item()
+            totals["acoustic_within1_pct"] += (
+                (levels - truth_acoustic).abs() <= 1).float().mean(dim=0).sum().item()
+            frames += codes.shape[-1]
+    return {key: 100 * value / max(frames, 1) for key, value in totals.items()}
 
 
 @click.command()
@@ -335,12 +359,14 @@ def measure(model: torch.nn.Module, decoder: torch.nn.Module, codes: torch.Tenso
 @click.option("--jitter-levels", default=2, show_default=True,
               help="How far --jitter may move an acoustic level, in grid steps.")
 @click.option("--holdout", default="fr_female", show_default=True, help="Voice excluded from training.")
+@click.option("--test-dir", default=str(TEST_DIR), show_default=True,
+              help="Extra held-out clips to score against, minted for the holdout voice.")
 @click.option("--device", default="cuda", show_default=True, help="Where to run.")
 @click.option("--seed", default=0, show_default=True, help="Seed for the data draw.")
 @click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write the weights.")
 def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: float,
          contiguous: float, random_fraction: float, jitter: float, jitter_levels: int,
-         holdout: str, device: str, seed: int, out_dir: str) -> None:
+         holdout: str, test_dir: str, device: str, seed: int, out_dir: str) -> None:
     """Train the audio -> decoder-input encoder on decoder-generated pairs."""
     decoder = load_decoder(find_snapshot(), device=device)
     for param in decoder.parameters():
@@ -360,7 +386,17 @@ def main(steps: int, batch: int, frames: int, buffer: int, refresh: int, lr: flo
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     generator = torch.Generator(device=device).manual_seed(seed)
-    held = codes_from_table_space(np.load(CODES_DIR / f"{holdout}.npy")).to(device)[None]
+    # The held-out voice's shipped prefix, plus any test utterances minted for it
+    # (mint_codes.py mint --voice <holdout> --codes-dir <test dir>). The prefix alone is
+    # 96 frames with 64 distinct semantic codes, not enough to read a number off; minted
+    # test utterances are the same distribution as training while never being in it.
+    held = [codes_from_table_space(np.load(CODES_DIR / f"{holdout}.npy")).to(device)[None]]
+    test_root = Path(test_dir)
+    if test_root.is_dir():
+        for path in sorted(test_root.glob("*.npy")):
+            held.append(codes_from_table_space(np.load(path)).to(device)[None])
+    logger.info(f"held-out test: {len(held)} clips, "
+                f"{sum(clip.shape[-1] for clip in held)} frames")
 
     # Decoding a fresh batch every step makes the *decoder* the cost of training (0.57 s a
     # step at batch 64, where the encoder's own forward and backward are a fraction of

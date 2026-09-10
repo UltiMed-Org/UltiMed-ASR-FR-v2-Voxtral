@@ -295,15 +295,25 @@ def corpus(articles: int, languages: tuple[str, ...], delay: float, out_dir: str
                    "saturates around 4 to 8.")
 @click.option("--holdout", default="fr_female", show_default=True,
               help="Voice never generated with, so the trainer's held-out test stays honest.")
+@click.option("--voice", "only_voices", multiple=True,
+              help="Generate with exactly these voices instead of all-but-holdout. This is how the "
+                   "held-out voice's TEST set is minted: point --codes-dir and --dump-dir elsewhere "
+                   "so it never joins the training pool.")
 @click.option("--timeout", default=600.0, show_default=True, help="Seconds per request.")
 @click.option("--corpus-dir", default=str(CORPUS_DIR), show_default=True, help="Where the text is.")
 @click.option("--dump-dir", default=str(DUMP_DIR), show_default=True,
               help="Host side of the container's VOXTRAL_CODE_DUMP_DIR.")
 @click.option("--codes-dir", default=str(CODES_DIR), show_default=True, help="Where to collect the codes.")
-def mint(minutes: float, url: str, max_chars: int, concurrency: int, holdout: str, timeout: float,
-         corpus_dir: str, dump_dir: str, codes_dir: str) -> None:
+def mint(minutes: float, url: str, max_chars: int, concurrency: int, holdout: str,
+         only_voices: tuple[str, ...], timeout: float, corpus_dir: str, dump_dir: str,
+         codes_dir: str) -> None:
     """Generate speech across every voice and keep the codes stage 0 emitted."""
-    voices = [voice for voice in tts.VOXTRAL_VOICES if voice != holdout]
+    voices = list(only_voices) or [voice for voice in tts.VOXTRAL_VOICES if voice != holdout]
+    if only_voices:
+        # Said out loud because minting the holdout into the training directory is the
+        # one mistake here that would not fail, it would just quietly inflate the score.
+        logger.warning(f"generating with {', '.join(voices)} only; make sure --codes-dir "
+                       f"({codes_dir}) is not the training pool if one of these is the holdout")
     by_language: dict[str, list[str]] = {}
     for path in sorted(Path(corpus_dir).glob("*.txt")):
         by_language[path.stem] = utterances(path.read_text(encoding="utf-8").split("\n"), max_chars)
@@ -330,7 +340,8 @@ def mint(minutes: float, url: str, max_chars: int, concurrency: int, holdout: st
         total += len(text)
         index += 1
     logger.info(f"{len(jobs)} utterances, about {total / 15 / 60:.0f} min of speech, "
-                f"{len(voices)} voices, holding out {holdout}")
+                f"{len(voices)} voices"
+                + ("" if only_voices else f", holding out {holdout}"))
 
     destination = Path(dump_dir)
     destination.mkdir(parents=True, exist_ok=True)
