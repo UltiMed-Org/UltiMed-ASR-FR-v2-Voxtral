@@ -1280,5 +1280,143 @@ def sensitivity(voice: str, frames: int, trials: int, seed: int, per_dim: bool,
                     f"(min {losses_t.min():7.4f})")
 
 
+@cli.command()
+@click.option("--voice", default="fr_female", show_default=True, help="Voice to invert.")
+@click.option("--frames", default=32, show_default=True, help="Leading frames to solve for.")
+@click.option("--rounds", default=6, show_default=True, help="Alternations to run.")
+@click.option("--warmup", default=200, show_default=True,
+              help="Adam steps of the acoustic solve per round.")
+@click.option("--lr-acoustic", default=0.01, show_default=True,
+              help="Adam rate for the acoustic half; the grid step is 0.1 in [-1, 1].")
+@click.option("--chunk", default=256, show_default=True, help="Semantic candidates per decoder pass.")
+@click.option("--window", default=16, show_default=True,
+              help="Frames of prefix to decode when scoring one frame (0 = all).")
+@click.option("--seed", default=0, show_default=True, help="Seed for the starting point.")
+@click.option("--init", "init_mode",
+              type=click.Choice(["random", "truth", "centre", "encoder", "degraded"]),
+              default="degraded", show_default=True, help="Where to start; see build_seed.")
+@click.option("--encoder", "encoder_path", default=None,
+              help="Checkpoint for --init encoder (default: cache/cloning/B6/encoder.pt).")
+@click.option("--init-noise", default=0.1, show_default=True,
+              help="Relative noise added to the truth when --init truth.")
+@click.option("--degrade-semantic", default=0.25, show_default=True,
+              help="Fraction of semantic codes left correct when --init degraded.")
+@click.option("--degrade-acoustic", default=1, show_default=True,
+              help="Largest step an acoustic code drifts by when --init degraded.")
+@click.option("--device", default="cuda", show_default=True, help="Where to run; cpu is far slower.")
+@click.option("--out-dir", default=str(OUT_DIR), show_default=True, help="Where to write wavs and metrics.")
+def alternate(voice: str, frames: int, rounds: int, warmup: int, lr_acoustic: float, chunk: int,
+              window: int, seed: int, init_mode: str, encoder_path: str | None, init_noise: float,
+              degrade_semantic: float, degrade_acoustic: int, device: str, out_dir: str) -> None:
+    """Solve the two halves in turn instead of together (stage B8).
+
+    B8 measured that joint descent destroys its own starting point: handed codes whose
+    semantic half was 100 pct correct and whose acoustic half was off by at most one grid
+    step, it came out at 43.75 pct, because the residual in the 36 acoustic dims produces
+    gradients that push the 256-dim semantic embeddings off their codebook rows, and once
+    one crosses into a neighbouring cell nothing pulls it back. With the semantic half
+    frozen the same seed recovers 100 pct of both halves, bit exact, and the acoustic
+    solve degrades gracefully rather than collapsing when the frozen semantic codes are
+    wrong (89.6 pct exact from a seed that is only 25 pct right).
+
+    So the halves are solved apart. Each round freezes the semantic codes and descends the
+    acoustic dims, then freezes those and rescores every semantic candidate per frame,
+    which is a discrete choice of one row in 8192 rather than a gradient problem. B3
+    measured the true code as the unique argmin by 400x when the acoustics are right and
+    rank 241 when they sit at a search's starting values; this asks where the argmin lands
+    when the acoustics come from a solve, which is the quantity that decides whether the
+    alternation converges or stalls.
+
+    Scoring is exhaustive over all 8192 rows. The B7 encoder's median rank of 111 means a
+    few-hundred-row shortlist would cover the truth more than half the time, which is the
+    obvious speedup once the exhaustive version has said whether this works at all.
+    """
+    model = load_decoder(find_snapshot(), device=device)
+    sample_rate = int(model.sampling_rate)
+    truth, target = build_targets(model, voice, frames)
+    n_levels = model.quantizer.acoustic_codebook.n_levels
+    table = model.quantizer.semantic_codebook.embedding.float().to(device)
+    mel_banks = {n_fft: mel_filterbank(n_fft, N_MELS, sample_rate).to(device)
+                 for n_fft, _ in STFT_SCALES}
+    samples_per_frame = target.numel() // frames
+    logger.info(f"{voice}: {frames} frames, target {target.numel() / sample_rate:.2f} s")
+
+    init = build_seed(model=model, init_mode=init_mode, truth=truth, target=target, frames=frames,
+                      seed=seed, voice=voice, encoder_path=encoder_path, init_noise=init_noise,
+                      degrade_semantic=degrade_semantic, degrade_acoustic=degrade_acoustic,
+                      device=device)
+    if init is None:
+        # `random` hands back nothing, so start on the manifold at random rows rather than
+        # anywhere between them: B3 found descent helpless off the codebook.
+        generator = torch.Generator().manual_seed(seed)
+        rows = torch.randint(table.shape[0], (frames,), generator=generator).to(device)
+        picked = torch.cat([rows[None],
+                            torch.full((truth.shape[0] - 1, frames), (n_levels - 1) // 2,
+                                       dtype=torch.long, device=device)], dim=0)
+        with torch.no_grad():
+            init = model.quantizer.decode(picked[None])[0].transpose(0, 1)
+    codes = quantize_emb(model, init).to(device)
+    history = []
+
+    for round_index in range(rounds):
+        # Half one: semantic frozen (lr_semantic=0 is the whole finding), acoustic free.
+        with torch.no_grad():
+            start = model.quantizer.decode(codes[None])[0].transpose(0, 1)
+        codes, waveform, _ = invert(model, target, frames, steps=0, warmup=warmup, stage_steps=0,
+                                    lr_semantic=0.0, lr_acoustic=lr_acoustic, commit_weight=1.0,
+                                    wave_weight=1.0, seed=seed, init=start)
+        codes = codes.to(device)
+        after_acoustic = score(codes.cpu(), truth.cpu(), n_levels)
+
+        # Half two: acoustic frozen, every semantic row scored per frame. Frames are done
+        # left to right so each one is judged against a prefix already updated this round,
+        # which is what makes a wrong early code recoverable instead of poisoning the rest.
+        ranks, changed = [], 0
+        for frame in range(frames):
+            evaluate = frame_context(model, codes, target, frame, window=window,
+                                     mel_banks=mel_banks, samples_per_frame=samples_per_frame)
+            values = codes[1:, frame].float() * 2.0 / (n_levels - 1) - 1.0
+            losses = []
+            with torch.no_grad():
+                for low in range(0, table.shape[0], chunk):
+                    rows = table[low:low + chunk]
+                    losses.append(evaluate(rows, values[None].expand(rows.shape[0], -1)))
+            losses = torch.cat(losses)
+            best = int(losses.argmin())
+            true_code = int(truth[0, frame])
+            ranks.append(int((losses < losses[true_code]).sum()))
+            changed += int(best != int(codes[0, frame]))
+            codes[0, frame] = best
+        after_semantic = score(codes.cpu(), truth.cpu(), n_levels)
+        rank_tensor = torch.tensor(ranks, dtype=torch.float)
+        logger.info(
+            f"round {round_index}: acoustic solve -> semantic {after_acoustic['semantic_exact_pct']:5.1f}% "
+            f"acoustic exact {after_acoustic['acoustic_exact_pct']:5.1f}%; "
+            f"rescore -> semantic {after_semantic['semantic_exact_pct']:5.1f}% "
+            f"(true code median rank {rank_tensor.median():.0f}, "
+            f"rank 1 on {100 * (rank_tensor == 0).float().mean():.0f}% of frames), "
+            f"{changed} codes changed")
+        history.append({"round": round_index, "after_acoustic": after_acoustic,
+                        "after_semantic": after_semantic,
+                        "true_code_median_rank": rank_tensor.median().item(),
+                        "codes_changed": changed})
+        if changed == 0:
+            # A fixed point: neither half moves the other any more, so further rounds are
+            # identical work. Whether it is the right fixed point is what the score says.
+            logger.info("fixed point reached, stopping")
+            break
+
+    final = score(codes.cpu(), truth.cpu(), n_levels)
+    logger.info(f"final: semantic exact {final['semantic_exact_pct']:6.2f}% "
+                f"acoustic exact {final['acoustic_exact_pct']:6.2f}% "
+                f"within1 {final['acoustic_within1_pct']:6.2f}%")
+    destination = Path(out_dir)
+    write_wav(destination / f"{voice}_alternate.wav", waveform.cpu(), sample_rate)
+    np.save(destination / f"{voice}_alternate_codes.npy", codes.cpu().numpy().astype(np.int16))
+    (destination / f"{voice}_alternate_metrics.json").write_text(
+        json.dumps({"final": final, "rounds": history}, indent=2))
+    logger.info(f"wrote {destination}")
+
+
 if __name__ == "__main__":
     cli()
