@@ -422,8 +422,12 @@ stage_a5() {
     # voxtral-tts (~17 GB, first boot up to 30 min, warm boot ~2 min) and
     # synthesizes 40 takes, roughly 8 min. Phase 2 stops it and boots the ASR
     # stack instead, so the two never contend for the card, then transcribes
-    # those 40 takes, roughly 3 min. Total 15 to 45 min depending on boot.
-    # Disk: negligible, ~15 MB of wav. Network: none (both images are local).
+    # those 40 takes, roughly 3 min. Total 20 to 60 min depending on boot.
+    # Disk: ~15 MB of wav, plus up to ~2 GB the first time if the ASR image and
+    # the whisper weights are not cached yet. Network: none for the TTS side,
+    # but the ASR side may pull an image and download a model. The 2026-09-11
+    # run spent past a 600s budget doing exactly that, which is why phase 2 now
+    # waits as patiently as phase 1 and says what it is waiting on.
     #
     # The sweep is the 20 shipped voices only. Derived voices are A6's business:
     # there is no point blending voices before knowing which bases survive
@@ -471,22 +475,43 @@ stage_a5() {
     sudo docker compose stop voxtral-tts
     ok "voxtral-tts stopped"
 
-    # The ASR service is key-protected and, on recent builds, refuses a request
-    # that names no model. Both are passed through to asr.py by voice_survey.
+    # The ASR service is key-protected. compose is the source of truth for the
+    # keys, so read the first one from there rather than asking the operator to
+    # export what the repo already knows.
     if [[ -z "${CRISPASR_API_KEY:-}" ]]; then
-        warn "CRISPASR_API_KEY is unset, so scoring will fail; export it and re-run"
-        warn "the wavs are already in $root, so a re-run only repeats phase 2"
+        CRISPASR_API_KEY="$(sed -n 's/.*CRISPASR_API_KEYS=\([^, ]*\).*/\1/p' docker-compose.yml | head -1)"
+        export CRISPASR_API_KEY
+        if [[ -n "$CRISPASR_API_KEY" ]]; then
+            ok "using the ASR key from docker-compose.yml"
+        else
+            fail "no ASR key in the environment or in docker-compose.yml"
+            return 1
+        fi
     fi
+
     sudo docker compose up -d crispasr crispasr-lb
-    local deadline=$((SECONDS + 600))
+    # Same budget and heartbeat as the TTS side: a first boot pulls the image and
+    # downloads the whisper weights, and a silent dot-loop cannot be told apart
+    # from a wedged one.
+    local deadline=$((SECONDS + 1800))
+    local last_report=0
     while ((SECONDS < deadline)); do
-        ./asr.py --check --api-key "${CRISPASR_API_KEY:-}" >/dev/null 2>&1 && break
+        ./asr.py --check --api-key "$CRISPASR_API_KEY" >/dev/null 2>&1 && break
+        if ((SECONDS - last_report >= 60)); then
+            last_report=$SECONDS
+            printf '\n  %4ds  %s\n' "$SECONDS" \
+                "$(sudo docker compose logs --tail 1 crispasr 2>/dev/null | tail -1 | cut -c1-160)"
+        fi
         sleep 5
         printf '.'
     done
-    ./asr.py --check --api-key "${CRISPASR_API_KEY:-}" >/dev/null 2>&1 \
-        && ok "ASR healthy after ${SECONDS}s" \
-        || { fail "ASR did not come up; wavs are in $root, re-run after fixing it"; return 1; }
+    if ./asr.py --check --api-key "$CRISPASR_API_KEY" >/dev/null 2>&1; then
+        ok "ASR healthy after ${SECONDS}s"
+    else
+        fail "ASR did not come up within 1800s; the wavs are in $root, so re-running"
+        fail "this stage only repeats phase 2 once the ASR is reachable"
+        return 1
+    fi
 
     say "phase 3: scoring"
     ./voxtral/cloning/voice_survey.py --wav-dir "$root/hard" --text "$hard" --out "$root/survey_hard.md"

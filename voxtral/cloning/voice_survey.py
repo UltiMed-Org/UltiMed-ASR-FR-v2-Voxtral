@@ -47,13 +47,94 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WER_REJECT = 0.30
 
 
+def french_numeral(n: int) -> str:
+    """Spell an integer in French, for 0 to 999.
+
+    Exists because the ASR writes numbers as digits ("75") while a voice reading the
+    sweep text says them as words ("soixante-quinze"). Without this, every take would be
+    charged several word errors for a number it pronounced perfectly, which is the
+    opposite of what the number-heavy text is there to measure.
+
+    Parameters
+    ----------
+    n : int
+        The value to spell, 0 to 999.
+
+    Returns
+    -------
+    str
+        French spelling, hyphenated in the usual way.
+    """
+    units = ["zero", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf",
+             "dix", "onze", "douze", "treize", "quatorze", "quinze", "seize", "dix-sept",
+             "dix-huit", "dix-neuf"]
+    tens = {20: "vingt", 30: "trente", 40: "quarante", 50: "cinquante", 60: "soixante"}
+    if n < 20:
+        return units[n]
+    if n < 100:
+        if n >= 80:
+            # 80 to 99 is "quatre-vingt" plus 0 to 19, and bare 80 takes an s.
+            rest = n - 80
+            return "quatre-vingts" if rest == 0 else f"quatre-vingt-{units[rest]}"
+        if n >= 70:
+            # 70 to 79 is "soixante" plus 10 to 19, not a tens word of its own, and 71
+            # keeps the "et" that 72 onwards drop.
+            return "soixante et onze" if n == 71 else f"soixante-{units[n - 60]}"
+        base, rest = (n // 10) * 10, n % 10
+        if rest == 0:
+            return tens[base]
+        # 21, 31 ... take "et un"; the rest hyphenate.
+        return f"{tens[base]} et un" if rest == 1 else f"{tens[base]}-{units[rest]}"
+    hundreds, rest = divmod(n, 100)
+    head = "cent" if hundreds == 1 else f"{units[hundreds]}-cents" if rest == 0 else f"{units[hundreds]}-cent"
+    return head if rest == 0 else f"{head} {french_numeral(rest)}"
+
+
+# Written form -> digits, longest first so "soixante quinze" is matched before "soixante".
+_NUMBER_WORDS = sorted(((tuple(re.sub(r"[^a-z]", " ", french_numeral(n)).split()), str(n))
+                        for n in range(0, 1000)),
+                       key=lambda pair: len(pair[0]), reverse=True)
+
+
+def fold_numbers(words: list[str]) -> list[str]:
+    """Replace spelled-out French numbers with their digits.
+
+    Applied to both sides of the comparison, so it does not matter which one spells them
+    out; what matters is that both end up in the same form.
+
+    Parameters
+    ----------
+    words : list[str]
+        Tokenised, lowercased, unaccented words.
+
+    Returns
+    -------
+    list[str]
+        The same words with any number phrase collapsed to a single digit token.
+    """
+    out, i = [], 0
+    while i < len(words):
+        for form, digits in _NUMBER_WORDS:
+            if tuple(words[i:i + len(form)]) == form:
+                out.append(digits)
+                i += len(form)
+                break
+        else:
+            # "et" only ever joins a number phrase ("vingt et un"), which the loop above
+            # matches whole, so a surviving "et" is an ordinary conjunction. Keep it.
+            out.append(words[i])
+            i += 1
+    return out
+
+
 def normalise(text: str) -> list[str]:
     """Reduce a transcript to comparable words.
 
     Case, punctuation and accents all differ between what was asked for and what an ASR
-    returns without either being an error, so they are removed. Digits are kept as
-    written: a model that says "75" where the text said "soixante-quinze" is reading the
-    line correctly, and the caller's reference text avoids digits for that reason.
+    returns without either being an error, so they are removed. Spelled-out numbers are
+    folded to digits on both sides: the reference avoids digits on purpose, but the ASR
+    writes them anyway ("75" for "soixante-quinze"), and charging a take for that would
+    invert the very thing the number-heavy text is there to measure.
 
     Parameters
     ----------
@@ -67,7 +148,7 @@ def normalise(text: str) -> list[str]:
     """
     folded = unicodedata.normalize("NFKD", text.lower())
     folded = "".join(c for c in folded if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9\s]", " ", folded).split()
+    return fold_numbers(re.sub(r"[^a-z0-9\s]", " ", folded).split())
 
 
 def word_error_rate(reference: str, hypothesis: str) -> float:
