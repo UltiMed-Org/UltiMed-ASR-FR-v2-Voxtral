@@ -2,7 +2,7 @@
 
 **STATUS:** B8 found a real bug in the search and a real limit behind it. The bug: joint descent converts acoustic residual into semantic error, so it destroys its own starting point (a 100 pct correct semantic seed comes out at 43.75 pct). Freezing the semantic half fixes that, and the alternating solver built on it (`invert.py alternate`) recovers all 37 code rows **bit exact** from a seed that is 62.5 pct semantically correct with acoustics within one grid step. The limit: that basin is narrow and the two halves are circular. The rescore needs near-exact acoustics (given perfect semantic codes but acoustics off by 10 levels, it discards all of them), and the acoustic solve needs correct semantics to reach near-exact. Cold starts still recover 0 pct. The encoder is therefore back on the critical path, not demoted.
 
-**NEXT ACTION:** Decision for the user. Track B is blocked: the shortlist test failed (0 pct semantic at every K, with the truth sitting unranked inside a 64-row list), and the reason is structural rather than a tuning problem, since the encoder would have to generalise to an unseen speaker from the only 20 that exist. The remaining routes to the actual goal (acoustic diversity for dataset generation) are Track A's 6 keeper voices, which already work, and the TADA backend on `crispasr-tts`, which does real reference-clip cloning and already has tooling in `utils/clone_voice.py`. Cloning `olivier2.ogg` and `alicia2.ogg` **on Voxtral** is not reachable with the open weights.
+**NEXT ACTION:** A5, and it needs a human for the compose commands (this agent has no sudo password): `./voxtral/cloning/step.sh a5` does the whole thing, boots `voxtral-tts`, synthesizes 20 voices x 2 French texts, stops it, boots the ASR stack, scores every take by word error rate and pitch, and writes a ranked listening table to `cache/cloning/A5/survey_hard.md`. Export `CRISPASR_API_KEY` first. Then listen top-down and report the counts, which is what decides whether A6 (expanding the survivors) is worth building.
 
 **Agent:** written with Claude Code. Any agent picking this up: read "How to use this file" first, do the next unchecked step only, then update STATUS / NEXT ACTION / the session log and commit.
 
@@ -220,6 +220,33 @@ Two lessons:
 2. **One clone request killed the whole engine.** The raise happens inside `execute_model`, which vLLM treats as fatal, so it took down concurrent traffic too, from an unauthenticated request. Fork patch 0006 refuses `ref_audio` in `_validate_voxtral_tts_request`, turning an outage into one 400 that explains itself. Remove that guard if a checkpoint ever ships the encoder: everything else on the path already works.
 
 `tts.py --ref-audio` and the `soxr` layer are kept. They cost nothing, they are correct, and they are exactly what a working checkpoint would need.
+
+### [ ] A5. How many usable, distinct French voices do the 20 bases actually yield?
+
+Track B is blocked (B8), so the goal reverts to what it always was: acoustic diversity for dataset generation. The honest answer to "how many voices can we get" has never been measured, only extrapolated from A2's **13 auditioned takes**, and **5 of the 20 shipped voices have never been tried on French at all** (`neutral_male`, `neutral_female`, `casual_male`, `casual_female`, `cheerful_female`).
+
+My estimate before measuring, recorded so the sweep can prove it wrong: 8 to 12 genuinely distinct French-clear voices, plus 8 to 10 marginal ones acceptable for a dataset but not a demo. The binding constraint is distinctness, not intelligibility: truncation was heard as "indistinguishable from the parent", so it makes variants, not voices.
+
+`stage_a5()` in `step.sh` synthesizes all 20 bases on two French texts at one fixed seed, then scores them with `voice_survey.py`. What is measured rather than judged:
+
+- **Intelligibility**, as word error rate between the transcript and the text the voice was asked to read. Anything above 30 pct is garbled rather than accented and is rejected before anyone listens. Two texts because A2 measured that accented prefixes stay fluent on easy material and break on numbers and liaisons; neither text contains digits, since "75" against "soixante-quinze" would score as an error no listener would hear.
+- **Pitch neighbours**, as median F0. Two survivors within 10 Hz get flagged to be heard back to back, because the cheap way to end up with 20 voices that are really 8 is to never check.
+
+Naturalness and identity stay with the listener; the point is to spend those ears on the survivors. The two GPU phases never overlap: `voxtral-tts` is stopped before the ASR stack comes up.
+
+Acceptance: a defensible count of French-clear bases, and a keep/drop decision per voice. Estimated: 15 to 45 min of machine time depending on boot, plus a listening pass.
+
+**Result:**
+
+### [ ] A6. Expand the survivors, on-manifold if possible
+
+Only worth building once A5 gives a base count. Two axes, and they are not equally promising.
+
+The existing derivation ops (`derive_voices.py`) work in the LLM's embedding space: `head k` and `tail k` truncate, `mix a b alpha` is an elementwise weighted average truncated to the shorter prefix, `cat a b split` splices frame-wise. **Generalising `mix` to N voices is one line and I expect it to make things worse**, for a reason B6 already measured in a different guise: a prefix is a sum of 37 codebook lookups, an average of prefixes is not, and averaging N of them shrinks the distance from the global centroid by roughly sqrt(N). Three-way mixes should sound *more* average and *less* distinct, which is the opposite of the goal. Sparse weights (0.6 / 0.3 / 0.1) keep one identity dominant and are the version worth trying.
+
+The better axis is **code-level recombination**, which B1 and B2 made possible and nobody has used. B1 recovered the exact codes of 18 of the 20 voices, and `encode_tokens` builds a prefix by summing 37 codebook lookups, so a hybrid built by taking the semantic code row from voice A and the 36 acoustic scalars from voice B **is a valid code tuple by construction**. That is a genuinely different object from an embedding average: the mush failure mode A2 measured comes from landing between codebook rows, and this cannot land between them. 18 x 18 gives 324 candidates, free, no training. Whether the LLM finds an unseen semantic/acoustic pairing natural is the open question, and it is exactly the kind of thing one sweep answers.
+
+**Result:**
 
 ## Track B: new voices from real clips, by inverting the decoder
 
