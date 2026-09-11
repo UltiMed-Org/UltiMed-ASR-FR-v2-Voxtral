@@ -114,6 +114,10 @@ def build_fields(args: argparse.Namespace) -> dict:
     """Collect the OpenAI/CrispASR form fields, sending only what was set so the
     server keeps its own startup default for every omitted knob."""
     optional = {
+        # Sent like every other knob: only when asked for. Recent CrispASR builds
+        # reject a transcription request that names no model with a 422, so this is
+        # usually required in practice even though the client never assumes it.
+        "model": args.model,
         "response_format": args.format,
         "language": args.language,
         "prompt": args.prompt,
@@ -194,6 +198,9 @@ def main() -> int:
                    help="Probe /health and transcribe a tiny bundled clip to confirm the model loaded.")
     p.add_argument("-o", "--output", default=None,
                    help="Write the raw response to this file (default: print to stdout).")
+    p.add_argument("--model", default=os.environ.get("CRISPASR_MODEL"),
+                   help="Model name to transcribe with (env: CRISPASR_MODEL). Newer "
+                        "servers return 422 when it is missing.")
     p.add_argument("--format", default="text", choices=JSON_FORMATS + TEXT_FORMATS,
                    help="response_format (default: text). diarized_json adds per-segment speakers.")
     p.add_argument("-l", "--language", default=None,
