@@ -16,6 +16,9 @@ matter of taste:
 - Distinct. Also measurable, imperfectly: median F0 separates most speakers, and takes
   that sit on top of each other in pitch are worth listening to as a pair to check
   whether they are the same voice wearing a different name.
+- Fast or slow. Words per second, which turned out to spread 3x across the 20 bases
+  and is both a diversity axis in its own right and a naturalness warning: the takes
+  under 2 words/s are the English-styled voices drawling through French.
 
 What is left for the listener is naturalness and identity, which no metric here settles.
 The point is to spend those ears on the survivors instead of on the whole sweep.
@@ -44,6 +47,7 @@ from wav_stats import median_f0, read_wav  # noqa: E402 - sys.path must be set f
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # Anything above this word error rate is garbled rather than merely accented. A2 heard
 # es_male mangle numbers while staying recognisably speech, which lands around here.
+ASR_ROUTE = "/v1/audio/transcriptions"
 WER_REJECT = 0.30
 
 
@@ -191,7 +195,8 @@ def transcribe(wav: Path, *, url: str, api_key: str | None, model: str | None,
     wav : Path
         The take to transcribe.
     url : str
-        ASR endpoint, passed through to `asr.py`.
+        ASR *base* URL, passed through to `asr.py`, which appends the
+        `/v1/audio/transcriptions` route itself.
     api_key : str, optional
         API key; the ASR service is key-protected.
     model : str, optional
@@ -205,7 +210,14 @@ def transcribe(wav: Path, *, url: str, api_key: str | None, model: str | None,
         The transcript, or an empty string when the call failed (which scores as a total
         miss rather than crashing the sweep half way through a long run).
     """
-    command = [str(REPO_ROOT / "asr.py"), str(wav), "--url", url, "--language", language]
+    # asr.py takes a BASE url and builds `<base>/v1/audio/transcriptions` itself, so
+    # handing it the full route produces a doubled path and a 404 on every take. The
+    # route is stripped here rather than only fixed in the default, so an explicit
+    # --url copied from a curl command still works.
+    base = url.rstrip("/")
+    if base.endswith(ASR_ROUTE):
+        base = base[: -len(ASR_ROUTE)].rstrip("/")
+    command = [str(REPO_ROOT / "asr.py"), str(wav), "--url", base, "--language", language]
     if api_key:
         command += ["--api-key", api_key]
     if model:
@@ -221,8 +233,8 @@ def transcribe(wav: Path, *, url: str, api_key: str | None, model: str | None,
 @click.option("--wav-dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               required=True, help="Directory of takes, one wav per voice.")
 @click.option("--text", "reference", required=True, help="The text every take was asked to read.")
-@click.option("--url", default="http://localhost:8002/v1/audio/transcriptions", show_default=True,
-              help="ASR endpoint.")
+@click.option("--url", default="http://localhost:8002", show_default=True,
+              help="ASR base URL (the /v1/audio/transcriptions route is appended).")
 @click.option("--api-key", default=None, envvar="CRISPASR_API_KEY",
               help="ASR API key (env: CRISPASR_API_KEY).")
 @click.option("--model", default=None, envvar="CRISPASR_MODEL",
@@ -238,6 +250,11 @@ def main(*, wav_dir: Path, reference: str, url: str, api_key: str | None, model:
         raise click.ClickException(f"no wavs in {wav_dir}")
     logger.info(f"scoring {len(takes)} takes against {len(normalise(reference))} reference words")
 
+    # Speaking rate is the third measurable axis, and the sweep showed it spreads 3x
+    # across the 20 bases (4.5 words/s down to 1.5). It doubles as a naturalness flag:
+    # the slowest takes are the English-styled voices drawling their way through French.
+    n_words = len(normalise(reference))
+
     rows = []
     for wav in takes:
         samples, rate = read_wav(wav)
@@ -246,6 +263,7 @@ def main(*, wav_dir: Path, reference: str, url: str, api_key: str | None, model:
                      "wer": word_error_rate(reference, heard),
                      "f0": median_f0(samples, rate),
                      "seconds": len(samples) / rate,
+                     "words_per_second": n_words / (len(samples) / rate),
                      "heard": heard})
         logger.info(f"{wav.stem:22} wer {100 * rows[-1]['wer']:5.1f}%  f0 {rows[-1]['f0']:6.1f} Hz")
 
@@ -266,10 +284,12 @@ def main(*, wav_dir: Path, reference: str, url: str, api_key: str | None, model:
              "Sorted by WER, so the ones worth your ears are at the top.", "",
              "Fill in the last three columns while listening. `distinct?` means distinct",
              "from every take above it, not merely from fr_female.", "",
-             "| voice | WER | F0 (Hz) | s | natural? | distinct? | keep |", "|---|---|---|---|---|---|---|"]
+             "| voice | WER | F0 (Hz) | s | w/s | natural? | distinct? | keep |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
         f0 = "-" if r["f0"] != r["f0"] else f"{r['f0']:.0f}"
-        lines.append(f"| {r['voice']} | {100 * r['wer']:.0f}% | {f0} | {r['seconds']:.1f} | | | |")
+        lines.append(f"| {r['voice']} | {100 * r['wer']:.0f}% | {f0} | {r['seconds']:.1f} | "
+                     f"{r['words_per_second']:.1f} | | | |")
     if neighbours:
         lines += ["", "## Pitch neighbours (listen back to back, same voice?)", ""]
         lines += [f"- {a} and {b}, {gap:.1f} Hz apart" for a, b, gap in neighbours]
