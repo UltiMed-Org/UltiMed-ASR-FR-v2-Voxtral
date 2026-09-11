@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # The stage the agent last prepared. Updated as part of the session protocol.
-CURRENT_STAGE="b7"
+CURRENT_STAGE="a5"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -415,6 +415,92 @@ stage_a2() {
     echo "    to drop the losers:  ./voxtral/cloning/derive_voices.py clean"
 }
 
+stage_a5() {
+    # How many usable, DISTINCT French voices do the 20 shipped ones yield?
+    #
+    # Cost: GPU, exclusively, in two phases that never overlap. Phase 1 boots
+    # voxtral-tts (~17 GB, first boot up to 30 min, warm boot ~2 min) and
+    # synthesizes 40 takes, roughly 8 min. Phase 2 stops it and boots the ASR
+    # stack instead, so the two never contend for the card, then transcribes
+    # those 40 takes, roughly 3 min. Total 15 to 45 min depending on boot.
+    # Disk: negligible, ~15 MB of wav. Network: none (both images are local).
+    #
+    # The sweep is the 20 shipped voices only. Derived voices are A6's business:
+    # there is no point blending voices before knowing which bases survive
+    # French, and A2 only ever auditioned 13 takes, 5 of the 20 bases never
+    # among them.
+    #
+    # Two texts, because A2 measured that accented prefixes stay fluent on easy
+    # material and break on numbers and liaisons. Scoring only the easy one
+    # would flatter half the sweep. Neither text contains digits: the reference
+    # is compared word by word, and "75" against "soixante-quinze" would count
+    # as an error the listener would not hear.
+    local hard="Le vieux chene du jardin a soixante-quinze ans, et les enfants s'y retrouvent chaque ete depuis vingt ans."
+    local easy="Bonjour, je m'appelle Camille et je vous propose aujourd'hui une petite histoire."
+    local seed=7
+    local root="cache/cloning/A5"
+    mkdir -p "$root/hard" "$root/easy"
+
+    local voices=(
+        ar_male casual_female casual_male cheerful_female
+        de_female de_male es_female es_male
+        fr_female fr_male hi_female hi_male
+        it_female it_male neutral_female neutral_male
+        nl_female nl_male pt_female pt_male
+    )
+
+    check_fork_has_local_voice_lookup
+    check_port_clash
+    start_voxtral
+    wait_for_health || return 1
+    show_voice_boot_log
+
+    # Same text, same seed for every take, so the only thing that varies between
+    # two wavs is the voice prefix.
+    say "phase 1: synthesizing ${#voices[@]} voices x 2 texts (seed $seed)"
+    local failed=()
+    local v
+    for v in "${voices[@]}"; do
+        printf '\n--- %s\n' "$v"
+        ./tts.py -t "$hard" --voice "$v" --noise-seed "$seed" -o "$root/hard/$v.wav" || failed+=("$v/hard")
+        ./tts.py -t "$easy" --voice "$v" --noise-seed "$seed" -o "$root/easy/$v.wav" || failed+=("$v/easy")
+    done
+    ((${#failed[@]})) && fail "${#failed[@]} take(s) rejected: ${failed[*]}"
+
+    say "phase 2: freeing the GPU for the ASR stack"
+    sudo docker compose stop voxtral-tts
+    ok "voxtral-tts stopped"
+
+    # The ASR service is key-protected and, on recent builds, refuses a request
+    # that names no model. Both are passed through to asr.py by voice_survey.
+    if [[ -z "${CRISPASR_API_KEY:-}" ]]; then
+        warn "CRISPASR_API_KEY is unset, so scoring will fail; export it and re-run"
+        warn "the wavs are already in $root, so a re-run only repeats phase 2"
+    fi
+    sudo docker compose up -d crispasr crispasr-lb
+    local deadline=$((SECONDS + 600))
+    while ((SECONDS < deadline)); do
+        ./asr.py --check --api-key "${CRISPASR_API_KEY:-}" >/dev/null 2>&1 && break
+        sleep 5
+        printf '.'
+    done
+    ./asr.py --check --api-key "${CRISPASR_API_KEY:-}" >/dev/null 2>&1 \
+        && ok "ASR healthy after ${SECONDS}s" \
+        || { fail "ASR did not come up; wavs are in $root, re-run after fixing it"; return 1; }
+
+    say "phase 3: scoring"
+    ./voxtral/cloning/voice_survey.py --wav-dir "$root/hard" --text "$hard" --out "$root/survey_hard.md"
+    ./voxtral/cloning/voice_survey.py --wav-dir "$root/easy" --text "$easy" --out "$root/survey_easy.md"
+
+    say "results"
+    echo "    listen:  $root/hard/  and  $root/easy/"
+    echo "    ranked:  $root/survey_hard.md  (start at the top, it is sorted by WER)"
+    echo "    the 'pitch neighbours' list at the bottom is the same-voice check"
+    echo
+    echo "Fill in natural? / distinct? / keep, then tell the agent the counts."
+    echo "A6 (blends of the survivors) is only worth building once that number exists."
+}
+
 stage_b7() {
     # Mint real code sequences to train the missing audio encoder on.
     #
@@ -549,7 +635,7 @@ case "$STAGE" in
         sudo docker compose stop voxtral-tts
         ok "voxtral-tts stopped, GPU freed"
         ;;
-    diag | a1 | a2 | a3 | b7)
+    diag | a1 | a2 | a3 | a5 | b7)
         require_sudo
         say "stage $STAGE (log: $LOG_FILE)"
         "stage_$STAGE"
@@ -557,7 +643,7 @@ case "$STAGE" in
         echo "The agent reads that file next session; no need to paste anything."
         ;;
     *)
-        fail "unknown stage '$STAGE' (expected: diag, a1, a2, a3, logs, down)"
+        fail "unknown stage '$STAGE' (expected: diag, a1, a2, a3, a5, b7, logs, down)"
         exit 1
         ;;
 esac
