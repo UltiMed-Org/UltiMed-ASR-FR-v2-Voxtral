@@ -355,35 +355,47 @@ def cmd_list() -> None:
         raise SystemExit(1)
 
 
-@cli.command("add")
-@click.option("--name", required=True, help="Name to register the voice under (lowercase; the server lowercases).")
-@click.option("--from-voice", default=None, help="Copy an already registered voice's embedding.")
-@click.option("--from-file", default=None, type=click.Path(exists=True, dir_okay=False), help="Install this .pt file.")
-@click.option("--force", is_flag=True, help="Overwrite an existing registration of --name.")
-def cmd_add(name: str, from_voice: str | None, from_file: str | None, force: bool) -> None:
-    """Install a voice embedding and register it in both config files.
+def _install_one(*, name: str, source: Path, embedding_dir: Path, hidden_dim: int,
+                 params_voices: dict, tekken_voices: dict, force: bool) -> int:
+    """Copy one embedding into the snapshot and enter it in both voice dicts.
 
-    The frame count N is read from the embedding itself rather than taken on
-    trust, because tekken.json's N is what drives the number of placeholder
-    tokens: deriving it from the tensor is the only way the two cannot drift.
+    Factored out of `add` so that the bulk path (--from-dir) registers voices by
+    exactly the same rules as the single one, and so that a bulk run rewrites the
+    two JSON files once instead of once per voice. The caller owns loading and
+    saving those files.
+
+    Parameters
+    ----------
+    name : str
+        Registration name; lowercased here because the server lowercases.
+    source : Path
+        The .pt to install.
+    embedding_dir : Path
+        Snapshot's voice_embedding/ directory.
+    hidden_dim : int
+        params.json's `dim`, needed to infer N from the file size.
+    params_voices : dict
+        params.json's {name: index} dict, mutated in place.
+    tekken_voices : dict
+        tekken.json's {name: N} dict, mutated in place.
+    force : bool
+        Overwrite an existing registration instead of refusing.
+
+    Returns
+    -------
+    int
+        The frame count N that was registered.
     """
-    if bool(from_voice) == bool(from_file):
-        raise SystemExit("give exactly one of --from-voice or --from-file")
-
-    snapshot = find_snapshot()
-    params, params_voices, tekken, tekken_voices = _voice_dicts(snapshot)
-    hidden_dim = int(params["dim"])
-    embedding_dir = snapshot / "voice_embedding"
-
     name = name.lower()
     target = embedding_dir / f"{name}.pt"
     if (target.exists() or name in params_voices or name in tekken_voices) and not force:
         raise SystemExit(f"voice '{name}' already exists; pass --force to overwrite")
-
-    source = Path(os.path.realpath(embedding_dir / f"{from_voice}.pt")) if from_voice else Path(from_file).resolve()
     if not source.is_file():
         raise SystemExit(f"source embedding not found: {source}")
 
+    # The frame count N is read from the embedding itself rather than taken on
+    # trust, because tekken.json's N is what drives the number of placeholder
+    # tokens: deriving it from the tensor is the only way the two cannot drift.
     frames = read_embedding_frames(source, hidden_dim)
 
     # Copy rather than symlink: a symlink into blobs/ would be silently replaced
@@ -397,15 +409,65 @@ def cmd_add(name: str, from_voice: str | None, from_file: str | None, force: boo
     # is fine; keeping them contiguous just makes the file readable.
     params_voices[name] = params_voices.get(name, max(params_voices.values(), default=-1) + 1)
     tekken_voices[name] = frames
+    return frames
 
-    _save_json(snapshot / "params.json", params)
-    _save_json(snapshot / "tekken.json", tekken)
 
+@cli.command("add")
+@click.option("--name", default=None, help="Name to register the voice under (lowercase; the server lowercases).")
+@click.option("--from-voice", default=None, help="Copy an already registered voice's embedding.")
+@click.option("--from-file", default=None, type=click.Path(exists=True, dir_okay=False), help="Install this .pt file.")
+@click.option("--from-dir", default=None, type=click.Path(exists=True, file_okay=False),
+              help="Register every .pt in this directory, named after its stem (bulk mode).")
+@click.option("--force", is_flag=True, help="Overwrite an existing registration.")
+def cmd_add(name: str | None, from_voice: str | None, from_file: str | None,
+            from_dir: str | None, force: bool) -> None:
+    """Install one or many voice embeddings and register them in both config files.
+
+    Bulk mode exists for the A6 candidate pool, which is hundreds of voices: one
+    process, one rewrite of params.json and tekken.json, instead of one subprocess
+    and two JSON rewrites per voice.
+    """
+    sources = [bool(from_voice), bool(from_file), bool(from_dir)]
+    if sum(sources) != 1:
+        raise SystemExit("give exactly one of --from-voice, --from-file or --from-dir")
+    if from_dir and name:
+        raise SystemExit("--from-dir names each voice after its file stem, so --name makes no sense")
+    if not from_dir and not name:
+        raise SystemExit("--name is required unless registering in bulk with --from-dir")
+
+    snapshot = find_snapshot()
+    params, params_voices, tekken, tekken_voices = _voice_dicts(snapshot)
+    hidden_dim = int(params["dim"])
+    embedding_dir = snapshot / "voice_embedding"
     frame_rate = float(params["multimodal"]["audio_model_args"]["audio_encoding_args"]["frame_rate"])
-    # Report the voice name, not source.name: for --from-voice the path was
-    # resolved through the HF symlink, so source.name is an opaque blob hash.
-    origin = f"voice '{from_voice}'" if from_voice else source.name
-    logger.success(f"registered '{name}': {frames} frames ({frames / frame_rate:.2f} s) from {origin}")
+
+    if from_dir:
+        files = sorted(Path(from_dir).glob("*.pt"))
+        if not files:
+            raise SystemExit(f"no .pt files in {from_dir}")
+        total = 0
+        for path in files:
+            total += _install_one(name=path.stem, source=path.resolve(), embedding_dir=embedding_dir,
+                                 hidden_dim=hidden_dim, params_voices=params_voices,
+                                 tekken_voices=tekken_voices, force=force)
+        _save_json(snapshot / "params.json", params)
+        _save_json(snapshot / "tekken.json", tekken)
+        logger.success(f"registered {len(files)} voices from {from_dir} "
+                       f"({total / frame_rate:.1f} s of prefix in total)")
+    else:
+        source = (Path(os.path.realpath(embedding_dir / f"{from_voice}.pt")) if from_voice
+                  else Path(from_file).resolve())
+        frames = _install_one(name=name, source=source, embedding_dir=embedding_dir,
+                              hidden_dim=hidden_dim, params_voices=params_voices,
+                              tekken_voices=tekken_voices, force=force)
+        _save_json(snapshot / "params.json", params)
+        _save_json(snapshot / "tekken.json", tekken)
+        # Report the voice name, not source.name: for --from-voice the path was
+        # resolved through the HF symlink, so source.name is an opaque blob hash.
+        origin = f"voice '{from_voice}'" if from_voice else source.name
+        logger.success(f"registered '{name.lower()}': {frames} frames "
+                       f"({frames / frame_rate:.2f} s) from {origin}")
+
     warn_if_server_will_brick()
     logger.info("apply with: sudo docker compose up -d voxtral-tts   (restart is NOT enough)")
 
