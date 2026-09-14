@@ -32,6 +32,9 @@
 #   STT_CONCURRENCY  parallel transcriptions (default 6, one per whisper replica)
 #   STT_SCALE        whisper replicas to run (default 6)
 #   EULER_STEPS      ODE steps per frame, 0 = server default (quality/speed lever)
+#   ONLY_FILE        restrict the sweep to the voices named in this file, one per line.
+#                    Screening is wide and shallow; choosing between survivors is narrow
+#                    and deep, e.g. ONLY_FILE=cache/cloning/A6/contenders.txt DEPTH=12
 #   HEALTH_TIMEOUT   seconds to wait for a stack to become healthy (default 900)
 #   COMPOSE          path to docker-compose.yml (default: the repo's own)
 #
@@ -141,6 +144,7 @@ run_pass() {
     # pins it at the floor wherever sudo started us.
     local mode="$1" rc=0
     local common=(--sentences "${DEPTH}")
+    [[ -n "${ONLY_FILE:-}" ]] && common+=(--only-file "${ONLY_FILE}")
     [[ "${INCLUDE_BASES}" == 1 ]] || common+=(--no-include-bases)
     if [[ "${mode}" == tts ]]; then
         common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}")

@@ -1,0 +1,417 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["click", "loguru", "torch", "torchaudio", "numpy", "speechbrain"]
+# ///
+"""Measure how many DIFFERENT speakers a pool of takes actually contains (stage A6).
+
+Why a model and not a statistic
+-------------------------------
+A5 tried median F0 and it failed: the same voice moved 30 Hz between two sentences,
+so F0 ranks prosody, not speakers. What is needed is a function trained to answer
+"same person or not", which is exactly what a speaker verification embedding is.
+This uses ECAPA-TDNN trained on VoxCeleb (speechbrain/spkrec-ecapa-voxceleb), where
+the cosine similarity between two utterances has a published operating point rather
+than a threshold someone made up.
+
+The sweep makes this comparison fair in a way a random corpus would not: every voice
+reads the SAME sentences with the SAME noise seed, so two takes differ only by the
+prefix that generated them. Text and prosody are held still, and the embedding sees
+speaker identity.
+
+What it produces
+----------------
+1. `embed`   one L2-normalised embedding per voice, averaged over its takes.
+2. `select`  a greedy max-min pick: start from an anchor, then repeatedly add the
+             voice whose similarity to everything already kept is lowest. This is the
+             opposite of ranking by intelligibility, which would select the blandest
+             voices; it deliberately walks outward from the anchor.
+3. `report`  the kept set with the nearest neighbour of each, plus the pairs that are
+             too close to be different people, plus a validation section.
+
+The validation section exists because a metric nobody checked is not evidence. Two
+checks run automatically: the 20 shipped voices are 20 different recordings and should
+sit far apart, and a hybrid should sit CLOSE to its acoustic donor if speaker identity
+really lives in the acoustic codes (the sweep's F0 correlation of +0.97 says it does).
+If those two come out wrong, nothing below them is worth reading.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import click
+import numpy as np
+import torch
+import torchaudio
+from loguru import logger
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sweep import STAGE_DIR, WER_REJECT, read_ledger  # noqa: E402
+from wav_stats import read_wav  # noqa: E402
+
+# VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
+# this exact question, which matters more than squeezing out the last point of EER.
+MODEL_ID = "speechbrain/spkrec-ecapa-voxceleb"
+MODEL_RATE = 16000
+# Cosine similarity above which two takes are treated as the same speaker. VoxCeleb
+# systems of this family sit near 0.25 at equal error rate; 0.5 is deliberately well
+# above that, because the cost of wrongly KEEPING two similar voices (a dataset with a
+# duplicate) is lower than wrongly discarding a genuinely new one.
+SAME_SPEAKER = 0.50
+EMBEDDINGS = STAGE_DIR / "embeddings.npz"
+
+
+def load_classifier(device: str):
+    """Load ECAPA once.
+
+    Parameters
+    ----------
+    device : str
+        "cuda" or "cpu".
+
+    Returns
+    -------
+    speechbrain.inference.speaker.EncoderClassifier
+        The loaded model.
+    """
+    from speechbrain.inference.speaker import EncoderClassifier
+
+    return EncoderClassifier.from_hparams(
+        source=MODEL_ID,
+        savedir=str(REPO_ROOT / "cache" / "cloning" / "ecapa"),
+        run_opts={"device": device},
+    )
+
+
+def embed_wav(classifier, path: Path, device: str) -> np.ndarray:
+    """Embed one take.
+
+    Parameters
+    ----------
+    classifier : EncoderClassifier
+        Loaded ECAPA.
+    path : Path
+        Wav file, any sample rate (resampled to 16 kHz for the model).
+    device : str
+        Where to run.
+
+    Returns
+    -------
+    numpy.ndarray
+        `[192]` float32, L2 normalised.
+    """
+    # wav_stats.read_wav and not torchaudio.load: recent torchaudio routes every load
+    # through TorchCodec and raises without it, and these files are plain 16-bit PCM that
+    # the standard library already reads in the one place this repo keeps that logic.
+    samples, rate = read_wav(path)
+    waveform = torch.tensor(samples, dtype=torch.float32).unsqueeze(0) / 32768.0
+    if rate != MODEL_RATE:
+        waveform = torchaudio.functional.resample(waveform, rate, MODEL_RATE)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    with torch.no_grad():
+        vector = classifier.encode_batch(waveform.to(device)).squeeze().float().cpu().numpy()
+    return vector / (np.linalg.norm(vector) + 1e-9)
+
+
+def load_embeddings() -> tuple[list[str], np.ndarray]:
+    """Read the cached per-voice embeddings.
+
+    Returns
+    -------
+    tuple
+        (voice names, `[V, 192]` matrix, rows L2 normalised).
+    """
+    if not EMBEDDINGS.is_file():
+        raise SystemExit(f"no embeddings yet ({EMBEDDINGS}); run `voice_distance.py embed` first")
+    data = np.load(EMBEDDINGS, allow_pickle=False)
+    return list(data["voices"]), data["vectors"]
+
+
+def passing_voices() -> dict[str, float]:
+    """Voices whose median WER clears the gate, with that median.
+
+    Distinctness is only asked about voices that can read the language: a broken take
+    is easy to make and always far from everything else, so skipping this filter would
+    fill the selection with mush.
+
+    Returns
+    -------
+    dict
+        `{voice: median WER}`.
+    """
+    import statistics
+
+    per: dict[str, list[float]] = {}
+    for (voice, _), record in read_ledger().items():
+        if "wer" in record:
+            per.setdefault(voice, []).append(record["wer"])
+    return {voice: statistics.median(wers) for voice, wers in per.items()
+            if statistics.median(wers) <= WER_REJECT}
+
+
+@click.group()
+def cli() -> None:
+    """Speaker-embedding distance over the A6 takes."""
+    logger.remove()
+    logger.add(sys.stderr, format="{time:HH:mm:ss} <level>{level: <7}</level> {message}", level="INFO")
+
+
+@cli.command("embed")
+@click.option("--device", default="cuda" if torch.cuda.is_available() else "cpu", show_default=True,
+              help="Where to run ECAPA.")
+@click.option("--max-takes", default=4, show_default=True,
+              help="Takes to average per voice (more is steadier, and slower).")
+@click.option("--only-passing/--all", default=False, show_default=True,
+              help="Embed only the voices that clear the WER gate.")
+def cmd_embed(device: str, max_takes: int, only_passing: bool) -> None:
+    """Embed every voice that has takes on disk, averaging over its takes."""
+    state = read_ledger()
+    wanted = set(passing_voices()) if only_passing else None
+
+    by_voice: dict[str, list[Path]] = {}
+    for (voice, _), record in sorted(state.items()):
+        if wanted is not None and voice not in wanted:
+            continue
+        path = REPO_ROOT / record["wav"] if record.get("wav") else None
+        if path and path.is_file():
+            by_voice.setdefault(voice, []).append(path)
+    if not by_voice:
+        raise SystemExit("no takes on disk; run the sweep first")
+
+    logger.info(f"embedding {len(by_voice)} voices on {device} "
+                f"({min(max_takes, max(len(v) for v in by_voice.values()))} takes each)")
+    classifier = load_classifier(device)
+
+    names, vectors = [], []
+    for index, (voice, paths) in enumerate(sorted(by_voice.items()), start=1):
+        # Averaging over takes then renormalising is the standard way to turn several
+        # utterances into one speaker vector: it cancels the per-sentence variation that
+        # made F0 useless here, and keeps what is constant across them.
+        stacked = np.stack([embed_wav(classifier, path, device) for path in paths[:max_takes]])
+        mean = stacked.mean(axis=0)
+        names.append(voice)
+        vectors.append(mean / (np.linalg.norm(mean) + 1e-9))
+        if index % 50 == 0:
+            logger.info(f"{index}/{len(by_voice)} voices embedded")
+
+    EMBEDDINGS.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(EMBEDDINGS, voices=np.array(names), vectors=np.stack(vectors).astype(np.float32))
+    logger.success(f"wrote {len(names)} embeddings to {EMBEDDINGS}")
+
+
+@cli.command("select")
+@click.option("--anchor", default="fr_female", show_default=True,
+              help="Voice to start from; the dataset work already uses this one.")
+@click.option("--threshold", default=SAME_SPEAKER, show_default=True,
+              help="Cosine similarity at which two voices count as the same speaker.")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/distinct.md).")
+def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
+    """Greedily pick a maximally spread set of intelligible voices, and report it."""
+    names, vectors = load_embeddings()
+    index_of = {name: i for i, name in enumerate(names)}
+    gate = passing_voices()
+    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+
+    eligible = [name for name in names if name in gate]
+    if anchor not in index_of:
+        raise SystemExit(f"anchor {anchor} has no embedding")
+    logger.info(f"{len(eligible)} voices clear the WER gate and have embeddings")
+
+    similarity = vectors @ vectors.T
+
+    # Greedy max-min (farthest point traversal). Each step adds the eligible voice whose
+    # closest already-kept neighbour is as far away as possible, so the set spreads out
+    # instead of clustering, and the ORDER is itself the answer: everything before the
+    # threshold crossing is a distinct voice, everything after is a near duplicate.
+    kept = [anchor]
+    order = []
+    remaining = [name for name in eligible if name != anchor]
+    while remaining:
+        kept_rows = [index_of[name] for name in kept]
+        best, best_similarity = None, 2.0
+        for name in remaining:
+            worst = max(similarity[index_of[name], row] for row in kept_rows)
+            if worst < best_similarity:
+                best, best_similarity = name, worst
+        order.append((best, best_similarity))
+        kept.append(best)
+        remaining.remove(best)
+
+    distinct = [anchor] + [name for name, sim in order if sim < threshold]
+    logger.info(f"{len(distinct)} voices stay below {threshold} cosine similarity to each other")
+
+    # Validation, before any of the numbers above are taken seriously.
+    bases = [name for name in names if name not in pool]
+    base_rows = [index_of[name] for name in bases]
+    base_pairs = [similarity[a, b] for i, a in enumerate(base_rows) for b in base_rows[i + 1:]]
+    donor_pairs, semantic_pairs = [], []
+    for name, entry in pool.items():
+        if entry["kind"] != "hybrid" or name not in index_of:
+            continue
+        semantic, acoustic = entry["parents"]
+        if acoustic in index_of:
+            donor_pairs.append(similarity[index_of[name], index_of[acoustic]])
+        if semantic in index_of:
+            semantic_pairs.append(similarity[index_of[name], index_of[semantic]])
+
+    lines = ["# A6 distinctness", "",
+             f"{len(eligible)} voices clear the WER gate (median <= {100 * WER_REJECT:.0f} pct) "
+             f"and were embedded with ECAPA-TDNN.",
+             f"**{len(distinct)} of them are different speakers** at cosine similarity "
+             f"< {threshold}, walking outward from `{anchor}`.", "",
+             "## Validation", "",
+             f"- The 20 shipped voices against each other: mean similarity "
+             f"{np.mean(base_pairs):.2f}, max {np.max(base_pairs):.2f}. These are 20 genuinely "
+             "different recordings, so this is what 'different speaker' looks like on this metric.",
+             f"- A hybrid against its ACOUSTIC donor: mean {np.mean(donor_pairs):.2f}.",
+             f"- A hybrid against its SEMANTIC donor: mean {np.mean(semantic_pairs):.2f}.",
+             "", "The last two are the test of where identity lives. The sweep's pitch correlation "
+             "(+0.97 with the acoustic donor, -0.05 with the semantic one) predicts the acoustic "
+             "number should be much the higher of the two.", "",
+             "## The selection, in the order it was picked", "",
+             "Each row's similarity is to the closest voice ABOVE it, so the list stays usable "
+             "if you cut it anywhere: take the first N rows and you have the N most spread-out "
+             "voices available.", "",
+             "| # | voice | kind | parents | WER | similarity to nearest kept |",
+             "|---|---|---|---|---|---|"]
+    rows = [(anchor, 0.0)] + order
+    for position, (name, sim) in enumerate(rows, start=1):
+        entry = pool.get(name, {"kind": "base", "parents": []})
+        marker = "" if sim < threshold else " (duplicate)"
+        lines.append(f"| {position} | {name} | {entry['kind']} | {'+'.join(entry['parents'])} | "
+                     f"{100 * gate[name]:.0f}% | {sim:.2f}{marker} |")
+
+    destination = Path(out) if out else STAGE_DIR / "distinct.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"wrote {destination}")
+
+
+@cli.command("shortlist")
+@click.option("--kind", default=None, help="Only this kind of candidate (base, hybrid, mixn).")
+@click.option("--count", default=10, show_default=True, help="How many takes to shortlist.")
+@click.option("--sid", default="s00", show_default=True, help="Which sentence to play.")
+@click.option("--max-wer", default=WER_REJECT, show_default=True, help="Reject anything worse than this.")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/shortlist.md).")
+def cmd_shortlist(kind: str | None, count: int, sid: str, max_wer: float, out: str | None) -> None:
+    """Write a listening list of the candidates furthest from every shipped voice.
+
+    This is the question the embedding cannot answer on its own. Distance from every
+    base means one of two things, and they are opposite: either a genuinely new speaker,
+    or audio degraded enough that the model cannot place it. The WER gate rules out the
+    worst of the second case but not all of it, so the last step is ears.
+    """
+    names, vectors = load_embeddings()
+    index_of = {name: i for i, name in enumerate(names)}
+    gate = passing_voices()
+    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+    bases = [name for name in names if name not in pool]
+    similarity = vectors @ vectors.T
+
+    rows = []
+    for name, entry in pool.items():
+        if name not in index_of or name not in gate or gate[name] > max_wer:
+            continue
+        if kind and entry["kind"] != kind:
+            continue
+        nearest, nearest_name = max((similarity[index_of[name], index_of[base]], base) for base in bases)
+        rows.append((nearest, name, nearest_name, entry))
+    rows.sort()
+
+    lines = [f"# A6 listening shortlist{f' ({kind})' if kind else ''}", "",
+             f"The {min(count, len(rows))} candidates that sit furthest from EVERY shipped voice, "
+             f"out of {len(rows)} that clear {100 * max_wer:.0f} pct WER.", "",
+             "For reference, two different shipped voices sit at most 0.53 apart on this metric, "
+             "so anything below that is, by the measure, a speaker who does not exist in the "
+             "checkpoint. Your ear decides whether it is a person or a smear.", "",
+             "| play | voice | parents | WER | nearest shipped voice |", "|---|---|---|---|---|"]
+    picked = rows[:count]
+    for nearest, name, nearest_name, entry in picked:
+        lines.append(f"| `cache/cloning/A6/wav/{name}/{sid}.wav` | {name} | "
+                     f"{'+'.join(entry['parents'])} | {100 * gate[name]:.0f}% | "
+                     f"{nearest_name} at {nearest:.2f} |")
+    lines += ["", "Bulk play, in order:", "", "```",
+              "for v in " + " ".join(name for _, name, _, _ in picked) + "; do",
+              f'  echo "$v"; ffplay -autoexit -nodisp "cache/cloning/A6/wav/$v/{sid}.wav" 2>/dev/null',
+              "done", "```"]
+
+    destination = Path(out) if out else STAGE_DIR / "shortlist.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(picked)} takes shortlisted, wrote {destination}")
+
+
+@cli.command("keepers")
+@click.option("--max-wer", default=0.15, show_default=True,
+              help="Clarity a representative must reach to be kept.")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/keepers.md).")
+@click.option("--contenders", default=0, show_default=True,
+              help="Also write the top N per identity to contenders.txt, for a deeper re-sweep.")
+def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
+    """Pick one usable voice per speaker identity: the production set.
+
+    Every candidate is assigned to the shipped voice it sounds most like, which by the
+    validation above is its acoustic donor, and the clearest member of each group wins.
+    That is the whole practical yield of A6: identities that could not read French get
+    represented by a hybrid that can, and identities that were already fine keep their
+    own voice unless a variant reads better.
+    """
+    names, vectors = load_embeddings()
+    index_of = {name: i for i, name in enumerate(names)}
+    gate = passing_voices()
+    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+    bases = [name for name in names if name not in pool]
+    similarity = vectors @ vectors.T
+
+    groups: dict[str, list[tuple[float, str]]] = {base: [] for base in bases}
+    for name in names:
+        if name not in gate or gate[name] > max_wer:
+            continue
+        identity = max(bases, key=lambda base: similarity[index_of[name], index_of[base]])
+        groups[identity].append((gate[name], name))
+
+    lines = ["# A6 keepers: one voice per speaker identity", "",
+             "Each shipped voice is a speaker. A6 did not add speakers (a hybrid sits at 0.86 "
+             "cosine similarity to its acoustic donor), it added a way to make a speaker read "
+             "French. This table takes the clearest representative of each identity.", "",
+             f"Representative must score at most {100 * max_wer:.0f} pct median WER.", "",
+             "| identity | keep | kind | own WER | kept WER |", "|---|---|---|---|---|"]
+    keepers = []
+    for base in sorted(groups):
+        if not groups[base]:
+            lines.append(f"| {base} | (none clears {100 * max_wer:.0f} pct) | | "
+                         f"{100 * gate[base]:.0f}% | |" if base in gate else
+                         f"| {base} | (none clears {100 * max_wer:.0f} pct) | | fails gate | |")
+            continue
+        best_wer, best = min(groups[base])
+        keepers.append(best)
+        kind = pool.get(best, {"kind": "base"})["kind"]
+        own = f"{100 * gate[base]:.0f}%" if base in gate else "fails gate"
+        lines.append(f"| {base} | {best} | {kind} | {own} | {100 * best_wer:.0f}% |")
+
+    lines += ["", f"**{len(keepers)} of {len(bases)} identities have a usable French voice.**", "",
+              "Use them straight from tts.py:", "", "```",
+              './tts.py -t "Bonjour." --voice ' + (keepers[0] if keepers else "fr_female") + " -o out.wav",
+              "```", "", "The full set:", "", "```", " ".join(keepers), "```"]
+
+    destination = Path(out) if out else STAGE_DIR / "keepers.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(keepers)} of {len(bases)} identities usable, wrote {destination}")
+
+    if contenders:
+        # Picking the best of ~19 variants on two sentences each is selection on noise:
+        # a 0 pct score means two clean sentences, not a clean voice. This list is the
+        # finalists per identity, to be re-swept deeper before anything is called final.
+        shortlist = [name for base in sorted(groups)
+                     for _, name in sorted(groups[base])[:contenders]]
+        path = STAGE_DIR / "contenders.txt"
+        path.write_text("\n".join(shortlist) + "\n")
+        logger.info(f"{len(shortlist)} contenders written to {path}: re-sweep them with "
+                    f"ONLY_FILE={path} DEPTH=12 sudo -E ./voxtral/cloning/driver.sh")
+
+
+if __name__ == "__main__":
+    cli()

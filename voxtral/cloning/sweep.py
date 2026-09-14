@@ -109,6 +109,36 @@ def load_sentences() -> list[dict]:
     return json.loads(path.read_text())
 
 
+def restrict(voices: list[str], only_file: str | None) -> list[str]:
+    """Narrow a voice list to the names in a file, preserving order.
+
+    The point is cheap depth. Screening 440 voices on two sentences answers "which are
+    broken"; choosing between the survivors needs more takes each, and running the whole
+    pool deeper wastes hours on candidates already eliminated. A file of finalists keeps
+    the same ledger, the same grid and the same resume logic.
+
+    Parameters
+    ----------
+    voices : list of str
+        Candidate names.
+    only_file : str, optional
+        Path to a newline-separated list of names (blank lines and # comments ignored).
+
+    Returns
+    -------
+    list of str
+        The intersection, in the original order.
+    """
+    if not only_file:
+        return voices
+    wanted = {line.strip() for line in Path(only_file).read_text().splitlines()
+              if line.strip() and not line.startswith("#")}
+    missing = wanted - set(voices)
+    if missing:
+        logger.warning(f"{len(missing)} name(s) in {only_file} are not in the pool, e.g. {sorted(missing)[:3]}")
+    return [voice for voice in voices if voice in wanted]
+
+
 def load_voices(*, include_bases: bool) -> list[str]:
     """Read the candidate pool, optionally with the shipped voices as controls.
 
@@ -314,11 +344,12 @@ def cmd_sentences(count: int, min_words: int, max_words: int, seed: int, corpus:
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Sweep the shipped voices too, as controls.")
 @click.option("--limit", default=0, show_default=True, help="Stop after N rows this pass (0 = all pending).")
+@click.option("--only-file", default=None, help="Restrict to the voices named in this file (one per line).")
 def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: int,
-            euler_steps: int, include_bases: bool, limit: int) -> None:
+            euler_steps: int, include_bases: bool, limit: int, only_file: str | None) -> None:
     """Synthesize every pending row of the grid."""
     sentences = load_sentences()
-    voices = load_voices(include_bases=include_bases)
+    voices = restrict(load_voices(include_bases=include_bases), only_file)
     state = read_ledger()
     rows = grid(voices=voices, sentences=sentences, depth=depth)
 
@@ -400,11 +431,12 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Score the shipped voices too, as controls.")
 @click.option("--limit", default=0, show_default=True, help="Stop after N rows this pass (0 = all pending).")
+@click.option("--only-file", default=None, help="Restrict to the voices named in this file (one per line).")
 def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, language: str,
-            concurrency: int, include_bases: bool, limit: int) -> None:
+            concurrency: int, include_bases: bool, limit: int, only_file: str | None) -> None:
     """Transcribe and score every synthesized row that has no score yet."""
     sentences = load_sentences()
-    voices = load_voices(include_bases=include_bases)
+    voices = restrict(load_voices(include_bases=include_bases), only_file)
     state = read_ledger()
     by_sid = {sentence["sid"]: sentence["text"] for sentence in sentences}
 
