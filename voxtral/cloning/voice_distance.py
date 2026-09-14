@@ -498,5 +498,181 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
                     f"ONLY_FILE={path} DEPTH=12 sudo -E ./voxtral/cloning/driver.sh")
 
 
+def declared_identity(voice: str, pool: dict) -> str:
+    """Which shipped speaker a candidate is supposed to sound like, by construction.
+
+    This is the *claim*, read off the recipe, not a measurement: the similarity matrix
+    exists to check it. A6 established that identity travels in the 36 acoustic codes, so
+    a hybrid `h_<semantic>_<acoustic>` should sound like its acoustic donor (the last
+    parent) and not at all like its semantic one. A sparse `x_` mix blends whole frames
+    with a dominant first component rather than splitting semantic from acoustic, so its
+    claim is that first parent. A shipped voice is its own identity.
+
+    Parameters
+    ----------
+    voice : str
+        Voice name.
+    pool : dict
+        `{name: entry}` from the candidate manifest.
+
+    Returns
+    -------
+    str
+        Name of the shipped voice this one is expected to resemble.
+    """
+    entry = pool.get(voice)
+    if entry is None or not entry.get("parents"):
+        return voice
+    return entry["parents"][-1] if entry["kind"] == "hybrid" else entry["parents"][0]
+
+
+def seriate(names: list[str], similarity: np.ndarray) -> list[int]:
+    """Order voices so that similar ones sit next to each other.
+
+    A 39x39 table in alphabetical order hides its own structure: the blocks are there but
+    scattered. This walks a greedy nearest-neighbour chain from the most peripheral voice
+    (lowest mean similarity to everything else), which pulls families onto the diagonal
+    and makes the matrix readable as a picture rather than as 1521 numbers.
+
+    It is a presentation order and nothing more. No claim is made that the chain is an
+    optimal ordering, and none is needed: every number in the table is the raw cosine.
+
+    Parameters
+    ----------
+    names : list of str
+        Voice names, indexing `similarity`.
+    similarity : numpy.ndarray
+        `[V, V]` cosine similarities.
+
+    Returns
+    -------
+    list of int
+        Indices into `names`, in display order.
+    """
+    remaining = set(range(len(names)))
+    # Start peripheral rather than central, so the chain runs from the most unusual voice
+    # inward instead of starting in the middle of the largest cluster and splitting it.
+    means = (similarity.sum(axis=1) - np.diag(similarity)) / max(len(names) - 1, 1)
+    order = [int(np.argmin(means))]
+    remaining.discard(order[0])
+    while remaining:
+        last = order[-1]
+        nxt = max(remaining, key=lambda index: similarity[last, index])
+        order.append(nxt)
+        remaining.discard(nxt)
+    return order
+
+
+@cli.command("matrix")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/similarity.md).")
+@click.option("--threshold", default=SAME_SPEAKER, show_default=True,
+              help="Cosine above which two voices are treated as the same speaker.")
+@click.option("--only-file", default=None, help="Restrict to the voices named in a file, one per line.")
+def cmd_matrix(out: str | None, threshold: float, only_file: str | None) -> None:
+    """Write the full N x N speaker-similarity matrix, plus what it implies.
+
+    The matrix is the direct answer to "how many acoustically different voices do I
+    actually have", which is the question a dataset-diversity exercise asks. WER says a
+    voice is usable; this says whether it is a *different* voice from the one next to it,
+    and the two have to be read together: a set of twenty voices that are all the same
+    speaker diversifies nothing, and a set of twenty distinct speakers half of whom garble
+    French is a dataset with garbled audio in it.
+    """
+    names, vectors = load_embeddings()
+    if only_file:
+        wanted = {line.strip() for line in Path(only_file).read_text().splitlines()
+                  if line.strip() and not line.startswith("#")}
+        keep = [index for index, name in enumerate(names) if name in wanted]
+        missing = wanted - set(names)
+        if missing:
+            logger.warning(f"{len(missing)} name(s) in {only_file} have no embedding, "
+                           f"e.g. {sorted(missing)[:3]}")
+        names = [names[index] for index in keep]
+        vectors = vectors[keep]
+    if len(names) < 2:
+        raise SystemExit("need at least two embedded voices for a matrix")
+
+    pool_path = REPO_ROOT / "cache" / "cloning" / "A6" / "pool.json"
+    pool = {entry["name"]: entry for entry in json.loads(pool_path.read_text())} \
+        if pool_path.is_file() else {}
+
+    # Rows are L2 normalised by `embed`, so the Gram matrix is exactly the cosine.
+    similarity = vectors @ vectors.T
+    order = seriate(names, similarity)
+    offdiag = similarity[np.triu_indices(len(names), k=1)]
+
+    # Numbered columns: 39 voice names across a header is unreadable in any renderer, and
+    # the legend below the table costs one lookup while the matrix stays a picture.
+    labels = {index: position for position, index in enumerate(order, start=1)}
+    lines = [f"## Speaker similarity, {len(names)} x {len(names)}", "",
+             "Cosine similarity between ECAPA-TDNN (VoxCeleb) speaker embeddings, each "
+             "voice averaged over its own takes. Every voice read the same sentences with "
+             "the same noise seed, so two takes differ only by the prefix that generated "
+             "them: text and prosody are held still and the embedding sees speaker "
+             "identity. 1.00 is the same speaker, and this family of systems sits near "
+             f"0.25 at equal error rate, so anything above {threshold:.2f} is two names for "
+             "one voice.", "",
+             "Columns are numbered to keep the table readable; the legend follows. Rows "
+             "are ordered by a greedy nearest-neighbour chain starting from the most "
+             "peripheral voice, so families fall on the diagonal. Leading zeros are "
+             "dropped and the diagonal is blank.", "",
+             "| # | voice | " + " | ".join(str(position) for position in range(1, len(order) + 1)) + " |",
+             "|---|---|" + "---|" * len(order)]
+    for index in order:
+        cells = []
+        for other in order:
+            if other == index:
+                cells.append("")
+                continue
+            value = float(similarity[index, other])
+            cells.append(f"{value:.2f}".lstrip("0") if value >= 0 else f"{value:.2f}")
+        lines.append(f"| {labels[index]} | `{names[index]}` | " + " | ".join(cells) + " |")
+
+    lines += ["", "### Legend and nearest neighbour", "",
+              "`claimed` is the shipped speaker each voice is supposed to resemble, read "
+              "off its recipe (a hybrid `h_<semantic>_<acoustic>` should sound like its "
+              "acoustic donor, a sparse `x_` mix like its dominant component). `nearest` "
+              "is what the embedding actually says. The two agreeing is the check that "
+              "the metric and the recipe are both working.", "",
+              "| # | voice | claimed | nearest | cosine | matches |",
+              "|---|---|---|---|---|---|"]
+    agree = 0
+    for index in order:
+        row = similarity[index].copy()
+        row[index] = -2.0
+        best = int(np.argmax(row))
+        claimed = declared_identity(names[index], pool)
+        # A base is its own claim, so "matches" is only meaningful for derived voices.
+        derived = claimed != names[index]
+        ok = derived and names[best] == claimed
+        agree += ok
+        lines.append(f"| {labels[index]} | `{names[index]}` | "
+                     f"{'`' + claimed + '`' if derived else '(shipped)'} | `{names[best]}` | "
+                     f"{row[best]:.2f} | {'yes' if ok else ('no' if derived else '-')} |")
+    derived_count = sum(1 for name in names if declared_identity(name, pool) != name)
+
+    pairs = [(float(similarity[a, b]), names[a], names[b])
+             for a in range(len(names)) for b in range(a + 1, len(names))
+             if similarity[a, b] >= threshold]
+    pairs.sort(reverse=True)
+    lines += ["", "### What the matrix says", "",
+              f"- Off-diagonal similarity: median {np.median(offdiag):.2f}, "
+              f"p25 {np.percentile(offdiag, 25):.2f}, p75 {np.percentile(offdiag, 75):.2f}, "
+              f"max {offdiag.max():.2f}, min {offdiag.min():.2f}.",
+              f"- {len(pairs)} of {len(offdiag)} pairs sit at or above {threshold:.2f}, "
+              f"i.e. are one speaker under two names.",
+              f"- {agree} of {derived_count} derived voices have their claimed donor as "
+              f"their nearest neighbour."]
+    if pairs:
+        lines += ["", "Pairs at or above the threshold, closest first:", "",
+                  "| cosine | a | b |", "|---|---|---|"]
+        lines += [f"| {value:.2f} | `{a}` | `{b}` |" for value, a, b in pairs]
+
+    destination = Path(out) if out else STAGE_DIR / "similarity.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(names)} voices, {len(pairs)} pair(s) above {threshold:.2f}, "
+                   f"wrote {destination}")
+
+
 if __name__ == "__main__":
     cli()
