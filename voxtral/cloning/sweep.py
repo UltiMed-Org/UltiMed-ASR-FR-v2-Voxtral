@@ -1367,6 +1367,47 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
         chosen = [t for t in takes if low <= features[t["sid"]]["words"] < high]
         bucket(f"{low} to {high if high < 999 else '65'} words", chosen)
 
+    # How a voice was BUILT, which is the lever anyone has: if one construction fails more
+    # than another on the same sentences, that is a recipe to change, not a voice to drop.
+    pool = {entry["name"]: entry for entry in json.loads(POOL_PATH.read_text())} \
+        if POOL_PATH.is_file() else {}
+
+    def construction(voice: str) -> tuple[str, str]:
+        """How this voice was made: its kind, and the donor that lent it articulation.
+
+        A6 built hybrids as `h_<semantic>_<acoustic>`, taking the semantic code column from
+        one voice and the 36 acoustic columns from another, so the semantic donor is what
+        decides whether the result can pronounce the language. Grouping by it is the only
+        way to see whether the recipe, rather than the speaker, is what breaks.
+        """
+        entry = pool.get(voice)
+        if entry is None or not entry.get("parents"):
+            return ("base", "-")
+        return (entry["kind"], entry["parents"][0])
+
+    lines += ["", "### Failure by construction", "",
+              "Same takes, grouped by how the voice was built rather than by which voice "
+              "it is. `semantic donor` is the voice a hybrid took its semantic code column "
+              "from, which is what lends it the ability to pronounce French at all.", "",
+              "| group | voices | takes | median WER | mean WER | p95 WER | runaway |",
+              "|---|---|---|---|---|---|---|"]
+
+    def group_row(label: str, chosen: list) -> None:
+        if not chosen:
+            return
+        wers = sorted(take["wer"] for take in chosen)
+        p95 = wers[min(len(wers) - 1, int(0.95 * len(wers)))]
+        lines.append(f"| {label} | {len({t['voice'] for t in chosen})} | {len(chosen)} | "
+                     f"{100 * statistics.median(wers):.1f}% | {100 * statistics.fmean(wers):.1f}% | "
+                     f"{100 * p95:.1f}% | "
+                     f"{100 * sum(1 for t in chosen if t['stretch'] >= runaway_factor) / len(chosen):.1f}% |")
+
+    for kind in sorted({construction(take["voice"])[0] for take in takes}):
+        group_row(f"kind: {kind}", [t for t in takes if construction(t["voice"])[0] == kind])
+    for donor in sorted({construction(take["voice"])[1] for take in takes} - {"-"}):
+        group_row(f"semantic donor: {donor}",
+                  [t for t in takes if construction(t["voice"])[1] == donor])
+
     # And finally per voice, so a voice that really is fragile is still visible.
     per_voice: dict[str, list] = {}
     for take in takes:
