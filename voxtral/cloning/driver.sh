@@ -9,10 +9,19 @@
 # `fleurs.sh` is the one-command entry point for the second; this script is the engine
 # under both, because the work is identical and only the run directory differs.
 #
-# Alternates two passes until the sweep converges:
+# Alternates two GPU passes and one offline one until the sweep converges:
 #
-#   bring voxtral-tts up (ASR down)  -> sweep.py tts   synthesize pending takes
-#   bring crispasr up (voxtral down) -> sweep.py stt   transcribe and score them
+#   bring voxtral-tts up (ASR down)  -> sweep.py tts     synthesize pending takes
+#   bring crispasr up (voxtral down) -> sweep.py stt     transcribe and score them
+#   no container needed              -> sweep.py retry   re-queue the takes that came
+#                                                        out degenerate, at a new seed
+#
+# The retry pass is why the loop is a loop and not two passes. Voxtral degenerates on a
+# small fraction of takes (it starts the sentence, then loops nonsense syllables until the
+# token cap), and since the only stochasticity in the model is the noise the decoder
+# starts from, another seed usually fixes it. `retry` spots those from the waveform alone
+# and bumps the row's attempt number, which makes the tts pass pick it up again. It stops
+# when every broken take is either repaired or out of attempts.
 #
 # The alternation exists because one 24 GB card cannot hold both stacks: Voxtral
 # takes about 20 GB at VOXTRAL_GPU_MEM_UTIL=0.7 and whisper wants ~3 GB per replica.
@@ -44,6 +53,11 @@
 #   STT_CONCURRENCY  parallel transcriptions (default 6, one per whisper replica)
 #   STT_SCALE        whisper replicas to run (default 6)
 #   EULER_STEPS      ODE steps per frame, 0 = server default (quality/speed lever)
+#   MAX_ATTEMPTS     attempts allowed per take including the first (default 3). 1 turns
+#                    retrying off entirely.
+#   RETRY_ON         comma-separated retry triggers (default "runaway"). Adding "wer"
+#                    turns the benchmark into best-of-N: see `sweep.py retry --help`
+#                    before you do, and read the results with `stats --attempt first`.
 #   PREPARE          sweep.py subcommand (with args) that mints this run's sentences.json
 #                    when it is missing, e.g. "fleurs". Empty (the default) means the list
 #                    has to exist already, which is A6's case: its 12 screen sentences
@@ -75,6 +89,8 @@ TTS_CONCURRENCY="${TTS_CONCURRENCY:-4}"
 STT_CONCURRENCY="${STT_CONCURRENCY:-6}"
 STT_SCALE="${STT_SCALE:-6}"
 EULER_STEPS="${EULER_STEPS:-0}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -163,11 +179,11 @@ run_pass() {
     local common=(--sentences "${DEPTH}")
     [[ -n "${ONLY_FILE:-}" ]] && common+=(--only-file "${ONLY_FILE}")
     [[ "${INCLUDE_BASES}" == 1 ]] || common+=(--no-include-bases)
-    if [[ "${mode}" == tts ]]; then
-        common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}")
-    else
-        common+=(--concurrency "${STT_CONCURRENCY}")
-    fi
+    case "${mode}" in
+        tts)   common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}") ;;
+        stt)   common+=(--concurrency "${STT_CONCURRENCY}") ;;
+        retry) common+=(--max-attempts "${MAX_ATTEMPTS}" --on "${RETRY_ON}") ;;
+    esac
     runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" \
         PATH="${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         CRISPASR_API_KEY="${CRISPASR_API_KEY}" \
@@ -207,17 +223,34 @@ while :; do
 
     switch stt
     rc=0; run_pass stt || rc=$?
+    scored_all=0
     case "${rc}" in
         0|11) ;;
-        10) echo "=== $(date '+%F %T') converged at depth ${DEPTH}: every take scored."; break ;;
+        10) scored_all=1 ;;
         20) echo "=== $(date '+%F %T') stopped during the stt pass, leaving the ledger as it is"; break ;;
         *)  echo "!!! stt pass exited ${rc}; aborting" >&2; exit "${rc}" ;;
     esac
+    stt_dry=$(( rc == 11 ? 1 : 0 ))
 
-    # Both passes finding nothing to do without the stt pass reporting convergence means
-    # rows are stuck (a voice that 500s on every attempt, say). Stop rather than swap two
-    # 9 GB model loads back and forth forever.
-    if (( tts_dry && rc == 11 )); then
+    # Offline, no container switch: it only reads the ledger. Exit 0 means it queued work
+    # for the next tts pass, 11 means every broken take is repaired or out of attempts.
+    retry_rc=0; run_pass retry || retry_rc=$?
+    case "${retry_rc}" in
+        0)  echo "--- $(date '+%F %T') retries queued, going round again"; continue ;;
+        11) ;;
+        *)  echo "!!! retry pass exited ${retry_rc}; aborting" >&2; exit "${retry_rc}" ;;
+    esac
+
+    if (( scored_all )); then
+        echo "=== $(date '+%F %T') converged at depth ${DEPTH_LABEL}: every take scored, "\
+             "nothing left to retry."
+        break
+    fi
+
+    # Both GPU passes finding nothing to do without the stt pass reporting convergence
+    # means rows are stuck (a voice that 500s on every attempt, say). Stop rather than swap
+    # two 9 GB model loads back and forth forever.
+    if (( tts_dry && stt_dry )); then
         echo "=== $(date '+%F %T') both passes ran dry without converging; leftovers need a look" >&2
         break
     fi

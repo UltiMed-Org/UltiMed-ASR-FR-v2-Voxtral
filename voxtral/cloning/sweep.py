@@ -220,34 +220,79 @@ def ledger_path() -> Path:
     return STAGE_DIR / "ledger.jsonl"
 
 
-def read_ledger() -> dict[tuple[str, str], dict]:
-    """Replay the ledger into one state dict per row.
+def iter_ledger():
+    """Yield every well-formed record in the ledger, oldest first.
 
-    Append-only with last-write-wins per key, so a row written twice (a retry after a
-    crash, say) collapses to its latest state, and a half-written final line from a
-    `kill -9` is skipped instead of aborting the run.
+    A half-written final line from a `kill -9` is skipped rather than aborting the run,
+    which is the whole reason the ledger is append-only JSON lines and not a database.
 
-    Returns
-    -------
+    Yields
+    ------
     dict
-        `{(voice, sid): {...}}`.
+        One record as it was written.
     """
-    state: dict[tuple[str, str], dict] = {}
     path = ledger_path()
     if not path.is_file():
-        return state
+        return
     for line in path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            yield json.loads(line)
         except json.JSONDecodeError:
             logger.warning("skipping a truncated ledger line (interrupted write?)")
-            continue
+
+
+def read_ledger() -> dict[tuple[str, str], dict]:
+    """Replay the ledger into the current state of each row.
+
+    Append-only with last-write-wins per key, so the several records a row accumulates
+    (a wav, then a transcript and a score) collapse into one.
+
+    Attempts are the exception to the merge. When a take is re-synthesized at a new noise
+    seed, its new record carries a higher `attempt` and REPLACES the row instead of
+    merging into it. Merging would leave the previous attempt's WER sitting next to the
+    new attempt's wav, and the passes would then believe a freshly synthesized take was
+    already scored. A record without an `attempt` is attempt 0, which is what every row
+    written before retries existed is.
+
+    Returns
+    -------
+    dict
+        `{(voice, sid): {...}}`, holding the latest attempt only. Use `read_attempts`
+        when the earlier ones matter, which they do for any honest report.
+    """
+    state: dict[tuple[str, str], dict] = {}
+    for record in iter_ledger():
         key = (record["voice"], record["sid"])
-        state.setdefault(key, {}).update(record)
+        current = state.get(key)
+        if current is not None and record.get("attempt", 0) > current.get("attempt", 0):
+            state[key] = dict(record)
+        else:
+            state.setdefault(key, {}).update(record)
     return state
+
+
+def read_attempts() -> dict[tuple[str, str], list[dict]]:
+    """Replay the ledger into every attempt of each row, in order.
+
+    The benchmark needs this and `read_ledger` is not enough for it: once a take can be
+    retried, reporting only the surviving attempt turns the measurement into best-of-N and
+    quietly flatters every voice. Keeping the whole history lets a report say explicitly
+    which attempt it is quoting.
+
+    Returns
+    -------
+    dict
+        `{(voice, sid): [attempt 0, attempt 1, ...]}`, each entry merged the same way
+        `read_ledger` merges a single attempt.
+    """
+    rows: dict[tuple[str, str], dict[int, dict]] = {}
+    for record in iter_ledger():
+        key = (record["voice"], record["sid"])
+        rows.setdefault(key, {}).setdefault(record.get("attempt", 0), {}).update(record)
+    return {key: [attempts[index] for index in sorted(attempts)] for key, attempts in rows.items()}
 
 
 def append_ledger(record: dict) -> None:
@@ -371,7 +416,7 @@ def sentence_seed(sentence: dict) -> int:
     return int(sentence["sid"][1:])
 
 
-def wav_for(voice: str, sid: str) -> Path:
+def wav_for(voice: str, sid: str, attempt: int = 0) -> Path:
     """Where one take lives.
 
     Parameters
@@ -380,13 +425,76 @@ def wav_for(voice: str, sid: str) -> Path:
         Voice name.
     sid : str
         Sentence id.
+    attempt : int, optional
+        Which attempt. Attempt 0 keeps the plain `<sid>.wav` name, so the thousands of
+        takes that exist from before retries were added stay exactly where they are, and
+        later attempts land beside it as `<sid>.a1.wav`. The earlier audio is never
+        overwritten: a retry that came out worse has to remain listenable, or there is no
+        way to check the retry rule itself.
 
     Returns
     -------
     Path
         Wav path, inside a per-voice directory so a voice can be deleted as a unit.
     """
-    return STAGE_DIR / "wav" / voice / f"{sid}.wav"
+    suffix = ".wav" if attempt == 0 else f".a{attempt}.wav"
+    return STAGE_DIR / "wav" / voice / f"{sid}{suffix}"
+
+
+# Offset between the noise seeds of consecutive attempts. Large and odd so that attempt 1
+# of one sentence cannot collide with attempt 0 of another: the per-sentence offsets are
+# small integers, and a collision would silently make two rows the same audio.
+ATTEMPT_SEED_STRIDE = 7919
+
+
+def stretch_of(*, seconds: float, words: int, rate: float) -> float:
+    """How much longer a take ran than the voice's own speaking rate predicts.
+
+    The degeneration signal, and deliberately independent of the ASR: a take that runs
+    three times longer than it should has stopped reading the sentence, and that is
+    visible in the waveform without asking a second model anything. A5 measured a 3x
+    spread in speaking rate across the shipped voices, so the comparison has to be against
+    the voice's own rate rather than a fixed seconds-per-word.
+
+    Parameters
+    ----------
+    seconds : float
+        Duration of the take.
+    words : int
+        Words in the reference sentence.
+    rate : float
+        That voice's median words per second.
+
+    Returns
+    -------
+    float
+        1.0 when the take is exactly as long as expected, higher when it overran.
+    """
+    if words <= 0 or rate <= 0 or seconds <= 0:
+        return 1.0
+    return seconds / (words / rate)
+
+
+def voice_rates(takes: list[dict], *, words_of) -> dict[str, float]:
+    """Each voice's median speaking rate, in words per second.
+
+    Parameters
+    ----------
+    takes : list of dict
+        Scored records carrying `voice`, `sid` and `seconds`.
+    words_of : callable
+        Maps a sid to the word count of its sentence.
+
+    Returns
+    -------
+    dict
+        `{voice: words per second}`.
+    """
+    per: dict[str, list[float]] = {}
+    for take in takes:
+        if take.get("seconds"):
+            per.setdefault(take["voice"], []).append(words_of(take["sid"]) / take["seconds"])
+    return {voice: statistics.median(values) for voice, values in per.items()}
 
 
 @click.group()
@@ -569,14 +677,18 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         exception: once a take has a WER the audio has served its purpose, and deleting
         wavs to reclaim space (a full FLEURS run is about 7 GB) must not trigger hours of
         resynthesis for work whose result is already on record.
+
+        `retry` schedules a re-synthesis by appending a record that bumps `attempt` and
+        carries neither a wav nor a WER, so a retried row fails both tests here and comes
+        back to this pass without any special case.
         """
         row = state.get((voice, sid), {})
         if "wer" in row:
             return True
-        return bool(row.get("wav")) and wav_for(voice, sid).is_file()
+        return bool(row.get("wav")) and wav_for(voice, sid, row.get("attempt", 0)).is_file()
 
-    pending = [(voice, sentence) for voice, sentence in rows
-               if not synthesized(voice, sentence["sid"])]
+    pending = [(voice, sentence, state.get((voice, sentence["sid"]), {}).get("attempt", 0))
+               for voice, sentence in rows if not synthesized(voice, sentence["sid"])]
     logger.info(f"{len(rows)} rows in the grid ({len(voices)} voices x "
                 f"{len(at_depth(sentences, depth))} sentences), {len(pending)} to synthesize")
     if not pending:
@@ -589,14 +701,17 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
     counters = {"ok": 0, "failed": 0, "seconds": 0.0}
     started = time.monotonic()
 
-    def run(job: tuple[str, dict]) -> None:
-        voice, sentence = job
+    def run(job: tuple[str, dict, int]) -> None:
+        voice, sentence, attempt = job
         sid = sentence["sid"]
         # Same seed for every voice reading this sentence: the take then differs only by
         # the prefix, which is what makes cross-voice comparison (and a later speaker
-        # embedding distance) mean anything.
+        # embedding distance) mean anything. A retry moves the seed by a fixed stride, so
+        # attempt N is reproducible rather than merely different, and every voice retrying
+        # the same sentence still lands on the same seed as the others.
+        seed = noise_seed + sentence_seed(sentence) + attempt * ATTEMPT_SEED_STRIDE
         body = tts.build_speech_body(text=sentence["text"], response_format="wav", speed=1.0,
-                                     voice=voice, noise_seed=noise_seed + sentence_seed(sentence),
+                                     voice=voice, noise_seed=seed,
                                      euler_steps=euler_steps or None)
         try:
             status, payload, _, elapsed = tts._post_json(endpoint, body, timeout)
@@ -607,14 +722,16 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         if status != 200:
             counters["failed"] += 1
             logger.warning(f"{voice}/{sid}: HTTP {status} in {elapsed:.1f}s: {payload[:160]!r}")
-            append_ledger({"voice": voice, "sid": sid, "tts_error": f"HTTP {status}"})
+            append_ledger({"voice": voice, "sid": sid, "attempt": attempt,
+                           "tts_error": f"HTTP {status}"})
             return
-        destination = wav_for(voice, sid)
+        destination = wav_for(voice, sid, attempt)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
         counters["ok"] += 1
         counters["seconds"] += elapsed
-        append_ledger({"voice": voice, "sid": sid, "wav": str(destination.relative_to(REPO_ROOT)),
+        append_ledger({"voice": voice, "sid": sid, "attempt": attempt, "noise_seed": seed,
+                       "wav": str(destination.relative_to(REPO_ROOT)),
                        "bytes": len(payload), "request_seconds": round(elapsed, 2)})
 
     stopped = run_pool(jobs=pending, work=run, concurrency=concurrency,
@@ -650,7 +767,7 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
     for voice, sentence in grid(voices=voices, sentences=sentences, depth=depth):
         sid = sentence["sid"]
         row = state.get((voice, sid), {})
-        if not (row.get("wav") and wav_for(voice, sid).is_file()):
+        if not (row.get("wav") and wav_for(voice, sid, row.get("attempt", 0)).is_file()):
             missing += 1
             continue
         if "wer" not in row:
@@ -670,7 +787,8 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
 
     def run(job: tuple[str, str]) -> None:
         voice, sid = job
-        wav = wav_for(voice, sid)
+        attempt = state.get((voice, sid), {}).get("attempt", 0)
+        wav = wav_for(voice, sid, attempt)
         samples, rate = read_wav(wav)
         heard = transcribe(wav, url=url, api_key=api_key, model=model, language=language)
         if not heard:
@@ -678,7 +796,8 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
             # scoring it as 100 pct would permanently condemn the voice on a transport
             # failure. Record the attempt without a score so a later pass retries it.
             counters["failed"] += 1
-            append_ledger({"voice": voice, "sid": sid, "stt_error": "empty transcript"})
+            append_ledger({"voice": voice, "sid": sid, "attempt": attempt,
+                           "stt_error": "empty transcript"})
             return
         wer = word_error_rate(by_sid[sid], heard)
         # CER is stored next to WER rather than recomputed by the report, because the
@@ -686,7 +805,8 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
         cer = character_error_rate(by_sid[sid], heard)
         counters["ok"] += 1
         counters["rejected"] += wer > WER_REJECT
-        append_ledger({"voice": voice, "sid": sid, "transcript": heard, "wer": round(wer, 4),
+        append_ledger({"voice": voice, "sid": sid, "attempt": attempt,
+                       "transcript": heard, "wer": round(wer, 4),
                        "cer": round(cer, 4),
                        "f0": round(median_f0(samples, rate), 1),
                        "seconds": round(len(samples) / rate, 2)})
@@ -698,6 +818,138 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
     if stopped:
         logger.warning("STOP flag seen, parking")
         sys.exit(20)
+
+
+@cli.command("retry")
+@click.option("--sentences", "depth", default=2, show_default=True, help="Sentences per voice.")
+@click.option("--max-attempts", default=3, show_default=True,
+              help="Total attempts allowed per take, including the first.")
+@click.option("--runaway-factor", default=3.0, show_default=True,
+              help="Duration multiple of a voice's own speaking rate that counts as degenerate.")
+@click.option("--on", "triggers", default="runaway", show_default=True,
+              help="Comma-separated retry triggers: runaway, ceiling, empty, wer.")
+@click.option("--wer-over", default=1.0, show_default=True,
+              help="With the 'wer' trigger, retry above this rate. Read the warning below.")
+@click.option("--include-bases/--no-include-bases", default=True, show_default=True,
+              help="Consider the shipped voices too.")
+@click.option("--only-file", default=None, help="Restrict to the voices named in a file.")
+@click.option("--dry-run", is_flag=True, help="Report what would be retried, schedule nothing.")
+def cmd_retry(depth: int, max_attempts: int, runaway_factor: float, triggers: str,
+              wer_over: float, include_bases: bool, only_file: str | None, dry_run: bool) -> None:
+    """Schedule a re-synthesis, at a different noise seed, of takes that came out broken.
+
+    Voxtral degenerates on a small fraction of takes: it starts the sentence correctly and
+    then loops nonsense syllables until the token cap. The audio is genuinely unusable, and
+    since the only stochasticity in the model is the noise the flow-matching decoder starts
+    from, another seed usually produces a clean take of the same sentence.
+
+    This is offline and costs nothing: it appends a record bumping the row's `attempt`,
+    which makes the tts pass pick it up again, and the driver then loops tts, stt and retry
+    until no row is both broken and under budget. Earlier attempts are kept, wav and all.
+
+    **What this must not be used for.** Retrying until a number looks good is best-of-N,
+    and best-of-N is not a measurement: a voice that degenerates on a tenth of its takes
+    would score like one that never does. That is why the default trigger is `runaway`
+    and not `wer`. A runaway is identified from the waveform alone, without the ASR, and
+    means the generation broke; retrying it repairs a defect. A high WER usually means the
+    sentence was hard, which is a fact about the voice worth keeping. The `wer` trigger
+    exists because dataset generation genuinely does want best-of-N (nobody ships audio
+    they know is wrong), but it is opt-in, every attempt stays in the ledger, and
+    `stats --attempt first` reports the honest number whatever this did.
+
+    Exit codes match the driver contract: 0 when retries were scheduled, 11 when there is
+    nothing to retry.
+
+    Parameters
+    ----------
+    depth : int
+        Sentences per voice, matching the passes.
+    max_attempts : int
+        Budget per take. 1 disables retrying entirely.
+    runaway_factor : float
+        Overrun multiple that counts as degeneration.
+    triggers : str
+        Which failures to retry: `runaway` (degenerate duration), `ceiling` (pinned at the
+        token cap), `empty` (the ASR returned nothing), `wer` (see the warning above).
+    wer_over : float
+        Threshold for the `wer` trigger. The default of 1.0 is "the transcript is longer
+        than the reference", which is a broken take rather than a hard sentence.
+    include_bases : bool
+        Whether the shipped voices are considered.
+    only_file : str or None
+        Restrict to the voices named in this file.
+    dry_run : bool
+        Report and schedule nothing.
+    """
+    wanted_triggers = {name.strip() for name in triggers.split(",") if name.strip()}
+    unknown = wanted_triggers - {"runaway", "ceiling", "empty", "wer"}
+    if unknown:
+        raise SystemExit(f"unknown retry trigger(s): {sorted(unknown)}")
+
+    sentences = load_sentences()
+    voices = restrict(load_voices(include_bases=include_bases), only_file)
+    wanted = set(voices)
+    # Only rows inside the grid this run is working on, so raising the depth later cannot
+    # be preempted by retries of sentences nobody has asked for yet.
+    by_sid = {entry["sid"]: entry["text"] for entry in at_depth(sentences, depth)}
+
+    def words_of(sid: str) -> int:
+        """Word count of a sentence, as both the rate and the stretch measure it."""
+        return len(by_sid[sid].split())
+
+    state = read_ledger()
+
+    scored = [dict(record, voice=voice, sid=sid) for (voice, sid), record in state.items()
+              if voice in wanted and sid in by_sid and ("wer" in record or "stt_error" in record)]
+    if not scored:
+        logger.info("nothing scored yet, so nothing to judge")
+        sys.exit(11)
+    rates = voice_rates([take for take in scored if take.get("seconds")], words_of=words_of)
+
+    broken: list[tuple[str, str, int, str]] = []
+    exhausted = 0
+    for take in scored:
+        attempt = take.get("attempt", 0)
+        reasons = []
+        seconds = take.get("seconds") or 0.0
+        if "runaway" in wanted_triggers and seconds and take["voice"] in rates:
+            if stretch_of(seconds=seconds, words=words_of(take["sid"]),
+                          rate=rates[take["voice"]]) >= runaway_factor:
+                reasons.append("runaway")
+        # 4096 tokens at 12.5 Hz: generation that never terminated and was cut off.
+        if "ceiling" in wanted_triggers and seconds >= 327.0:
+            reasons.append("ceiling")
+        if "empty" in wanted_triggers and take.get("stt_error"):
+            reasons.append("empty")
+        if "wer" in wanted_triggers and take.get("wer", 0.0) > wer_over:
+            reasons.append("wer")
+        if not reasons:
+            continue
+        if attempt + 1 >= max_attempts:
+            exhausted += 1
+            continue
+        broken.append((take["voice"], take["sid"], attempt + 1, "+".join(reasons)))
+
+    logger.info(f"{len(scored)} scored takes, {len(broken)} to retry, "
+                f"{exhausted} already out of attempts (budget {max_attempts})")
+    if not broken:
+        logger.info("nothing to retry")
+        sys.exit(11)
+    by_reason: dict[str, int] = {}
+    for _, _, _, reason in broken:
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    for reason, count in sorted(by_reason.items(), key=lambda item: -item[1]):
+        logger.info(f"  {count} x {reason}")
+    if dry_run:
+        for voice, sid, attempt, reason in broken[:20]:
+            logger.info(f"  would retry {voice}/{sid} as attempt {attempt} ({reason})")
+        sys.exit(11)
+
+    for voice, sid, attempt, reason in broken:
+        # Carries no wav and no wer on purpose: `read_ledger` replaces the row on a higher
+        # attempt, so this is what makes the take pending again for both passes.
+        append_ledger({"voice": voice, "sid": sid, "attempt": attempt, "retry_reason": reason})
+    logger.success(f"scheduled {len(broken)} retry/retries; the tts pass will pick them up")
 
 
 @cli.command("report")
@@ -802,8 +1054,11 @@ def summarise(values: list[float]) -> dict[str, float]:
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Include the shipped voices as controls.")
 @click.option("--only-file", default=None, help="Restrict to the voices named in a file.")
+@click.option("--attempt", "which", default="first",
+              type=click.Choice(["first", "last", "best"]), show_default=True,
+              help="Which attempt of a retried take to report. Read the docstring.")
 def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
-              only_file: str | None) -> None:
+              only_file: str | None, which: str) -> None:
     """Per-voice WER and CER distributions over everything scored so far.
 
     Offline: reads the ledger, touches no GPU and no server, so it can be run against a
@@ -816,20 +1071,54 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     the tail (p75, max) says more about whether a voice can be trusted to generate a
     dataset than the median does. A voice that reads 90 pct of FLEURS perfectly and
     detonates on the rest still ships broken audio.
+
+    `--attempt` decides what a retried take contributes, and the three answers are three
+    different questions:
+
+    - `first` (the default) is what the model does unaided, which is the only honest
+      benchmark number. Retrying and then reporting the survivor is best-of-N, and
+      best-of-N would score a voice that degenerates on a tenth of its takes the same as
+      one that never does.
+    - `best` is what a dataset built with this pipeline would actually contain, since a
+      generator that spots a degenerate take and regenerates it would keep the good one.
+      Quote it as a production expectation, never as a property of the voice.
+    - `last` is what is currently on disk, which is what you get if you go and listen.
+
+    The gap between `first` and `best` is itself the useful number: it says how much the
+    retry loop is carrying.
     """
     sentences = load_sentences()
     voices = restrict(load_voices(include_bases=include_bases), only_file)
     wanted = set(voices)
     by_sid = {entry["sid"]: entry["text"] for entry in sentences}
-    state = read_ledger()
+    history = read_attempts()
+
+    def chosen_attempt(attempts: list[dict]) -> dict | None:
+        """Pick the attempt this report is about, from a take's whole history."""
+        scored_attempts = [record for record in attempts if "wer" in record]
+        if not scored_attempts:
+            return None
+        if which == "first":
+            return scored_attempts[0]
+        if which == "last":
+            return scored_attempts[-1]
+        return min(scored_attempts, key=lambda record: record["wer"])
 
     scored: dict[str, dict[str, dict]] = {}
-    for (voice, sid), record in state.items():
-        if voice not in wanted or sid not in by_sid or "wer" not in record:
+    retried = 0
+    for (voice, sid), attempts in history.items():
+        if voice not in wanted or sid not in by_sid:
             continue
-        scored.setdefault(voice, {})[sid] = record
+        record = chosen_attempt(attempts)
+        if record is None:
+            continue
+        retried += sum(1 for entry in attempts if "wer" in entry) > 1
+        scored.setdefault(voice, {})[sid] = dict(record)
     if not scored:
         raise SystemExit(f"nothing scored yet in {STAGE_DIR}")
+    if retried:
+        logger.info(f"{retried} take(s) have more than one scored attempt; "
+                    f"reporting the '{which}' one")
 
     # A take scored before CER existed has a WER and no CER. Deriving the missing rate
     # needs nothing but the transcript already on record, so it is repaired here rather
@@ -842,7 +1131,8 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
             if "cer" in record or not record.get("transcript"):
                 continue
             record["cer"] = round(character_error_rate(by_sid[sid], record["transcript"]), 4)
-            append_ledger({"voice": voice, "sid": sid, "cer": record["cer"]})
+            append_ledger({"voice": voice, "sid": sid, "attempt": record.get("attempt", 0),
+                           "cer": record["cer"]})
             backfilled += 1
     if backfilled:
         logger.info(f"{backfilled} take(s) got a CER back-filled from their stored transcript")
@@ -905,6 +1195,10 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     lines = [f"# {RUN}: WER and CER per voice", "",
              f"{len(rows)} voices, compared on the {len(common)} sentences every one of them "
              f"has read ({len(by_sid)} in the run, {audio_hours:.1f} h of audio scored).",
+             "",
+             f"Retried takes are reported at their **{which}** attempt"
+             + (f", and {retried} take(s) have more than one." if retried
+                else "; no take needed a retry.") + "",
              "",
              "All figures are percentages. WER is Levenshtein over words, CER over "
              "characters, both after the same normalisation (case, accents, punctuation "
@@ -999,15 +1293,16 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
 
     # Each voice is judged against its own speaking rate, because A5 measured a 3x spread
     # across the shipped voices: a fixed seconds-per-word threshold would flag every slow
-    # voice as degenerate and miss a fast one that doubled.
-    rates: dict[str, float] = {}
-    for voice in {take["voice"] for take in takes}:
-        own = [len(by_sid[take["sid"]].split()) / take["seconds"]
-               for take in takes if take["voice"] == voice]
-        rates[voice] = statistics.median(own)
+    # voice as degenerate and miss a fast one that doubled. Shared with `retry`, which has
+    # to agree with this table about what "broken" means or the two tell different stories.
+    def words_of(sid: str) -> int:
+        """Word count of a sentence."""
+        return len(by_sid[sid].split())
+
+    rates = voice_rates(takes, words_of=words_of)
     for take in takes:
-        expected = len(by_sid[take["sid"]].split()) / rates[take["voice"]]
-        take["stretch"] = take["seconds"] / expected
+        take["stretch"] = stretch_of(seconds=take["seconds"], words=words_of(take["sid"]),
+                                     rate=rates[take["voice"]])
     runaways = [take for take in takes if take["stretch"] >= runaway_factor]
     # 4096 tokens at 12.5 Hz. A take at the cap did not finish, it was cut off.
     ceiling = [take for take in takes if take["seconds"] >= 327.0]

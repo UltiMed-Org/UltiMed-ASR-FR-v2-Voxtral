@@ -32,6 +32,12 @@
 #   WITH_BASES   1 (default) benchmarks the keepers *and* the 20 shipped voices, so each
 #                keeper's number can be read next to its own donor's. 0 = keepers only.
 #   ONLY_FILE    an explicit voice list, one name per line, overriding WITH_BASES.
+#   MAX_ATTEMPTS attempts per take including the first (default 3). Voxtral degenerates
+#                on a small fraction of takes, and since its only stochasticity is the
+#                noise the decoder starts from, another seed usually fixes it: the driver
+#                spots those from the waveform and re-queues them automatically. Set 1 to
+#                turn that off. Every attempt is kept, and `stats --attempt first` reports
+#                the unaided number whatever the retry loop did.
 #   LIMIT        benchmark only the first N sentences of the split (0 = all 332). The
 #                split is shuffled with a fixed seed first, so a prefix is a fair sample
 #                rather than a handful of topics, and enlarging it later reuses every
