@@ -209,6 +209,26 @@ def load_voices(*, include_bases: bool) -> list[str]:
     return names
 
 
+def load_pool() -> dict[str, dict]:
+    """The derived-voice recipes, keyed by voice name.
+
+    The pool is written once by `derive_voices.py` and read by every command that needs
+    to know how a voice was built, including the ones in `voice_distance.py`. It lives
+    under the A6 run rather than the current one because a later run (a benchmark, say)
+    reuses A6's voices without re-deriving them, so `CLONING_RUN` must not move it.
+
+    Returns
+    -------
+    dict
+        `{name: {"name", "kind", "parents", ...}}`, empty if no pool has been built yet.
+        Callers that cannot work without it should say so themselves; the common case
+        here is a report that simply treats every voice as a shipped base.
+    """
+    if not POOL_PATH.is_file():
+        return {}
+    return {entry["name"]: entry for entry in json.loads(POOL_PATH.read_text())}
+
+
 def ledger_path() -> Path:
     """Where the append-only record of finished work lives.
 
@@ -963,7 +983,7 @@ def cmd_report(out: str | None, include_bases: bool) -> None:
     Deliberately NOT a ranking by WER: see the module docstring. Distinctness is the
     axis that decides what to keep, and `voice_distance.py` owns it.
     """
-    pool = {entry["name"]: entry for entry in json.loads(POOL_PATH.read_text())}
+    pool = load_pool()
     state = read_ledger()
     voices = load_voices(include_bases=include_bases)
 
@@ -1369,8 +1389,7 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
 
     # How a voice was BUILT, which is the lever anyone has: if one construction fails more
     # than another on the same sentences, that is a recipe to change, not a voice to drop.
-    pool = {entry["name"]: entry for entry in json.loads(POOL_PATH.read_text())} \
-        if POOL_PATH.is_file() else {}
+    pool = load_pool()
 
     def construction(voice: str) -> tuple[str, str]:
         """How this voice was made: its kind, and the donor that lent it articulation.

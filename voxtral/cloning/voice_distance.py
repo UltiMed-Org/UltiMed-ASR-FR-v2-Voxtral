@@ -38,7 +38,6 @@ If those two come out wrong, nothing below them is worth reading.
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -50,7 +49,7 @@ from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sweep import STAGE_DIR, WER_REJECT, read_ledger  # noqa: E402
+from sweep import STAGE_DIR, WER_REJECT, load_pool, read_ledger  # noqa: E402
 from wav_stats import read_wav  # noqa: E402
 
 # VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
@@ -267,7 +266,7 @@ def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
     names, vectors = load_embeddings()
     index_of = {name: i for i, name in enumerate(names)}
     gate = passing_voices()
-    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+    pool = load_pool()
 
     eligible = [name for name in names if name in gate]
     if anchor not in index_of:
@@ -360,7 +359,7 @@ def cmd_shortlist(kind: str | None, count: int, sid: str, max_wer: float, out: s
     names, vectors = load_embeddings()
     index_of = {name: i for i, name in enumerate(names)}
     gate = passing_voices()
-    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+    pool = load_pool()
     bases = [name for name in names if name not in pool]
     similarity = vectors @ vectors.T
 
@@ -414,7 +413,7 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
     names, vectors = load_embeddings()
     index_of = {name: i for i, name in enumerate(names)}
     gate = passing_voices()
-    pool = {entry["name"]: entry for entry in json.loads((STAGE_DIR / "pool.json").read_text())}
+    pool = load_pool()
     bases = [name for name in names if name not in pool]
     similarity = vectors @ vectors.T
 
@@ -592,9 +591,7 @@ def cmd_matrix(out: str | None, threshold: float, only_file: str | None) -> None
     if len(names) < 2:
         raise SystemExit("need at least two embedded voices for a matrix")
 
-    pool_path = REPO_ROOT / "cache" / "cloning" / "A6" / "pool.json"
-    pool = {entry["name"]: entry for entry in json.loads(pool_path.read_text())} \
-        if pool_path.is_file() else {}
+    pool = load_pool()
 
     # Rows are L2 normalised by `embed`, so the Gram matrix is exactly the cosine.
     similarity = vectors @ vectors.T
