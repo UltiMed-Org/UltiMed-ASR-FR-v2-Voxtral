@@ -6,7 +6,9 @@
 # Every voice reads all 332 sentences of google/fleurs fr_fr test (8520 words), each take
 # is transcribed by whisper-large-v3-turbo, and the per-sentence WER and CER end up in
 # cache/cloning/FLEURS/: ledger.jsonl (the record), per_sentence.csv (every take, flat)
-# and stats.md (per voice: min, p25, median, mean, p75, max, stdev for both rates).
+# and stats.md (per voice: min, p25, median, mean, p75, max, stdev for both rates). The
+# wavs are about 7 GB for a full run and can be deleted once scored: a take with a WER
+# on record is never re-synthesized.
 #
 # Run it under tmux or nohup. It takes hours: about 29 takes a minute to synthesize and
 # about 70 a minute to transcribe, so roughly 11 h for 40 voices, 5 h for the 20 keepers

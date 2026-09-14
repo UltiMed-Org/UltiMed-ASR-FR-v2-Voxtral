@@ -536,11 +536,22 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
     state = read_ledger()
     rows = grid(voices=voices, sentences=sentences, depth=depth)
 
-    # A row counts as done when the ledger says so AND the wav is still on disk, so
-    # deleting a take is enough to ask for it again.
+    def synthesized(voice: str, sid: str) -> bool:
+        """Whether this row still needs audio.
+
+        A row counts as done when the ledger says so AND the wav is still on disk, so
+        deleting a take is enough to ask for it again. An already-scored row is the
+        exception: once a take has a WER the audio has served its purpose, and deleting
+        wavs to reclaim space (a full FLEURS run is about 7 GB) must not trigger hours of
+        resynthesis for work whose result is already on record.
+        """
+        row = state.get((voice, sid), {})
+        if "wer" in row:
+            return True
+        return bool(row.get("wav")) and wav_for(voice, sid).is_file()
+
     pending = [(voice, sentence) for voice, sentence in rows
-               if not (state.get((voice, sentence["sid"]), {}).get("wav")
-                       and wav_for(voice, sentence["sid"]).is_file())]
+               if not synthesized(voice, sentence["sid"])]
     logger.info(f"{len(rows)} rows in the grid ({len(voices)} voices x "
                 f"{len(at_depth(sentences, depth))} sentences), {len(pending)} to synthesize")
     if not pending:
