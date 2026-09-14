@@ -495,6 +495,69 @@ def stretch_of(*, seconds: float, words: int, rate: float) -> float:
     return seconds / (words / rate)
 
 
+RUNAWAY_FACTOR = 3.0
+
+
+def voice_profiles(*, only: set[str] | None = None,
+                   runaway_factor: float = RUNAWAY_FACTOR) -> dict[str, dict]:
+    """One robustness row per voice, straight from the ledger.
+
+    Collapses every scored take into the four numbers that decide whether a voice can be
+    used to generate a dataset: what it does on a typical sentence (median WER), what it
+    costs on average once the disasters are included (mean WER), how often it degenerates
+    (runaway share), and how fast it speaks. The last is not a quality measure, it is a
+    diversity axis: two voices that are the same speaker still differ if one reads at 1.6
+    and the other at 3.0 words per second.
+
+    Lives here rather than in a command because `voice_distance.py` has to rank voices by
+    robustness when it picks one representative per speaker cluster, and a second
+    implementation of "runaway" would eventually disagree with `diagnose`.
+
+    Parameters
+    ----------
+    only : set of str, optional
+        Restrict to these voices. Default is every voice in the ledger.
+    runaway_factor : float
+        Duration multiple of the voice's own median speaking rate that counts as
+        degenerate. Waveform-based, so it does not depend on the ASR being right.
+
+    Returns
+    -------
+    dict
+        `{voice: {"takes", "median", "mean", "runaway", "rate"}}`, rates as fractions.
+    """
+    by_sid = {entry["sid"]: entry["text"] for entry in load_sentences()}
+    takes = [dict(record, voice=voice, sid=sid)
+             for (voice, sid), record in read_ledger().items()
+             if (only is None or voice in only) and sid in by_sid
+             and "wer" in record and record.get("seconds")]
+    if not takes:
+        return {}
+
+    def words_of(sid: str) -> int:
+        """Word count of a sentence."""
+        return len(by_sid[sid].split())
+
+    rates = voice_rates(takes, words_of=words_of)
+    per: dict[str, list] = {}
+    for take in takes:
+        take["stretch"] = stretch_of(seconds=take["seconds"], words=words_of(take["sid"]),
+                                     rate=rates[take["voice"]])
+        per.setdefault(take["voice"], []).append(take)
+
+    profiles = {}
+    for voice, group in per.items():
+        wers = [take["wer"] for take in group]
+        profiles[voice] = {
+            "takes": len(group),
+            "median": statistics.median(wers),
+            "mean": statistics.fmean(wers),
+            "runaway": sum(1 for t in group if t["stretch"] >= runaway_factor) / len(group),
+            "rate": rates[voice],
+        }
+    return profiles
+
+
 def voice_rates(takes: list[dict], *, words_of) -> dict[str, float]:
     """Each voice's median speaking rate, in words per second.
 
@@ -844,7 +907,7 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
 @click.option("--sentences", "depth", default=2, show_default=True, help="Sentences per voice.")
 @click.option("--max-attempts", default=3, show_default=True,
               help="Total attempts allowed per take, including the first.")
-@click.option("--runaway-factor", default=3.0, show_default=True,
+@click.option("--runaway-factor", default=RUNAWAY_FACTOR, show_default=True,
               help="Duration multiple of a voice's own speaking rate that counts as degenerate.")
 @click.option("--on", "triggers", default="runaway", show_default=True,
               help="Comma-separated retry triggers: runaway, ceiling, empty, wer.")
@@ -1278,7 +1341,7 @@ def text_features(text: str) -> dict:
 @click.option("--only-file", default=None, help="Restrict to the voices named in a file.")
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Include the shipped voices as controls.")
-@click.option("--runaway-factor", default=3.0, show_default=True,
+@click.option("--runaway-factor", default=RUNAWAY_FACTOR, show_default=True,
               help="Duration multiple of a voice's own speaking rate that counts as a runaway.")
 @click.option("--worst", default=25, show_default=True, help="How many hard sentences to list.")
 def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
@@ -1422,15 +1485,70 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
                      f"{100 * sum(1 for t in chosen if t['stretch'] >= runaway_factor) / len(chosen):.1f}% |")
 
     for kind in sorted({construction(take["voice"])[0] for take in takes}):
-        group_row(f"kind: {kind}", [t for t in takes if construction(t["voice"])[0] == kind])
+        chosen = [t for t in takes if construction(t["voice"])[0] == kind]
+        group_row(f"kind: {kind}", chosen)
+        # The same group with its degenerate takes removed. If a kind's mean collapses back
+        # onto the others here, it is not a worse reader, it is a reader that occasionally
+        # detonates, and a retry loop fixes that where a different recipe would not.
+        group_row(f"kind: {kind}, runaways removed",
+                  [t for t in chosen if t["stretch"] < runaway_factor])
     for donor in sorted({construction(take["voice"])[1] for take in takes} - {"-"}):
         group_row(f"semantic donor: {donor}",
                   [t for t in takes if construction(t["voice"])[1] == donor])
 
-    # And finally per voice, so a voice that really is fragile is still visible.
     per_voice: dict[str, list] = {}
     for take in takes:
         per_voice.setdefault(take["voice"], []).append(take)
+
+    # The question the whole A6 pool exists to answer: is a derived voice better than just
+    # using the voice it borrowed its identity from? A hybrid keeps the acoustic donor's
+    # speaker and swaps in another voice's semantic column, so the donor is the thing it
+    # has to beat. If it does not, the pool is 19 more names for 19 voices already shipped.
+    def identity_donor(voice: str) -> str | None:
+        """The voice a derived voice took its speaker identity from.
+
+        For a hybrid that is the acoustic donor (`parents[-1]`, the second half of
+        `h_<semantic>_<acoustic>`), because A6 measured identity to live entirely in the
+        36 acoustic codes. For a sparse mix it is the dominant component, which is stored
+        first. Returns None for a shipped voice, which has nothing to be compared against.
+        """
+        entry = pool.get(voice)
+        if entry is None or not entry.get("parents"):
+            return None
+        return entry["parents"][-1] if entry["kind"] == "hybrid" else entry["parents"][0]
+
+    profiles = voice_profiles(only=wanted, runaway_factor=runaway_factor)
+
+    def profile(voice: str) -> dict[str, float]:
+        """Shared robustness row for one voice, so this table and `select` agree."""
+        return profiles[voice]
+
+    pairs = [(voice, identity_donor(voice)) for voice in sorted(per_voice)]
+    pairs = [(voice, donor) for voice, donor in pairs if donor in per_voice]
+    if pairs:
+        better_median = sum(1 for v, d in pairs if profile(v)["median"] < profile(d)["median"])
+        better_mean = sum(1 for v, d in pairs if profile(v)["mean"] < profile(d)["mean"])
+        worse_tail = sum(1 for v, d in pairs if profile(v)["runaway"] > profile(d)["runaway"])
+        lines += ["", "### Derived voice against the voice it copied", "",
+                  "Every derived voice next to the donor it took its speaker identity from "
+                  "(the acoustic parent of a hybrid, the dominant component of a mix), on "
+                  "the same sentences. `x / y` is derived / donor. A derived voice only "
+                  "earns its place if it beats this row, because the donor is already "
+                  "available and costs nothing.", "",
+                  f"Of {len(pairs)} pairs: **{better_median} beat their donor on the median "
+                  f"sentence**, {better_mean} on the mean, and **{worse_tail} degenerate more "
+                  "often than their donor does**.", "",
+                  "| derived | donor | median WER | mean WER | runaway | words/s |",
+                  "|---|---|---|---|---|---|"]
+        for voice, donor in sorted(pairs, key=lambda pair: profile(pair[0])["median"]):
+            here, there = profile(voice), profile(donor)
+            lines.append(
+                f"| `{voice}` | `{donor}` | {100 * here['median']:.1f}% / {100 * there['median']:.1f}% | "
+                f"{100 * here['mean']:.1f}% / {100 * there['mean']:.1f}% | "
+                f"{100 * here['runaway']:.1f}% / {100 * there['runaway']:.1f}% | "
+                f"{here['rate']:.2f} / {there['rate']:.2f} |")
+
+    # And finally per voice, so a voice that really is fragile is still visible.
     lines += ["", "### Runaways per voice", "",
               "A voice at the top of this table degenerates more often than the others on "
               "the same sentences, which is a reason to drop it. A voice near the bottom "

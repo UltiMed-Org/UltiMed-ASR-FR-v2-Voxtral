@@ -49,7 +49,7 @@ from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sweep import STAGE_DIR, WER_REJECT, load_pool, read_ledger  # noqa: E402
+from sweep import STAGE_DIR, WER_REJECT, load_pool, read_ledger, voice_profiles  # noqa: E402
 from wav_stats import read_wav  # noqa: E402
 
 # VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
@@ -336,6 +336,72 @@ def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
         marker = "" if sim < threshold else " (duplicate)"
         lines.append(f"| {position} | {name} | {entry['kind']} | {'+'.join(entry['parents'])} | "
                      f"{100 * gate[name]:.0f}% | {sim:.2f}{marker} |")
+
+    # The greedy walk answers "how many different speakers are there", but it names an
+    # arbitrary member of each cluster: it picks whichever twin it reached first, which can
+    # be the fragile one. For an actual roster the cluster is the speaker and the question
+    # is which of its names to generate with.
+    #
+    # Clusters are the connected components of the "at or above threshold" graph, not the
+    # neighbourhoods of the kept voices: similarity is not transitive (de_female sits at
+    # 0.58 from pt_female, which sits at 0.97 from h_frm_ptf), so neighbourhoods overlap
+    # and would list the same voice under two speakers. Components cannot, and merging a
+    # borderline chain is the conservative error here: it under-counts diversity rather
+    # than shipping two names for one speaker.
+    profiles = voice_profiles()
+
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        """Root of this voice's cluster, with path compression."""
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if similarity[index_of[a], index_of[b]] >= threshold:
+                parent[find(a)] = find(b)
+
+    components: dict[str, list[str]] = {}
+    for name in names:
+        components.setdefault(find(name), []).append(name)
+
+    def robustness(name: str) -> tuple[float, float]:
+        """Sort key: degenerate rarely first, then be accurate on average."""
+        row = profiles.get(name, {"runaway": 1.0, "mean": 1.0})
+        return (row["runaway"], row["mean"])
+
+    # Ordered by the walk, so the roster is still "most different first" and can be cut
+    # anywhere: the first N rows are the N most spread-out speakers available.
+    walked = [anchor] + [name for name, _ in order]
+    seen, roster = set(), []
+    for name in walked:
+        root = find(name)
+        if root in seen:
+            continue
+        seen.add(root)
+        family = [member for member in components[root] if member in profiles]
+        roster.append((min(family or [name], key=robustness), family))
+
+    logger.info(f"{len(roster)} speaker clusters at >= {threshold} cosine similarity")
+    lines += ["", "## The roster: one name per speaker, the best-behaved one", "",
+              f"The {len(names)} voices form **{len(roster)} clusters** at cosine >= "
+              f"{threshold} (connected components, so a chain of near-duplicates counts "
+              "once). Only one name per cluster buys any acoustic diversity, and this "
+              "picks the member that degenerates least rather than the one the walk "
+              "happened to reach first. `words/s` is kept because it separates voices the "
+              "embedding cannot: same speaker, different delivery.", "",
+              "| # | voice | same speaker as | median WER | mean WER | runaway | words/s |",
+              "|---|---|---|---|---|---|---|"]
+    for position, (best, family) in enumerate(roster, start=1):
+        row = profiles.get(best, {})
+        others = [name for name in sorted(family, key=robustness) if name != best]
+        lines.append(
+            f"| {position} | `{best}` | {', '.join(f'`{name}`' for name in others) or '-'} | "
+            f"{100 * row.get('median', float('nan')):.1f}% | {100 * row.get('mean', float('nan')):.1f}% | "
+            f"{100 * row.get('runaway', float('nan')):.1f}% | {row.get('rate', float('nan')):.2f} |")
 
     destination = Path(out) if out else STAGE_DIR / "distinct.md"
     destination.write_text("\n".join(lines) + "\n")
