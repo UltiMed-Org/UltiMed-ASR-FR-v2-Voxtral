@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path
 
 import click
@@ -155,6 +156,39 @@ def normalise(text: str) -> list[str]:
     return fold_numbers(re.sub(r"[^a-z0-9\s]", " ", folded).split())
 
 
+def _levenshtein(reference: Sequence, hypothesis: Sequence) -> int:
+    """Edit distance between two sequences, counted in their own elements.
+
+    Shared by the word-level and character-level error rates so the two can never
+    drift apart: WER and CER differ only in what they tokenise into, never in how the
+    alignment is computed.
+
+    Parameters
+    ----------
+    reference : Sequence
+        Tokens of the text the voice was asked to read.
+    hypothesis : Sequence
+        Tokens of what the ASR heard.
+
+    Returns
+    -------
+    int
+        Number of substitutions, insertions and deletions.
+    """
+    # Single-row Levenshtein. Pure Python is fast enough even for CER on the longest
+    # FLEURS sentence (65 words, ~400 characters, so ~160k inner steps or ~30 ms), which
+    # is two orders of magnitude below the ASR call that produced the transcript.
+    previous = list(range(len(hypothesis) + 1))
+    for i, r in enumerate(reference, start=1):
+        current = [i]
+        for j, h in enumerate(hypothesis, start=1):
+            current.append(min(previous[j] + 1,          # deletion
+                               current[j - 1] + 1,       # insertion
+                               previous[j - 1] + (r != h)))
+        previous = current
+    return previous[-1]
+
+
 def word_error_rate(reference: str, hypothesis: str) -> float:
     """Levenshtein distance over words, divided by the reference length.
 
@@ -174,16 +208,39 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     ref, hyp = normalise(reference), normalise(hypothesis)
     if not ref:
         return float("nan")
-    # Single-row Levenshtein: the sweep is dozens of short takes, so clarity beats speed.
-    previous = list(range(len(hyp) + 1))
-    for i, r in enumerate(ref, start=1):
-        current = [i]
-        for j, h in enumerate(hyp, start=1):
-            current.append(min(previous[j] + 1,          # deletion
-                               current[j - 1] + 1,       # insertion
-                               previous[j - 1] + (r != h)))
-        previous = current
-    return previous[-1] / len(ref)
+    return _levenshtein(ref, hyp) / len(ref)
+
+
+def character_error_rate(reference: str, hypothesis: str) -> float:
+    """Levenshtein distance over characters, divided by the reference length.
+
+    CER is WER's finer-grained companion and the two are worth reading together. A take
+    that says "soixante-quize" loses a whole word under WER but one character under CER,
+    so a big gap between the two rates means mangled endings, while WER and CER moving
+    together means the voice read genuinely different words.
+
+    Normalisation is deliberately the same one WER uses (case, accents, punctuation and
+    spelled-out numbers folded), with the words rejoined by single spaces. Comparing the
+    raw strings instead would charge every take for the ASR's punctuation and
+    capitalisation habits, which is not the property being measured.
+
+    Parameters
+    ----------
+    reference : str
+        The text the voice was asked to read.
+    hypothesis : str
+        What the ASR heard.
+
+    Returns
+    -------
+    float
+        0.0 for a perfect match. Can exceed 1.0 when the transcript is longer than the
+        reference.
+    """
+    ref, hyp = " ".join(normalise(reference)), " ".join(normalise(hypothesis))
+    if not ref:
+        return float("nan")
+    return _levenshtein(ref, hyp) / len(ref)
 
 
 def transcribe(wav: Path, *, url: str, api_key: str | None, model: str | None,
