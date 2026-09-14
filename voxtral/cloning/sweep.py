@@ -346,6 +346,31 @@ def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str) -> bo
     return stopped
 
 
+def sentence_seed(sentence: dict) -> int:
+    """Noise seed offset for one sentence.
+
+    Normally derived from the sentence id, so every voice reading a given sentence draws
+    the same acoustic noise and two takes differ only by the prefix that generated them.
+
+    A sentence may pin an explicit `seed` instead, which is what the `probe` variants
+    need: they hold the seed still while the *text* changes, and the id cannot express
+    that because each variant needs its own id to have its own ledger row.
+
+    Parameters
+    ----------
+    sentence : dict
+        Entry from the run's sentence list.
+
+    Returns
+    -------
+    int
+        Offset added to the pass's base noise seed.
+    """
+    if "seed" in sentence:
+        return int(sentence["seed"])
+    return int(sentence["sid"][1:])
+
+
 def wav_for(voice: str, sid: str) -> Path:
     """Where one take lives.
 
@@ -571,7 +596,7 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         # the prefix, which is what makes cross-voice comparison (and a later speaker
         # embedding distance) mean anything.
         body = tts.build_speech_body(text=sentence["text"], response_format="wav", speed=1.0,
-                                     voice=voice, noise_seed=noise_seed + int(sid[1:]),
+                                     voice=voice, noise_seed=noise_seed + sentence_seed(sentence),
                                      euler_steps=euler_steps or None)
         try:
             status, payload, _, elapsed = tts._post_json(endpoint, body, timeout)
@@ -904,6 +929,340 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     destination.write_text("\n".join(lines) + "\n")
     logger.success(f"{len(rows)} voices over {len(common)} shared sentences, "
                    f"wrote {destination} and {csv_path}")
+
+
+def text_features(text: str) -> dict:
+    """Properties of a sentence that might explain why voices struggle with it.
+
+    Chosen before looking at the results, from what FLEURS actually contains that the A6
+    screen deliberately filtered out: the screen required a capital start, a terminal
+    stop, no digits, at most one interior capital and French letters only, so every one
+    of these is a category the voices have never been measured on.
+
+    Parameters
+    ----------
+    text : str
+        The reference sentence.
+
+    Returns
+    -------
+    dict
+        `words`, `quoted` (French guillemets), `multi` (more than one sentence),
+        `digits`, `parens`, `nbsp` (non-breaking or thin spaces, which French typography
+        puts before `?!:;»` and which a tokenizer may or may not treat as a space).
+    """
+    return {"words": len(text.split()),
+            "quoted": "«" in text or "»" in text,
+            "multi": bool(re.search(r"[.!?]\s+\S", text)),
+            "digits": any(character.isdigit() for character in text),
+            "parens": "(" in text,
+            "nbsp": "\u00a0" in text or "\u2009" in text}
+
+
+@cli.command("diagnose")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/failures.md).")
+@click.option("--only-file", default=None, help="Restrict to the voices named in a file.")
+@click.option("--include-bases/--no-include-bases", default=True, show_default=True,
+              help="Include the shipped voices as controls.")
+@click.option("--runaway-factor", default=3.0, show_default=True,
+              help="Duration multiple of a voice's own speaking rate that counts as a runaway.")
+@click.option("--worst", default=25, show_default=True, help="How many hard sentences to list.")
+def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
+                 runaway_factor: float, worst: int) -> None:
+    """Separate broken voices from broken sentences, and name the failure modes.
+
+    A per-voice mean is useless on its own when the failures are catastrophic and rare: a
+    voice whose mean WER is 98 pct and whose median is 4 pct is not a bad voice, it is a
+    good voice that detonated twice. What matters is whether the detonations follow the
+    voice or the sentence, because only the first is a reason to drop a voice and only the
+    second is a reason to fix the text before generating a dataset with it.
+
+    Two signals, deliberately independent. Word error rate comes from the ASR and can be
+    wrong for its own reasons. Runaway duration does not: a take is flagged when it runs
+    more than `--runaway-factor` times longer than the voice's *own* median speaking rate
+    predicts for that word count, which detects degeneration without asking a second model
+    anything. A take pinned at the token ceiling is the extreme case of the same thing,
+    and is reported separately because it means the audio is also truncated mid-word.
+    """
+    sentences = load_sentences()
+    voices = restrict(load_voices(include_bases=include_bases), only_file)
+    wanted = set(voices)
+    by_sid = {entry["sid"]: entry["text"] for entry in sentences}
+    features = {sid: text_features(text) for sid, text in by_sid.items()}
+    state = read_ledger()
+
+    takes = [dict(record, voice=voice, sid=sid)
+             for (voice, sid), record in state.items()
+             if voice in wanted and sid in by_sid and "wer" in record and record.get("seconds")]
+    if not takes:
+        raise SystemExit(f"nothing scored yet in {STAGE_DIR}")
+
+    # Each voice is judged against its own speaking rate, because A5 measured a 3x spread
+    # across the shipped voices: a fixed seconds-per-word threshold would flag every slow
+    # voice as degenerate and miss a fast one that doubled.
+    rates: dict[str, float] = {}
+    for voice in {take["voice"] for take in takes}:
+        own = [len(by_sid[take["sid"]].split()) / take["seconds"]
+               for take in takes if take["voice"] == voice]
+        rates[voice] = statistics.median(own)
+    for take in takes:
+        expected = len(by_sid[take["sid"]].split()) / rates[take["voice"]]
+        take["stretch"] = take["seconds"] / expected
+    runaways = [take for take in takes if take["stretch"] >= runaway_factor]
+    # 4096 tokens at 12.5 Hz. A take at the cap did not finish, it was cut off.
+    ceiling = [take for take in takes if take["seconds"] >= 327.0]
+
+    lines = ["## Failure modes", "",
+             f"{len(takes)} scored takes over {len({t['sid'] for t in takes})} sentences and "
+             f"{len({t['voice'] for t in takes})} voices.", "",
+             f"- **{len(runaways)} runaway takes** ({100 * len(runaways) / len(takes):.1f} pct), "
+             f"meaning the audio ran at least {runaway_factor:g}x longer than that voice's own "
+             "median speaking rate predicts. This is measured from the waveform, not from the "
+             "transcript, so it does not depend on the ASR being right.",
+             f"- **{len(ceiling)} takes pinned at the 327.7 s token ceiling**, which is "
+             "generation that never terminated and was cut off mid-word.", ""]
+
+    # Per-sentence first: if the hard sentences are the same ones for everybody, the
+    # problem is the corpus and no amount of choosing between voices fixes it.
+    per_sid: dict[str, list] = {}
+    for take in takes:
+        per_sid.setdefault(take["sid"], []).append(take)
+    hardest = sorted(per_sid.items(),
+                     key=lambda item: -statistics.median([t["wer"] for t in item[1]]))[:worst]
+    lines += [f"### The {len(hardest)} hardest sentences", "",
+              "Median WER is across voices, so it measures the *sentence*: a high median "
+              "means every voice struggled, which is a property of the text.", "",
+              "| sid | voices | median WER | max WER | runaways | words | «» | multi | digits | text |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for sid, group in hardest:
+        wers = [take["wer"] for take in group]
+        feature = features[sid]
+        lines.append(
+            f"| `{sid}` | {len(group)} | {100 * statistics.median(wers):.0f}% | "
+            f"{100 * max(wers):.0f}% | {sum(1 for t in group if t['stretch'] >= runaway_factor)} | "
+            f"{feature['words']} | {'yes' if feature['quoted'] else ''} | "
+            f"{'yes' if feature['multi'] else ''} | {'yes' if feature['digits'] else ''} | "
+            + by_sid[sid][:70].replace("|", "/") + "… |")
+
+    # Then the same takes grouped by text feature, which turns the table above from an
+    # anecdote into a rate.
+    lines += ["", "### Error rate by text feature", "",
+              "Each row is every take whose sentence has that property. `runaway` is the "
+              "share of those takes that degenerated. A feature that raises the median "
+              "raises it for all voices at once and is a corpus property; a feature that "
+              "raises only the mean and the runaway rate is a rare catastrophic trigger, "
+              "which is the more dangerous kind for dataset generation.", "",
+              "| group | sentences | takes | median WER | mean WER | runaway |",
+              "|---|---|---|---|---|---|"]
+
+    def bucket(label: str, chosen: list) -> None:
+        if not chosen:
+            return
+        wers = [take["wer"] for take in chosen]
+        lines.append(f"| {label} | {len({t['sid'] for t in chosen})} | {len(chosen)} | "
+                     f"{100 * statistics.median(wers):.1f}% | {100 * statistics.fmean(wers):.1f}% | "
+                     f"{100 * sum(1 for t in chosen if t['stretch'] >= runaway_factor) / len(chosen):.1f}% |")
+
+    bucket("all takes", takes)
+    for name, key in (("guillemets «»", "quoted"), ("several sentences", "multi"),
+                      ("digits", "digits"), ("parentheses", "parens"), ("nbsp / thin space", "nbsp")):
+        bucket(f"with {name}", [t for t in takes if features[t["sid"]][key]])
+        bucket(f"without {name}", [t for t in takes if not features[t["sid"]][key]])
+    for low, high in ((0, 20), (20, 30), (30, 40), (40, 999)):
+        chosen = [t for t in takes if low <= features[t["sid"]]["words"] < high]
+        bucket(f"{low} to {high if high < 999 else '65'} words", chosen)
+
+    # And finally per voice, so a voice that really is fragile is still visible.
+    per_voice: dict[str, list] = {}
+    for take in takes:
+        per_voice.setdefault(take["voice"], []).append(take)
+    lines += ["", "### Runaways per voice", "",
+              "A voice at the top of this table degenerates more often than the others on "
+              "the same sentences, which is a reason to drop it. A voice near the bottom "
+              "whose mean WER is nonetheless high was tripped by the text, not by itself.", "",
+              "| voice | takes | runaways | ceiling | median WER | mean WER | words/s |",
+              "|---|---|---|---|---|---|---|"]
+    for voice, group in sorted(per_voice.items(),
+                               key=lambda item: -sum(1 for t in item[1] if t["stretch"] >= runaway_factor)):
+        wers = [take["wer"] for take in group]
+        lines.append(f"| `{voice}` | {len(group)} | "
+                     f"{sum(1 for t in group if t['stretch'] >= runaway_factor)} | "
+                     f"{sum(1 for t in group if t['seconds'] >= 327.0)} | "
+                     f"{100 * statistics.median(wers):.1f}% | {100 * statistics.fmean(wers):.1f}% | "
+                     f"{rates[voice]:.2f} |")
+
+    destination = Path(out) if out else STAGE_DIR / "failures.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(runaways)} runaway(s) and {len(ceiling)} at the ceiling "
+                   f"in {len(takes)} takes, wrote {destination}")
+
+
+# Non-breaking space, thin space, narrow no-break space. French typography puts one of
+# these before ?!:;» and inside « », so they are invisible in every editor and travel
+# with the guillemets, which is exactly why the two have to be separated by experiment.
+FRENCH_SPACES = "\u00a0\u2009\u202f"
+
+
+def _plain_spaces(text: str) -> str:
+    """Turn French typographic spaces into ordinary ones, leaving the guillemets."""
+    return re.sub(f"[{FRENCH_SPACES}]", " ", text)
+
+
+def _no_guillemets(text: str) -> str:
+    """Delete the guillemets and nothing else.
+
+    Deliberately not `\\s*[«»]\\s*`: swallowing the neighbouring whitespace would remove
+    the typographic space at the same time, and then this variant would be testing both
+    changes at once instead of one.
+    """
+    return text.replace("«", "").replace("»", "")
+
+
+# A 2x2, not a ladder: `nbsp` keeps the guillemets and fixes the spaces, `quotes` keeps
+# the spaces and removes the guillemets, so whichever of the two moves the numbers is the
+# culprit and `clean` bounds what is achievable. Keys appear verbatim in the report.
+PROBE_VARIANTS = {
+    "raw": lambda text: text,
+    "nbsp": _plain_spaces,
+    "quotes": _no_guillemets,
+    "clean": lambda text: re.sub(r" +", " ", _plain_spaces(_no_guillemets(text))).strip(),
+}
+
+
+@cli.command("probe")
+@click.option("--from-run", default="FLEURS", show_default=True,
+              help="Run whose hardest sentences are re-read as variants.")
+@click.option("--worst", default=8, show_default=True, help="How many hard sentences to probe.")
+@click.option("--require", default="quoted", show_default=True,
+              help="Only probe sentences with this text feature (empty = any).")
+def cmd_probe(from_run: str, worst: int, require: str) -> None:
+    """Mint a tiny run that re-reads the hardest sentences with the text cleaned up.
+
+    `diagnose` can only say that guillemets and non-breaking spaces travel with the
+    catastrophes. It cannot say which one causes them, because French typography puts a
+    non-breaking space inside every pair of guillemets, so the two features are almost the
+    same set of sentences. The only way to separate them is to change one at a time and
+    re-synthesize, which is what this mints the sentence list for.
+
+    Each source sentence becomes four rows sharing one pinned noise seed, so the audio
+    differs by the text and by nothing else: `raw` as FLEURS ships it, `nbsp` with the
+    non-breaking and thin spaces turned into ordinary ones, `quotes` with the guillemets
+    removed, and `clean` with both. Running it is the normal driver over a small run:
+
+        sudo -E RUN=PROBE DEPTH=0 PREPARE=probe \\
+            ONLY_FILE=cache/cloning/PROBE/voices.txt ./voxtral/cloning/driver.sh
+
+    then `sweep.py probe-report`. It costs two container flips and a few minutes, which is
+    the whole reason it is a separate run rather than more rows in the benchmark.
+
+    Parameters
+    ----------
+    from_run : str
+        Run directory to take the sentences and the scores from.
+    worst : int
+        How many of the hardest sentences to include.
+    require : str
+        A `text_features` key the sentence must have, so the probe spends its rows on the
+        suspected trigger rather than on whatever happened to score badly. Empty for any.
+    """
+    source = REPO_ROOT / "cache" / "cloning" / from_run
+    sentences = json.loads((source / "sentences.json").read_text())
+    by_sid = {entry["sid"]: entry["text"] for entry in sentences}
+
+    # Ranked by how badly the *sentence* does across voices, which is the only ranking that
+    # points at the text rather than at one unlucky voice.
+    per_sid: dict[str, list[float]] = {}
+    for line in (source / "ledger.jsonl").read_text(errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "wer" in record and record["sid"] in by_sid:
+            per_sid.setdefault(record["sid"], []).append(record["wer"])
+    if not per_sid:
+        raise SystemExit(f"no scores in {source}/ledger.jsonl")
+    ranked = sorted(per_sid.items(), key=lambda item: -statistics.median(item[1]))
+    if require:
+        ranked = [item for item in ranked if text_features(by_sid[item[0]])[require]]
+    chosen = ranked[:worst]
+    if not chosen:
+        raise SystemExit(f"no sentences in {from_run} have the '{require}' feature")
+
+    out = []
+    for index, (sid, _) in enumerate(chosen):
+        text = by_sid[sid]
+        for offset, (variant, transform) in enumerate(PROBE_VARIANTS.items()):
+            out.append({"sid": f"p{index * len(PROBE_VARIANTS) + offset}",
+                        "text": transform(text),
+                        # Shared across the four variants of one source sentence, so the
+                        # only thing that moves between them is the text.
+                        "seed": index,
+                        "variant": variant,
+                        "origin": sid})
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    (STAGE_DIR / "sentences.json").write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    logger.success(f"{len(chosen)} sentences x {len(PROBE_VARIANTS)} variants = {len(out)} rows "
+                   f"to {STAGE_DIR / 'sentences.json'}")
+    keepers = REPO_ROOT / "cache" / "cloning" / "A6" / "keepers.txt"
+    logger.info(f"pick the voices to probe with, e.g.  head -6 {keepers} > {STAGE_DIR / 'voices.txt'}")
+
+
+@cli.command("probe-report")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/probe.md).")
+def cmd_probe_report(out: str | None) -> None:
+    """Compare the probe variants: which text change actually fixes the failures.
+
+    Reads the same ledger everything else does. The comparison is within a source
+    sentence, across variants, so it is immune to some sentences simply being harder.
+    """
+    sentences = load_sentences()
+    if not any("variant" in entry for entry in sentences):
+        raise SystemExit(f"{STAGE_DIR}/sentences.json is not a probe list; run `probe` first")
+    meta = {entry["sid"]: entry for entry in sentences}
+    state = read_ledger()
+
+    rows = [dict(record, **meta[sid]) for (voice, sid), record in state.items()
+            if sid in meta and "wer" in record]
+    if not rows:
+        raise SystemExit(f"nothing scored yet in {STAGE_DIR}")
+
+    per_variant: dict[str, list] = {}
+    for row in rows:
+        per_variant.setdefault(row["variant"], []).append(row)
+    lines = ["## Probe: does cleaning the text fix the failures", "",
+             "Every row below is the same sentences read by the same voices at the same "
+             "noise seed, with one text change applied. `raw` is FLEURS as shipped, `nbsp` "
+             "replaces non-breaking and thin spaces with ordinary ones, `quotes` removes "
+             "the guillemets, `clean` does both. A variant that drops the mean and the "
+             "runaway rate is the fix; a variant that changes nothing exonerates that "
+             "feature.", "",
+             "| variant | takes | median WER | mean WER | max WER | over 100 pct | median s |",
+             "|---|---|---|---|---|---|---|"]
+    for variant in PROBE_VARIANTS:
+        group = per_variant.get(variant, [])
+        if not group:
+            continue
+        wers = [row["wer"] for row in group]
+        seconds = [row.get("seconds", 0.0) for row in group]
+        lines.append(f"| `{variant}` | {len(group)} | {100 * statistics.median(wers):.1f}% | "
+                     f"{100 * statistics.fmean(wers):.1f}% | {100 * max(wers):.0f}% | "
+                     f"{sum(1 for wer in wers if wer > 1.0)} | "
+                     f"{statistics.median(seconds):.1f} |")
+
+    lines += ["", "### Per source sentence", "",
+              "| origin | voice | " + " | ".join(f"`{name}`" for name in PROBE_VARIANTS) + " |",
+              "|---|---|" + "---|" * len(PROBE_VARIANTS)]
+    cells: dict[tuple[str, str], dict[str, float]] = {}
+    for (voice, sid), record in state.items():
+        if sid in meta and "wer" in record:
+            cells.setdefault((meta[sid]["origin"], voice), {})[meta[sid]["variant"]] = record["wer"]
+    for (origin, voice), values in sorted(cells.items()):
+        lines.append(f"| `{origin}` | `{voice}` | " + " | ".join(
+            f"{100 * values[name]:.0f}%" if name in values else "-" for name in PROBE_VARIANTS) + " |")
+
+    destination = Path(out) if out else STAGE_DIR / "probe.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(rows)} probe takes over {len(per_variant)} variants, wrote {destination}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@
 # Produces, in cache/cloning/FLEURS/:
 #   stats.md          per voice: min, p25, median, mean, p75, max, stdev of WER and CER
 #   per_sentence.csv  one row per (voice, sentence), both rates, duration, F0, transcript
+#   failures.md       what broke: runaway takes, the hardest sentences, error rate by
+#                     text feature, and runaways per voice
 #   similarity.md     the N x N speaker-embedding cosine matrix, plus what it implies
 #   RESULTS.md        the three above assembled, with the written analysis on top
 #
@@ -47,6 +49,9 @@ echo "=== error-rate tables"
 run sweep.py stats --only-file "${VOICES}" --out "${STAGE_DIR}/stats.md" \
     --csv-out "${STAGE_DIR}/per_sentence.csv"
 
+echo "=== failure modes"
+run sweep.py diagnose --only-file "${VOICES}" --out "${STAGE_DIR}/failures.md"
+
 echo "=== speaker embeddings (${MAX_TAKES} takes per voice, ${DEVICE})"
 # The benchmark leaves its containers up, so the card is usually still full when this
 # runs. Falling back rather than failing keeps the report a single command either way.
@@ -70,6 +75,8 @@ echo "=== assembling ${STAGE_DIR}/RESULTS.md"
         echo
     fi
     cat "${STAGE_DIR}/stats.md"
+    echo
+    cat "${STAGE_DIR}/failures.md"
     echo
     cat "${STAGE_DIR}/similarity.md"
 } > "${STAGE_DIR}/RESULTS.md"
