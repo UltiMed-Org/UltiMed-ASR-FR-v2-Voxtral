@@ -4,6 +4,7 @@
 #   ./voxtral/cloning/stop_all.sh          # park, then stop the containers
 #   ./voxtral/cloning/stop_all.sh --park   # only park the sweep, leave containers up
 #   WAIT=120 ./voxtral/cloning/stop_all.sh # wait longer for the pass to finish its chunk
+#   RUN=FLEURS ./voxtral/cloning/stop_all.sh   # park the FLEURS benchmark, not the A6 screen
 #
 # Order matters. The STOP flag goes first so `sweep.py` finishes the requests already in
 # flight and records them, instead of losing them to a container that vanished mid-call.
@@ -17,7 +18,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 COMPOSE="${COMPOSE:-${REPO_ROOT}/docker-compose.yml}"
-STOP_FLAG="${REPO_ROOT}/cache/cloning/A6/STOP"
+# A STOP flag is per run, so a benchmark and a screen can be parked independently. RUN
+# defaults to A6 to match driver.sh; pass RUN=FLEURS to stop a benchmark instead.
+RUN="${RUN:-A6}"
+STOP_FLAG="${REPO_ROOT}/cache/cloning/${RUN}/STOP"
 WAIT="${WAIT:-90}"
 PARK_ONLY=0
 [[ "${1:-}" == --park ]] && PARK_ONLY=1

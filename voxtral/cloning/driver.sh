@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Unattended driver for the A6 voice screen, on one GPU.
+# Unattended driver for a voice sweep, on one GPU.
+#
+# Serves two runs, selected with RUN (see below):
+#
+#   RUN=A6      screen 420 candidates on 12 short sentences, to find the survivors
+#   RUN=FLEURS  benchmark the survivors on the whole French FLEURS test split
+#
+# `fleurs.sh` is the one-command entry point for the second; this script is the engine
+# under both, because the work is identical and only the run directory differs.
 #
 # Alternates two passes until the sweep converges:
 #
@@ -17,6 +25,7 @@
 # does not take the sweep with it:
 #
 #   sudo -E ./voxtral/cloning/driver.sh
+#   sudo -E RUN=FLEURS DEPTH=0 ONLY_FILE=cache/cloning/A6/keepers.txt ./voxtral/cloning/driver.sh
 #
 # To get the GPU back at any moment: ./voxtral/cloning/stop_all.sh (from another
 # shell, no sudo needed for the flag part). It writes a STOP flag that the current
@@ -24,14 +33,21 @@
 # lost: work is recorded in the ledger as each take completes.
 #
 # Environment:
-#   DEPTH            sentences per voice to reach this run (default 2). Raising it and
-#                    re-running deepens the sweep; rows already done are skipped.
+#   RUN              which run directory under cache/cloning/ to work in (default A6).
+#                    Exported to the Python passes as CLONING_RUN.
+#   DEPTH            sentences per voice to reach this run (default 2), 0 = every
+#                    sentence in the run. Raising it and re-running deepens the sweep;
+#                    rows already done are skipped.
 #   TARGET_USER      user to run the Python passes as (default: $SUDO_USER)
 #   INCLUDE_BASES    1 (default) sweeps the 20 shipped voices too, as controls
 #   TTS_CONCURRENCY  parallel speech requests (default 4; throughput saturates at 4-8)
 #   STT_CONCURRENCY  parallel transcriptions (default 6, one per whisper replica)
 #   STT_SCALE        whisper replicas to run (default 6)
 #   EULER_STEPS      ODE steps per frame, 0 = server default (quality/speed lever)
+#   PREPARE          sweep.py subcommand (with args) that mints this run's sentences.json
+#                    when it is missing, e.g. "fleurs". Empty (the default) means the list
+#                    has to exist already, which is A6's case: its 12 screen sentences
+#                    were picked by hand with `sweep.py sentences` and are not re-rolled.
 #   ONLY_FILE        restrict the sweep to the voices named in this file, one per line.
 #                    Screening is wide and shallow; choosing between survivors is narrow
 #                    and deep, e.g. ONLY_FILE=cache/cloning/A6/contenders.txt DEPTH=12
@@ -49,7 +65,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 COMPOSE="${COMPOSE:-${REPO_ROOT}/docker-compose.yml}"
-STAGE_DIR="${REPO_ROOT}/cache/cloning/A6"
+RUN="${RUN:-A6}"
+STAGE_DIR="${REPO_ROOT}/cache/cloning/${RUN}"
 STOP_FLAG="${STAGE_DIR}/STOP"
 
 DEPTH="${DEPTH:-2}"
@@ -154,12 +171,27 @@ run_pass() {
     runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" \
         PATH="${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         CRISPASR_API_KEY="${CRISPASR_API_KEY}" \
+        CLONING_RUN="${RUN}" \
         nice -n 40 "${UV_BIN}" run "${HERE}/sweep.py" "${mode}" "${common[@]}" || rc=$?
     return "${rc}"
 }
 
-echo "=== $(date '+%F %T') A6 driver starting: depth ${DEPTH}, log ${LOG}"
-echo "=== stop it any time with ${HERE}/stop_all.sh"
+echo "=== $(date '+%F %T') ${RUN} driver starting: depth ${DEPTH:-all}, log ${LOG}"
+echo "=== stop it any time with  RUN=${RUN} ${HERE}/stop_all.sh"
+
+# A run cannot start without a sentence list, and for a fetched corpus there is no reason
+# to make that a separate manual step. Never overwritten: sentence ids are half of the
+# ledger key, so re-rolling them mid-run would orphan every take already recorded.
+if [[ ! -f "${STAGE_DIR}/sentences.json" ]]; then
+    [[ -n "${PREPARE:-}" ]] || {
+        echo "driver: no ${STAGE_DIR}/sentences.json and no PREPARE command to mint one" >&2
+        exit 1
+    }
+    echo "--- $(date '+%F %T') preparing the sentence list: sweep.py ${PREPARE}"
+    # shellcheck disable=SC2086 # PREPARE carries its own arguments on purpose
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" \
+        "${UV_BIN}" run "${HERE}/sweep.py" ${PREPARE}
+fi
 
 while :; do
     switch tts
@@ -191,5 +223,8 @@ done
 
 # The report is offline, so it costs nothing to leave one behind for whoever reads the
 # log in the morning.
-runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" "${UV_BIN}" run "${HERE}/sweep.py" report || true
+for summary in report stats; do
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" \
+        "${UV_BIN}" run "${HERE}/sweep.py" "${summary}" || true
+done
 echo "=== $(date '+%F %T') driver done. Containers are still up; ${HERE}/stop_all.sh frees the GPU."

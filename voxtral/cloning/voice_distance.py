@@ -471,7 +471,20 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
 
     destination = Path(out) if out else STAGE_DIR / "keepers.md"
     destination.write_text("\n".join(lines) + "\n")
-    logger.success(f"{len(keepers)} of {len(bases)} identities usable, wrote {destination}")
+
+    # The same set as a plain list, because every consumer downstream wants names one per
+    # line rather than a markdown table: `sweep.py --only-file`, `driver.sh ONLY_FILE`,
+    # and `fleurs.sh`, which benchmarks exactly these voices against FLEURS.
+    keepers_path = STAGE_DIR / "keepers.txt"
+    keepers_path.write_text("\n".join(keepers) + "\n")
+
+    # Keepers plus every shipped voice, deduplicated because some keepers *are* shipped
+    # voices. A benchmark wants this one: a keeper's number only means something next to
+    # the number its own donor scores on the same sentence.
+    both = list(dict.fromkeys(keepers + sorted(bases)))
+    (STAGE_DIR / "keepers_and_bases.txt").write_text("\n".join(both) + "\n")
+    logger.success(f"{len(keepers)} of {len(bases)} identities usable, wrote {destination}, "
+                   f"{keepers_path} and keepers_and_bases.txt ({len(both)} voices)")
 
     if contenders:
         # Picking the best of ~19 variants on two sentences each is selection on noise:
