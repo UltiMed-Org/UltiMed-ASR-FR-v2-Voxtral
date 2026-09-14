@@ -132,6 +132,58 @@ def load_embeddings() -> tuple[list[str], np.ndarray]:
     return list(data["voices"]), data["vectors"]
 
 
+def per_sentence_wer() -> dict[str, dict[str, float]]:
+    """Every voice's word error rate, kept per sentence rather than collapsed.
+
+    Returns
+    -------
+    dict
+        `{voice: {sid: wer}}`.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for (voice, sid), record in read_ledger().items():
+        if "wer" in record:
+            out.setdefault(voice, {})[sid] = record["wer"]
+    return out
+
+
+def adjusted_scores(scores: dict[str, dict[str, float]], *, voices: list[str]) -> dict[str, float]:
+    """Score voices against each sentence's own difficulty, not against zero.
+
+    The 12 screen sentences are not equally hard: the median voice scores 0 pct on
+    "Le castillan est la seule langue officielle" and 33 pct on the one containing
+    "Idiothele" and "mygalomorphes", and even fr_female, the reference voice this whole
+    project is built around, loses a third of that sentence. Comparing raw word error
+    rates therefore mostly compares which sentences a voice happened to be given.
+
+    Subtracting the per-sentence median turns the number into "how much worse than the
+    typical voice on this exact sentence", so 0 means typical and negative means better.
+    The mean is used rather than the median because a voice that destroys one sentence in
+    twelve is not usable for dataset generation, and a median hides exactly that.
+
+    Parameters
+    ----------
+    scores : dict
+        `{voice: {sid: wer}}`.
+    voices : list of str
+        The comparison set whose medians define "typical" (the deeply measured ones).
+
+    Returns
+    -------
+    dict
+        `{voice: mean excess WER}` for every voice in `scores`.
+    """
+    import statistics
+
+    baseline: dict[str, float] = {}
+    for sid in {sid for voice in voices for sid in scores.get(voice, {})}:
+        values = [scores[voice][sid] for voice in voices if sid in scores.get(voice, {})]
+        if values:
+            baseline[sid] = statistics.median(values)
+    return {voice: statistics.mean([wer - baseline.get(sid, 0.0) for sid, wer in sentences.items()])
+            for voice, sentences in scores.items() if sentences}
+
+
 def passing_voices() -> dict[str, float]:
     """Voices whose median WER clears the gate, with that median.
 
@@ -366,19 +418,38 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
     bases = [name for name in names if name not in pool]
     similarity = vectors @ vectors.T
 
+    scores = per_sentence_wer()
+    # "Typical" is defined by the deepest tier available, which after a contenders
+    # re-sweep is the 60 finalists and before one is everybody.
+    deepest = max(len(sentences) for sentences in scores.values())
+    reference = [voice for voice, sentences in scores.items() if len(sentences) == deepest]
+    adjusted = adjusted_scores(scores, voices=reference)
+
     groups: dict[str, list[tuple[float, str]]] = {base: [] for base in bases}
     for name in names:
         if name not in gate or gate[name] > max_wer:
             continue
         identity = max(bases, key=lambda base: similarity[index_of[name], index_of[base]])
-        groups[identity].append((gate[name], name))
+        groups[identity].append((adjusted[name], name))
+
+    # Only the deepest-measured members of a group compete. Without this a candidate
+    # measured on 2 sentences beats one measured on 12 by never having been asked the
+    # hard ones, which is how the depth-2 pass produced picks that did not survive
+    # contact with more data.
+    for identity, members in groups.items():
+        deep = [(score, name) for score, name in members if len(scores[name]) == deepest]
+        if deep:
+            groups[identity] = deep
 
     lines = ["# A6 keepers: one voice per speaker identity", "",
              "Each shipped voice is a speaker. A6 did not add speakers (a hybrid sits at 0.86 "
              "cosine similarity to its acoustic donor), it added a way to make a speaker read "
              "French. This table takes the clearest representative of each identity.", "",
-             f"Representative must score at most {100 * max_wer:.0f} pct median WER.", "",
-             "| identity | keep | kind | own WER | kept WER |", "|---|---|---|---|---|"]
+             f"Representative must score at most {100 * max_wer:.0f} pct median WER, and is chosen",
+             "by mean excess WER against each sentence's own difficulty (0 = as good as the",
+             f"typical voice on that sentence, negative = better). Deepest tier: {deepest} takes.", "",
+             "| identity | keep | kind | own WER | kept WER | excess | takes |",
+             "|---|---|---|---|---|---|---|"]
     keepers = []
     for base in sorted(groups):
         if not groups[base]:
@@ -386,11 +457,12 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
                          f"{100 * gate[base]:.0f}% | |" if base in gate else
                          f"| {base} | (none clears {100 * max_wer:.0f} pct) | | fails gate | |")
             continue
-        best_wer, best = min(groups[base])
+        best_excess, best = min(groups[base])
         keepers.append(best)
         kind = pool.get(best, {"kind": "base"})["kind"]
         own = f"{100 * gate[base]:.0f}%" if base in gate else "fails gate"
-        lines.append(f"| {base} | {best} | {kind} | {own} | {100 * best_wer:.0f}% |")
+        lines.append(f"| {base} | {best} | {kind} | {own} | {100 * gate[best]:.0f}% | "
+                     f"{100 * best_excess:+.1f} | {len(scores[best])} |")
 
     lines += ["", f"**{len(keepers)} of {len(bases)} identities have a usable French voice.**", "",
               "Use them straight from tts.py:", "", "```",
