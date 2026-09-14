@@ -1300,7 +1300,13 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
                               sorted(ragged.items())[:4]) + ".", ""]
     lines += ["## Word error rate", ""] + table("wer")
     lines += ["", "## Character error rate", ""] + table("cer")
-    lines += ["", f"Per-sentence detail, one row per (voice, sentence): `{csv_path}`.", ""]
+    # Relative to the repo, never absolute: this markdown gets pasted into issues and
+    # shared, and an absolute path there leaks the author's home directory.
+    try:
+        shown = csv_path.relative_to(REPO_ROOT)
+    except ValueError:
+        shown = csv_path
+    lines += ["", f"Per-sentence detail, one row per (voice, sentence): `{shown}`.", ""]
 
     destination = Path(out) if out else STAGE_DIR / "stats.md"
     destination.write_text("\n".join(lines) + "\n")
