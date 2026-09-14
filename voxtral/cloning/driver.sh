@@ -176,7 +176,9 @@ run_pass() {
     return "${rc}"
 }
 
-echo "=== $(date '+%F %T') ${RUN} driver starting: depth ${DEPTH:-all}, log ${LOG}"
+DEPTH_LABEL="${DEPTH}"
+[[ "${DEPTH}" -le 0 ]] && DEPTH_LABEL="all"
+echo "=== $(date '+%F %T') ${RUN} driver starting: depth ${DEPTH_LABEL}, log ${LOG}"
 echo "=== stop it any time with  RUN=${RUN} ${HERE}/stop_all.sh"
 
 # A run cannot start without a sentence list, and for a fetched corpus there is no reason
