@@ -49,7 +49,7 @@ from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sweep import STAGE_DIR, WER_REJECT, load_pool, read_ledger, voice_profiles  # noqa: E402
+from sweep import RUN, STAGE_DIR, WER_REJECT, load_pool, read_ledger, voice_profiles  # noqa: E402
 from wav_stats import read_wav  # noqa: E402
 
 # VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
@@ -310,7 +310,7 @@ def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
         if semantic in index_of:
             semantic_pairs.append(similarity[index_of[name], index_of[semantic]])
 
-    lines = ["# A6 distinctness", "",
+    lines = [f"# {RUN}: how many different speakers", "",
              f"{len(eligible)} voices clear the WER gate (median <= {100 * WER_REJECT:.0f} pct) "
              f"and were embedded with ECAPA-TDNN.",
              f"**{len(distinct)} of them are different speakers** at cosine similarity "
@@ -667,7 +667,7 @@ def cmd_matrix(out: str | None, threshold: float, only_file: str | None) -> None
     # Numbered columns: 39 voice names across a header is unreadable in any renderer, and
     # the legend below the table costs one lookup while the matrix stays a picture.
     labels = {index: position for position, index in enumerate(order, start=1)}
-    lines = [f"## Speaker similarity, {len(names)} x {len(names)}", "",
+    lines = [f"# Speaker similarity, {len(names)} x {len(names)}", "",
              "Cosine similarity between ECAPA-TDNN (VoxCeleb) speaker embeddings, each "
              "voice averaged over its own takes. Every voice read the same sentences with "
              "the same noise seed, so two takes differ only by the prefix that generated "

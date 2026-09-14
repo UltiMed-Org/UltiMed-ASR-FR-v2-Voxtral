@@ -1396,7 +1396,7 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
     # 4096 tokens at 12.5 Hz. A take at the cap did not finish, it was cut off.
     ceiling = [take for take in takes if take["seconds"] >= 327.0]
 
-    lines = ["## Failure modes", "",
+    lines = [f"# {RUN}: failure modes", "",
              f"{len(takes)} scored takes over {len({t['sid'] for t in takes})} sentences and "
              f"{len({t['voice'] for t in takes})} voices.", "",
              f"- **{len(runaways)} runaway takes** ({100 * len(runaways) / len(takes):.1f} pct), "
