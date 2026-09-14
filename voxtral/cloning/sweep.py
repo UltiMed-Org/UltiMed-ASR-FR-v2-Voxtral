@@ -51,6 +51,7 @@ import json
 import os
 import random
 import re
+import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -489,6 +490,9 @@ def cmd_report(out: str | None, include_bases: bool) -> None:
         if not scored:
             continue
         wers = sorted(record["wer"] for record in scored)
+        # statistics.median and not wers[len(wers) // 2]: at an even number of takes the
+        # latter is the UPPER middle, so at the default depth of 2 it silently reports the
+        # worse of the two takes as the voice's typical score.
         entry = pool.get(voice, {"kind": "base", "parents": []})
         rows.append({
             "voice": voice,
@@ -498,7 +502,7 @@ def cmd_report(out: str | None, include_bases: bool) -> None:
             # The median is the headline and the worst take is shown next to it: a voice
             # that reads one sentence cleanly and garbles another is not usable, and a
             # mean would hide that.
-            "median_wer": wers[len(wers) // 2],
+            "median_wer": statistics.median(wers),
             "worst_wer": wers[-1],
             "f0": sum(record.get("f0", 0.0) for record in scored) / len(scored),
             "seconds": sum(record.get("seconds", 0.0) for record in scored) / len(scored),
