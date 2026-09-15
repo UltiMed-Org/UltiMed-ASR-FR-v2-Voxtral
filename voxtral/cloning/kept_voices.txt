@@ -1,0 +1,48 @@
+# The voices kept out of the FLEURS benchmark (stage A7), one per line.
+#
+# 39 voices were benchmarked and the ECAPA matrix collapsed them into 20 speakers at
+# cosine >= 0.7, so the 20 `shipped` rows below are the whole acoustic budget: every
+# other name in the pool is one of these 20 under a different prefix. The `hybrid`
+# rows buy no NEW speaker, they are the same speaker read with another voice's
+# articulation, kept because they read measurably better than the shipped name they
+# share a cluster with while staying under a 2 pct runaway rate.
+#
+# Excluded on purpose, and why, so nobody re-adds them from the WER tables alone:
+#   h_frf_cam, h_frm_nem, h_frf_nef, h_frm_esf, h_frf_caf  degenerate too often
+#     (6.6 to 14.5 pct junk takes, and h_frf_cam needed a retry on 32 of 332)
+#   h_def_frm, h_def_hif, h_def_him, h_frf_arm, x_frf_caf_nlm  no gain over the
+#     shipped voice in their own cluster, so they only add QC cost
+#
+# cluster is the connected component at cosine >= 0.7; rows sharing a cluster are the
+# SAME speaker, which is exactly why they are listed together rather than sorted by WER.
+#
+# cluster<TAB>role<TAB>voice
+1	shipped	fr_female
+2	shipped	es_male
+2	hybrid	h_frm_esm
+3	shipped	pt_male
+3	hybrid	h_frm_ptm
+4	shipped	casual_male
+5	shipped	nl_male
+5	hybrid	h_frf_nlm
+6	shipped	hi_female
+7	shipped	de_male
+7	hybrid	h_frf_dem
+8	shipped	nl_female
+8	hybrid	h_frm_nlf
+9	shipped	pt_female
+9	hybrid	h_frm_ptf
+10	shipped	cheerful_female
+10	hybrid	h_frf_chf
+11	shipped	ar_male
+12	shipped	it_male
+12	hybrid	h_frm_itm
+13	shipped	it_female
+13	hybrid	h_frm_itf
+14	shipped	fr_male
+15	shipped	hi_male
+16	shipped	casual_female
+17	shipped	neutral_male
+18	shipped	neutral_female
+19	shipped	es_female
+20	shipped	de_female
