@@ -219,8 +219,16 @@ def cli() -> None:
               help="Takes to average per voice (more is steadier, and slower).")
 @click.option("--only-passing/--all", default=False, show_default=True,
               help="Embed only the voices that clear the WER gate.")
-def cmd_embed(device: str, max_takes: int, only_passing: bool) -> None:
-    """Embed every voice that has takes on disk, averaging over its takes."""
+@click.option("--refresh/--reuse", default=False, show_default=True,
+              help="Re-embed voices that are already in the cache.")
+def cmd_embed(device: str, max_takes: int, only_passing: bool, refresh: bool) -> None:
+    """Embed every voice that has takes on disk, averaging over its takes.
+
+    Reuses what is already cached by default, because this is the one step of the report
+    that needs a GPU and several minutes: re-running the report after the containers have
+    been taken down should not have to redo it. `--refresh` forces the work, which is what
+    a changed `--max-takes` or a re-synthesized voice needs.
+    """
     state = read_ledger()
     wanted = set(passing_voices()) if only_passing else None
 
@@ -234,11 +242,23 @@ def cmd_embed(device: str, max_takes: int, only_passing: bool) -> None:
     if not by_voice:
         raise SystemExit("no takes on disk; run the sweep first")
 
+    known: dict[str, np.ndarray] = {}
+    if not refresh and EMBEDDINGS.is_file():
+        cached_names, cached_vectors = load_embeddings()
+        known = {name: cached_vectors[index] for index, name in enumerate(cached_names)}
+        for voice in list(by_voice):
+            if voice in known:
+                del by_voice[voice]
+        if not by_voice:
+            logger.success(f"all {len(known)} voices already embedded in {EMBEDDINGS}")
+            return
+        logger.info(f"{len(known)} voices already embedded, {len(by_voice)} to do")
+
     logger.info(f"embedding {len(by_voice)} voices on {device} "
                 f"({min(max_takes, max(len(v) for v in by_voice.values()))} takes each)")
     classifier = load_classifier(device)
 
-    names, vectors = [], []
+    names, vectors = list(known), [known[name] for name in known]
     for index, (voice, paths) in enumerate(sorted(by_voice.items()), start=1):
         # Averaging over takes then renormalising is the standard way to turn several
         # utterances into one speaker vector: it cancels the per-sentence variation that
@@ -386,22 +406,38 @@ def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
         roster.append((min(family or [name], key=robustness), family))
 
     logger.info(f"{len(roster)} speaker clusters at >= {threshold} cosine similarity")
-    lines += ["", "## The roster: one name per speaker, the best-behaved one", "",
+    lines += ["", "## The roster: one row per speaker", "",
               f"The {len(names)} voices form **{len(roster)} clusters** at cosine >= "
               f"{threshold} (connected components, so a chain of near-duplicates counts "
-              "once). Only one name per cluster buys any acoustic diversity, and this "
-              "picks the member that degenerates least rather than the one the walk "
-              "happened to reach first. `words/s` is kept because it separates voices the "
-              "embedding cannot: same speaker, different delivery.", "",
-              "| # | voice | same speaker as | median WER | mean WER | runaway | words/s |",
-              "|---|---|---|---|---|---|---|"]
+              "once). A cluster is one speaker under several names, so only one row here "
+              "buys any acoustic diversity, but which NAME to generate with depends on "
+              "what is wanted:", "",
+              "- **safe** is the member that degenerates least, then reads best. Use it "
+              "when a bad take is expensive.",
+              "- **accurate** is the member with the lowest median WER. It is often a "
+              "hybrid, which reads the same speaker's timbre with another voice's "
+              "articulation, and it usually pays for that with a higher runaway rate.",
+              "- `words/s` is the safe pick's delivery, kept because it separates voices "
+              "the embedding cannot: same speaker, different pace.", "",
+              "Every figure is the **first attempt**, the unaided voice, matching the "
+              "tables above. With the retry loop on, about three quarters of the runaway "
+              "takes come good on a second or third seed, so the runaway column is the "
+              "rate at which a generator would have to redo work, not the rate at which "
+              "it would ship a broken file.", "",
+              "| # | safe | median | mean | runaway | words/s | accurate | median | runaway |",
+              "|---|---|---|---|---|---|---|---|---|"]
     for position, (best, family) in enumerate(roster, start=1):
         row = profiles.get(best, {})
-        others = [name for name in sorted(family, key=robustness) if name != best]
+        reader = min(family, key=lambda name: (profiles[name]["median"], profiles[name]["runaway"]))
+        read_row = profiles.get(reader, {})
+        same = reader == best
         lines.append(
-            f"| {position} | `{best}` | {', '.join(f'`{name}`' for name in others) or '-'} | "
-            f"{100 * row.get('median', float('nan')):.1f}% | {100 * row.get('mean', float('nan')):.1f}% | "
-            f"{100 * row.get('runaway', float('nan')):.1f}% | {row.get('rate', float('nan')):.2f} |")
+            f"| {position} | `{best}` | {100 * row.get('median', float('nan')):.1f}% | "
+            f"{100 * row.get('mean', float('nan')):.1f}% | "
+            f"{100 * row.get('runaway', float('nan')):.1f}% | {row.get('rate', float('nan')):.2f} | "
+            + ("(same)" if same else f"`{reader}`") + " | "
+            + ("-" if same else f"{100 * read_row.get('median', float('nan')):.1f}%") + " | "
+            + ("-" if same else f"{100 * read_row.get('runaway', float('nan')):.1f}%") + " |")
 
     destination = Path(out) if out else STAGE_DIR / "distinct.md"
     destination.write_text("\n".join(lines) + "\n")

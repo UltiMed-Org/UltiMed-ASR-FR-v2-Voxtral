@@ -498,8 +498,43 @@ def stretch_of(*, seconds: float, words: int, rate: float) -> float:
 RUNAWAY_FACTOR = 3.0
 
 
+ATTEMPT_CHOICES = ("first", "last", "best")
+
+
+def pick_attempt(attempts: list[dict], *, which: str) -> dict | None:
+    """Choose which attempt of one take a report is about.
+
+    Every table in this project has to name its convention, because once takes can be
+    retried the same ledger supports three different honest answers and mixing them in one
+    document is how a benchmark starts lying. `first` is the unaided voice, `best` is what
+    a dataset generator that regenerates its own bad takes would end up containing, `last`
+    is what is on disk to listen to.
+
+    Parameters
+    ----------
+    attempts : list of dict
+        Every attempt of one take, oldest first, as `read_attempts` returns them.
+    which : str
+        One of `ATTEMPT_CHOICES`.
+
+    Returns
+    -------
+    dict or None
+        The chosen attempt, or None when none of them was ever scored.
+    """
+    scored = [record for record in attempts if "wer" in record]
+    if not scored:
+        return None
+    if which == "first":
+        return scored[0]
+    if which == "last":
+        return scored[-1]
+    return min(scored, key=lambda record: record["wer"])
+
+
 def voice_profiles(*, only: set[str] | None = None,
-                   runaway_factor: float = RUNAWAY_FACTOR) -> dict[str, dict]:
+                   runaway_factor: float = RUNAWAY_FACTOR,
+                   which: str = "first") -> dict[str, dict]:
     """One robustness row per voice, straight from the ledger.
 
     Collapses every scored take into the four numbers that decide whether a voice can be
@@ -520,6 +555,10 @@ def voice_profiles(*, only: set[str] | None = None,
     runaway_factor : float
         Duration multiple of the voice's own median speaking rate that counts as
         degenerate. Waveform-based, so it does not depend on the ASR being right.
+    which : str
+        Which attempt of a retried take to summarise, from `ATTEMPT_CHOICES`. Defaults to
+        `first`, the unaided voice, so a roster built on this cannot quietly become a
+        best-of-N ranking once the retry loop has run.
 
     Returns
     -------
@@ -527,10 +566,13 @@ def voice_profiles(*, only: set[str] | None = None,
         `{voice: {"takes", "median", "mean", "runaway", "rate"}}`, rates as fractions.
     """
     by_sid = {entry["sid"]: entry["text"] for entry in load_sentences()}
-    takes = [dict(record, voice=voice, sid=sid)
-             for (voice, sid), record in read_ledger().items()
-             if (only is None or voice in only) and sid in by_sid
-             and "wer" in record and record.get("seconds")]
+    takes = []
+    for (voice, sid), attempts in read_attempts().items():
+        if (only is not None and voice not in only) or sid not in by_sid:
+            continue
+        record = pick_attempt(attempts, which=which)
+        if record is not None and record.get("seconds"):
+            takes.append(dict(record, voice=voice, sid=sid))
     if not takes:
         return {}
 
@@ -1143,7 +1185,7 @@ def summarise(values: list[float]) -> dict[str, float]:
               help="Include the shipped voices as controls.")
 @click.option("--only-file", default=None, help="Restrict to the voices named in a file.")
 @click.option("--attempt", "which", default="first",
-              type=click.Choice(["first", "last", "best"]), show_default=True,
+              type=click.Choice(ATTEMPT_CHOICES), show_default=True,
               help="Which attempt of a retried take to report. Read the docstring.")
 def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
               only_file: str | None, which: str) -> None:
@@ -1181,23 +1223,12 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     by_sid = {entry["sid"]: entry["text"] for entry in sentences}
     history = read_attempts()
 
-    def chosen_attempt(attempts: list[dict]) -> dict | None:
-        """Pick the attempt this report is about, from a take's whole history."""
-        scored_attempts = [record for record in attempts if "wer" in record]
-        if not scored_attempts:
-            return None
-        if which == "first":
-            return scored_attempts[0]
-        if which == "last":
-            return scored_attempts[-1]
-        return min(scored_attempts, key=lambda record: record["wer"])
-
     scored: dict[str, dict[str, dict]] = {}
     retried = 0
     for (voice, sid), attempts in history.items():
         if voice not in wanted or sid not in by_sid:
             continue
-        record = chosen_attempt(attempts)
+        record = pick_attempt(attempts, which=which)
         if record is None:
             continue
         retried += sum(1 for entry in attempts if "wer" in entry) > 1
@@ -1360,8 +1391,10 @@ def text_features(text: str) -> dict:
 @click.option("--runaway-factor", default=RUNAWAY_FACTOR, show_default=True,
               help="Duration multiple of a voice's own speaking rate that counts as a runaway.")
 @click.option("--worst", default=25, show_default=True, help="How many hard sentences to list.")
+@click.option("--attempt", "which", type=click.Choice(ATTEMPT_CHOICES), default="first",
+              show_default=True, help="Which attempt of a retried take to report.")
 def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
-                 runaway_factor: float, worst: int) -> None:
+                 runaway_factor: float, worst: int, which: str) -> None:
     """Separate broken voices from broken sentences, and name the failure modes.
 
     A per-voice mean is useless on its own when the failures are catastrophic and rare: a
@@ -1384,9 +1417,14 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
     features = {sid: text_features(text) for sid, text in by_sid.items()}
     state = read_ledger()
 
-    takes = [dict(record, voice=voice, sid=sid)
-             for (voice, sid), record in state.items()
-             if voice in wanted and sid in by_sid and "wer" in record and record.get("seconds")]
+    takes, retried = [], 0
+    for (voice, sid), attempts in read_attempts().items():
+        if voice not in wanted or sid not in by_sid:
+            continue
+        retried += sum(1 for entry in attempts if "wer" in entry) > 1
+        record = pick_attempt(attempts, which=which)
+        if record is not None and record.get("seconds"):
+            takes.append(dict(record, voice=voice, sid=sid))
     if not takes:
         raise SystemExit(f"nothing scored yet in {STAGE_DIR}")
 
@@ -1407,8 +1445,11 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
     ceiling = [take for take in takes if take["seconds"] >= 327.0]
 
     lines = [f"# {RUN}: failure modes", "",
-             f"{len(takes)} scored takes over {len({t['sid'] for t in takes})} sentences and "
-             f"{len({t['voice'] for t in takes})} voices.", "",
+             f"{len(takes)} scored takes over {len({t['sid'] for t in takes})} sentences "
+             f"and {len({t['voice'] for t in takes})} voices, each quoted at its "
+             f"**{which}** attempt"
+             + (f" ({retried} take(s) were retried, so this is the unaided number unless "
+                "you asked for another)." if retried else "; no take needed a retry."), "",
              f"- **{len(runaways)} runaway takes** ({100 * len(runaways) / len(takes):.1f} pct), "
              f"meaning the audio ran at least {runaway_factor:g}x longer than that voice's own "
              "median speaking rate predicts. This is measured from the waveform, not from the "
