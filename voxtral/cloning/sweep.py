@@ -1882,8 +1882,9 @@ def cmd_probe_report(out: str | None) -> None:
              "replaces non-breaking and thin spaces with ordinary ones, `quotes` removes "
              "the guillemets, `clean` does both. A variant that drops the mean and the "
              "runaway rate is the fix; a variant that changes nothing exonerates that "
-             "feature.", "",
-             "| variant | takes | median WER | mean WER | max WER | over 100 pct | median s |",
+             "feature. `unusable` counts takes at or past 100 pct WER, which have lost at "
+             "least as many words as the sentence contains.", "",
+             "| variant | takes | median WER | mean WER | max WER | unusable | median s |",
              "|---|---|---|---|---|---|---|"]
     for variant in PROBE_VARIANTS:
         group = per_variant.get(variant, [])
@@ -1893,8 +1894,38 @@ def cmd_probe_report(out: str | None) -> None:
         seconds = [row.get("seconds", 0.0) for row in group]
         lines.append(f"| `{variant}` | {len(group)} | {100 * statistics.median(wers):.1f}% | "
                      f"{100 * statistics.fmean(wers):.1f}% | {100 * max(wers):.0f}% | "
-                     f"{sum(1 for wer in wers if wer > 1.0)} | "
+                     f"{sum(1 for wer in wers if wer >= 1.0)} | "
                      f"{statistics.median(seconds):.1f} |")
+
+    # The verdict, computed rather than eyeballed: a 2x2 is only worth running if the
+    # reading of it is mechanical. Each single-feature variant is scored against `raw` on
+    # the two numbers that matter for dataset generation (what a typical take costs, and
+    # how often a take is unusable), and `clean` says whether the two features interact.
+    def summary(variant: str) -> tuple[float, float, int]:
+        """Median WER, mean WER and count of unusable takes for one variant."""
+        group = per_variant.get(variant, [])
+        wers = [row["wer"] for row in group]
+        return (statistics.median(wers), statistics.fmean(wers),
+                sum(1 for wer in wers if wer >= 1.0))
+
+    if {"raw", "nbsp", "quotes"} <= set(per_variant):
+        base = summary("raw")
+        lines += ["", "### Verdict", "",
+                  "Each single-feature variant against `raw`, on the same sentences, voices "
+                  "and seed. A feature is implicated only if removing it alone moves both "
+                  "numbers.", "",
+                  "| removed | median WER | unusable takes (WER >= 100 pct) | implicated |",
+                  "|---|---|---|---|"]
+        for variant, label in (("nbsp", "nbsp / thin space"), ("quotes", "guillemets «»"),
+                               ("clean", "both")):
+            if variant not in per_variant:
+                continue
+            here = summary(variant)
+            guilty = here[0] < base[0] and here[2] < base[2]
+            lines.append(
+                f"| {label} | {100 * base[0]:.1f}% -> {100 * here[0]:.1f}% | "
+                f"{base[2]} -> {here[2]} of {len(per_variant[variant])} | "
+                f"{'**yes**' if guilty else 'no'} |")
 
     lines += ["", "### Per source sentence", "",
               "| origin | voice | " + " | ".join(f"`{name}`" for name in PROBE_VARIANTS) + " |",
