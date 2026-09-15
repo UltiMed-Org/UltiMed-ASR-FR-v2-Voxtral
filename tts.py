@@ -99,6 +99,42 @@ from pathlib import Path
 
 DEFAULT_URL = "http://127.0.0.1:8003"
 
+# Unicode spaces that French typography scatters through ordinary prose: the
+# no-break space before ; : ! ? and inside guillemets, plus its thin and
+# narrow variants. Voxtral TTS degenerates on them, measured rather than
+# guessed: the PROBE run (voxtral/cloning, 8 sentences x 6 voices x 4 text
+# variants at a pinned seed) took the affected sentences from 47.7 pct median
+# WER and 16 of 48 unusable takes down to 10.5 pct and 3 of 48 by replacing
+# these with an ordinary space and changing nothing else. Removing the
+# guillemets instead changed nothing at all (57.6 pct, 15 of 48), so the
+# space is the trigger and the quotes were only ever guilty by association.
+# Full write-up: cache/cloning/FLEURS/RESULTS.md.
+UNICODE_SPACES = "\u00a0\u2009\u202f\u2007\u2008\u205f\u3000"
+
+
+def normalise_spaces(text: str) -> str:
+    """Replace the exotic Unicode spaces with ordinary ones.
+
+    Applied to every request by default because the failure it prevents is
+    silent and expensive: the model starts the sentence correctly and then
+    loops syllables until it runs out of tokens, which costs minutes of GPU
+    time and produces an unusable file with a 200 response. Nothing else about
+    the text is touched, so this cannot change wording, punctuation or
+    pronunciation; the audible difference is that the take terminates.
+
+    Parameters
+    ----------
+    text : str
+        Text as the caller wrote it.
+
+    Returns
+    -------
+    str
+        The same text with every character in `UNICODE_SPACES` replaced by
+        `" "`. Unchanged when it contains none, which is the common case.
+    """
+    return text.translate({ord(char): " " for char in UNICODE_SPACES})
+
 # Built-in voice embeddings shipped with mistralai/Voxtral-4B-TTS-2603 (from
 # voice_embedding/*.pt in the HF repo). Only relevant when the voxtral-tts
 # service is the one on :8003; TADA voices are tada-ref-*.gguf paths instead.
@@ -251,6 +287,7 @@ def build_speech_body(
     max_new_tokens: int | None = None,
     consent_attestation: str | None = None,
     spoken_disclaimer: bool | None = None,
+    raw_spaces: bool = False,
 ) -> dict:
     """Assemble the JSON body for `POST /v1/audio/speech`.
 
@@ -382,6 +419,12 @@ def build_speech_body(
         Set False to skip the audible AI-disclosure prefix on voice-cloned
         output. Machine-readable provenance (watermark + C2PA) is always
         applied regardless; the caller then owns disclosing AI use.
+    raw_spaces : bool
+        Send `text` byte for byte, skipping `normalise_spaces`. Off by
+        default, so ordinary callers get the fix without asking. Turn it on
+        when the exact bytes are the point: a measurement that has to send
+        the corpus verbatim (`voxtral/cloning/sweep.py` does), or a
+        reproduction of the degeneration itself.
 
     Returns
     -------
@@ -389,7 +432,7 @@ def build_speech_body(
         The request body, ready for `json.dumps`.
     """
     body: dict = {
-        "input": text,
+        "input": text if raw_spaces else normalise_spaces(text),
         "response_format": response_format,
         "speed": speed,
     }
@@ -506,6 +549,7 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
         dump_codes=args.dump_codes,
         noise_temp=args.noise_temp,
         max_new_tokens=args.max_new_tokens,
+        raw_spaces=args.raw_spaces,
         consent_attestation=args.consent_attestation,
         spoken_disclaimer=args.spoken_disclaimer,
     )
@@ -797,6 +841,13 @@ def main() -> int:
                    help="Speech speed, 0.25 to 4.0 (default: 1.0).")
     p.add_argument("--timeout", type=float, default=300.0,
                    help="HTTP timeout in seconds (default: 300).")
+    p.add_argument("--raw-spaces", action="store_true",
+                   help="Send the text byte for byte instead of replacing "
+                        "non-breaking and thin spaces with ordinary ones. The "
+                        "replacement is on by default because Voxtral TTS "
+                        "degenerates on those characters (measured: 47.7 -> "
+                        "10.5 pct median WER on the sentences that carry them); "
+                        "use this when the exact bytes are the point.")
     p.add_argument("--seed", type=int, default=None,
                    help="Integer seed for reproducible synthesis (default: not sent). "
                         "With sampling on, different seeds change the wording. NOTE: this "

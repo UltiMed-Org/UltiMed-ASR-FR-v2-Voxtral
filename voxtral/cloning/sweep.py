@@ -793,8 +793,13 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         # attempt N is reproducible rather than merely different, and every voice retrying
         # the same sentence still lands on the same seed as the others.
         seed = noise_seed + sentence_seed(sentence) + attempt * ATTEMPT_SEED_STRIDE
+        # raw_spaces: the sweep is the instrument, so it sends the corpus byte for byte.
+        # tts.py normalises the exotic Unicode spaces for ordinary callers (the PROBE run
+        # is what established that it should), and letting it do so here would silently
+        # rewrite the very text a benchmark is measuring, starting with the probe's own
+        # `raw` variant.
         body = tts.build_speech_body(text=sentence["text"], response_format="wav", speed=1.0,
-                                     voice=voice, noise_seed=seed,
+                                     voice=voice, noise_seed=seed, raw_spaces=True,
                                      euler_steps=euler_steps or None)
         try:
             status, payload, _, elapsed = tts._post_json(endpoint, body, timeout)
@@ -1331,15 +1336,20 @@ def text_features(text: str) -> dict:
     -------
     dict
         `words`, `quoted` (French guillemets), `multi` (more than one sentence),
-        `digits`, `parens`, `nbsp` (non-breaking or thin spaces, which French typography
-        puts before `?!:;»` and which a tokenizer may or may not treat as a space).
+        `digits`, `parens`, `nbsp` (any of the exotic Unicode spaces French typography
+        puts before `?!:;»`, which the model was measured to degenerate on).
+
+    The `nbsp` test is exactly the set `tts.normalise_spaces` replaces, so a sentence
+    flagged here is a sentence the client's default now fixes. Detecting a character the
+    fix does not touch, or missing one it does, would make every table below disagree
+    with what a caller actually gets.
     """
     return {"words": len(text.split()),
             "quoted": "«" in text or "»" in text,
             "multi": bool(re.search(r"[.!?]\s+\S", text)),
             "digits": any(character.isdigit() for character in text),
             "parens": "(" in text,
-            "nbsp": "\u00a0" in text or "\u2009" in text}
+            "nbsp": any(character in text for character in tts.UNICODE_SPACES)}
 
 
 @cli.command("diagnose")
@@ -1579,12 +1589,15 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
 # Non-breaking space, thin space, narrow no-break space. French typography puts one of
 # these before ?!:;» and inside « », so they are invisible in every editor and travel
 # with the guillemets, which is exactly why the two have to be separated by experiment.
-FRENCH_SPACES = "\u00a0\u2009\u202f"
-
-
 def _plain_spaces(text: str) -> str:
-    """Turn French typographic spaces into ordinary ones, leaving the guillemets."""
-    return re.sub(f"[{FRENCH_SPACES}]", " ", text)
+    """Turn the exotic Unicode spaces into ordinary ones, leaving the guillemets.
+
+    Delegates to `tts.normalise_spaces` rather than repeating the character list: that
+    function is what ordinary callers now get by default, so the probe must test exactly
+    it. A second copy here would eventually test a set of characters the client does not
+    actually replace.
+    """
+    return tts.normalise_spaces(text)
 
 
 def _no_guillemets(text: str) -> str:

@@ -93,6 +93,17 @@ This deliberately keeps per-request settings from leaking into the shared, long-
 backend context. When adding a knob, keep it opt-in (default `None`) unless it must always
 be sent (`input` / `response_format` / the audio file).
 
+**One exception, and it rewrites the text:** `tts.py` replaces the exotic Unicode spaces
+(`\u00a0`, `\u2009`, `\u202f`, and siblings) with ordinary ones before sending `input`,
+via `normalise_spaces`. This is on by default because Voxtral TTS degenerates on them:
+it starts the sentence correctly then loops syllables until it hits the token ceiling,
+burning minutes of GPU time and returning an unusable file with a 200. Measured in the
+`PROBE` run (`cache/cloning/FLEURS/RESULTS.md`): on the sentences that carry one, median
+WER 47.7 -> 10.5 pct and unusable takes 16 of 48 -> 3 of 48, with the guillemets shown to
+be innocent. Nothing else about the text is touched. Pass `--raw-spaces` (or
+`raw_spaces=True`) when the exact bytes matter; `voxtral/cloning/sweep.py` does, since a
+benchmark must send its corpus verbatim.
+
 ## Auth asymmetry (easy to trip on)
 
 The **ASR** service sets `CRISPASR_API_KEYS`, so `/v1/audio/transcriptions` needs a Bearer
