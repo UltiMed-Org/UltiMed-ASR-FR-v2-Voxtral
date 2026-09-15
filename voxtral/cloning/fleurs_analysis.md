@@ -6,7 +6,9 @@ Written by Claude Code against the tables above. Every number in this section co
 
 Every one of the 39 voices (20 shipped, 18 hybrids, 1 sparse mix) read all 332 unique sentences of the French FLEURS test split, and every take was transcribed by the same whisper-large-v3-turbo deployment. That is 12948 takes and 50.8 hours of generated audio, scored sentence by sentence, with WER and CER computed after the same normalisation on both sides.
 
-The comparison is fair in the way that matters: all voices read the same text with the same noise seed, so a difference between two rows is a difference between two voices, not between two corpora. No take was retried, so these are first-attempt numbers with nothing hidden.
+The comparison is fair in the way that matters: all voices read the same text with the same noise seed, so a difference between two rows is a difference between two voices, not between two corpora.
+
+Retry rounds were run afterwards, up to three attempts per degenerate take with a different noise seed each time. **Every table above still quotes the first attempt**, because reporting the surviving attempt would be best-of-N and would flatter exactly the voices that need watching. What the retries found has its own section below.
 
 ## The headline: 39 voices are 20 speakers
 
@@ -51,6 +53,26 @@ Length matters less than the typography but it is not nothing: 0.4 pct runaway u
 
 The failures also follow the sentence more than the voice. `f1877` produced 9 runaways across different voices, `f1857` 7, `f1843` 5. Those are properties of the text, and no choice of voice fixes them.
 
+## What the retries answered
+
+145 takes were retried. **108 converged** (90 on the second seed, 18 on the third) and **37 ran out of budget still degenerate**. So degeneration is mostly a property of the sampled noise, not of the (voice, sentence) pair, and the right response to it is a retry loop rather than a shorter voice list.
+
+The effect on the fragile voices is large. Quoting the best attempt instead of the first would move `h_frf_cam` from 34.0 pct mean WER to 19.4 pct and its maximum from 773 pct to 248 pct, `h_frf_nef` from 24.4 pct to 16.4 pct with its maximum falling from 1614 pct to 234 pct, and `h_frm_nlf` from 16.5 pct to 8.4 pct. Medians barely move, which is the expected signature: retries touch the 1 pct of takes that broke and nothing else. 16 of the 39 voices change at all.
+
+**The 37 takes that never converged are the interesting ones, and they identify the culprit.** They land on only 15 distinct sentences, and the comparison against the corpus they came from is not subtle:
+
+| feature | stuck sentences | whole corpus |
+|---|---|---|
+| nbsp / thin space | 15/15 (100%) | 61/332 (18%) |
+| guillemets «» | 11/15 (73%) | 26/332 (8%) |
+| parentheses | 5/15 (33%) | 36/332 (11%) |
+| digits | 4/15 (27%) | 70/332 (21%) |
+| several sentences | 4/15 (27%) | 64/332 (19%) |
+
+Every single sentence that survived three different seeds still broken contains a non-breaking or thin space, against 18 pct of the corpus. Guillemets are present in 73 pct of them, but every guillemet pair in French typography contains a thin space, so the guillemets are most likely along for the ride. Digits and multi-sentence rows sit at their base rate and are not implicated at all.
+
+That is as far as observation can go. The `probe` run settles it causally by reading the same sentences with the spaces normalised, the guillemets removed, both, and neither, at a pinned seed. Its sentence list and voice list are now generated (5 sentences with guillemets, 3 without, all carrying the thin space; the five most fragile voices plus `fr_female` as a control), and the run has not been done.
+
 ## The recommendation
 
 **Use the 20 shipped voices as the diversity backbone.** They are the entire acoustic space available, every one of them has a 0.0 pct runaway rate (`casual_male` has a single one in 332), and their medians run from 0.0 pct to 9.1 pct WER. `distinct.md` lists them in most-different-first order, so if the dataset needs fewer than 20 speakers, take the first N rows of that table and they will be the most spread-out N available.
@@ -63,11 +85,11 @@ Weight `fr_female` and `fr_male` heavily. They are not just the best of the 20, 
 
 **Clean the text before generating.** Normalising non-breaking and thin spaces to plain spaces, and deciding what to do with guillemets, is worth more than any voice selection: it addresses the group that carries 5 to 7 pct runaway rates and triple the median WER. Do the `probe` run first so the fix targets the right character.
 
-**Keep the retry loop on regardless.** Runaways are detected from the waveform, not from the ASR, so retrying them with a different seed cannot flatter the benchmark. `driver.sh` now runs tts, stt and retry in a loop until no take is suspicious, and `stats --attempt first` keeps reporting the unaided number whatever the retries did.
+**Keep the retry loop on, and expect it to clear about three quarters of the damage.** Runaways are detected from the waveform, not from the ASR, so retrying them with a different seed cannot flatter the benchmark. `driver.sh` runs tts, stt and retry in a loop until no take is suspicious, `stats --attempt first` keeps reporting the unaided number whatever the retries did, and `retries.md` says how well it worked. With retries the fragile hybrids stop being dangerous, but the residue is text-driven and a retry loop cannot fix that.
 
 ## What this does not tell you
 
-- **Whether a runaway is reproducible.** A retried take has not been generated yet, so it is not known whether a different seed fixes a degenerate take or whether some (sentence, voice) pairs are simply cursed. The retry loop answers this the first time it runs, and its ledger keeps every attempt.
-- **Whether guillemets or the thin space is the cause.** They co-occur. The `probe` 2x2 exists for exactly this and has not been run.
+- **Whether the 37 stuck takes are fixable at all.** Three seeds were not enough for them. Whether a fourth or a tenth would work, or whether those (voice, sentence) pairs are genuinely impossible, is unknown: raising `MAX_ATTEMPTS` is the cheap experiment, but the text fix is the better one if the probe confirms the thin space.
+- **Whether guillemets or the thin space is the cause.** They co-occur in 11 of the 15 stuck sentences. The evidence points hard at the space (present in 15 of 15), but that is a correlation over 15 sentences, and the `probe` 2x2 is what would settle it.
 - **How these voices sound.** ECAPA answers "same speaker or not", and WER answers "were the words right". Neither says whether a voice is pleasant, whether a hybrid inherits the donor's prosody or the semantic donor's, or whether the accent survives in a way a listener would notice. That needs ears on a sample.
 - **Whether whisper is fair to every voice.** The ASR is one model with its own accent biases, so a foreign-accented voice may be penalised for being correctly transcribable by a human but not by this model. The CER table is the partial check: where WER is high and CER is low, the words were nearly right, which is a scoring artifact more than a generation failure.
