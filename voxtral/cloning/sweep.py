@@ -1876,7 +1876,7 @@ def cmd_probe_report(out: str | None) -> None:
     per_variant: dict[str, list] = {}
     for row in rows:
         per_variant.setdefault(row["variant"], []).append(row)
-    lines = ["## Probe: does cleaning the text fix the failures", "",
+    lines = [f"# {RUN}: does cleaning the text fix the failures", "",
              "Every row below is the same sentences read by the same voices at the same "
              "noise seed, with one text change applied. `raw` is FLEURS as shipped, `nbsp` "
              "replaces non-breaking and thin spaces with ordinary ones, `quotes` removes "

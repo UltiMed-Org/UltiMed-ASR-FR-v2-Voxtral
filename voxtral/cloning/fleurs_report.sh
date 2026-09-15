@@ -18,6 +18,10 @@
 #                     name to use for each
 #   retries.md        whether a second seed fixed the degenerate takes, and where the
 #                     ones it could not fix pile up (skipped if nothing was retried)
+#
+# The PROBE run's verdict (cache/cloning/PROBE/probe.md) is spliced in too when it exists.
+# It belongs in this report even though it is a different run: it is the answer to the
+# question the failure tables raise and cannot settle.
 #   RESULTS.md        the three above assembled, with the written analysis last
 #
 # The analysis is prose and lives in a tracked file (fleurs_analysis.md) rather than
@@ -107,6 +111,10 @@ splice() { sed 's/^\(#\{1,5\}\) /#\1 /' "$1"; }
     if [[ -f "${STAGE_DIR}/retries.md" ]]; then
         echo
         splice "${STAGE_DIR}/retries.md"
+    fi
+    if [[ -f "${REPO_ROOT}/cache/cloning/PROBE/probe.md" ]]; then
+        echo
+        splice "${REPO_ROOT}/cache/cloning/PROBE/probe.md"
     fi
     if [[ -f "${HERE}/fleurs_analysis.md" ]]; then
         echo

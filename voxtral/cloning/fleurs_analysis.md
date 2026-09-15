@@ -71,7 +71,24 @@ The effect on the fragile voices is large. Quoting the best attempt instead of t
 
 Every single sentence that survived three different seeds still broken contains a non-breaking or thin space, against 18 pct of the corpus. Guillemets are present in 73 pct of them, but every guillemet pair in French typography contains a thin space, so the guillemets are most likely along for the ride. Digits and multi-sentence rows sit at their base rate and are not implicated at all.
 
-That is as far as observation can go. The `probe` run settles it causally by reading the same sentences with the spaces normalised, the guillemets removed, both, and neither, at a pinned seed. Its sentence list and voice list are now generated (5 sentences with guillemets, 3 without, all carrying the thin space; the five most fragile voices plus `fr_female` as a control), and the run has not been done.
+## The probe: it is the space, and the guillemets are innocent
+
+The causal test was then run: 8 of those sentences read by 6 voices at a pinned seed, four times each, changing one thing at a time. 192 takes.
+
+| variant | median WER | mean WER | unusable takes |
+|---|---|---|---|
+| `raw`, as FLEURS ships it | 47.7% | 90.5% | 16 of 48 |
+| `nbsp`, spaces normalised, guillemets kept | **10.5%** | **25.9%** | **3 of 48** |
+| `quotes`, guillemets removed, spaces kept | 57.6% | 76.4% | 15 of 48 |
+| `clean`, both | 18.2% | 29.6% | 4 of 48 |
+
+Replacing the non-breaking and thin spaces with ordinary ones cuts the median WER by a factor of 4.5 and takes the unusable takes from 16 to 3. Removing the guillemets and leaving the spaces alone does nothing at all: the median moves the wrong way and 15 of 48 takes are still unusable. Doing both is no better than fixing the spaces alone, so the guillemets contribute nothing in either direction and were only ever implicated because French typography puts a thin space inside every pair.
+
+The median take also got shorter, 18.2 s to 13.8 s, which is the same fact seen from the waveform: the raw takes were running long because they were degenerating.
+
+**This is a one-character preprocessing fix and it is the single largest quality lever found in the whole track.** Any text going to this model should have U+00A0, U+2009 and U+202F replaced with an ordinary space first. It is worth more than the choice of voice: it takes the affected sentences from unusable to ordinary, and 18 pct of an arbitrary French corpus is affected.
+
+Caveat on the size of the test: 48 takes per variant, 8 sentences, 6 voices. The direction is consistent and large, but the exact multiplier is not.
 
 ## The recommendation
 
@@ -83,13 +100,12 @@ Weight `fr_female` and `fr_male` heavily. They are not just the best of the 20, 
 
 **Drop the rest.** Two ways to fail the rule, and every remaining derived voice fails one of them. Too fragile: `h_frf_cam` is the worst voice in the pool on every axis (9.3 pct runaway, 31 takes in 332, and a worse median than its donor), followed by `h_frm_nem` at 4.2 pct, `h_frf_nef` and `h_frm_esf` at 3.6 pct, and `h_frf_caf` at 3.3 pct. Pointless: `h_def_frm`, `h_def_hif`, `h_def_him`, `h_frf_arm` and `x_frf_caf_nlm` are stable but read no better than the voices they copied, so the donor is strictly the better choice.
 
-**Clean the text before generating.** Normalising non-breaking and thin spaces to plain spaces, and deciding what to do with guillemets, is worth more than any voice selection: it addresses the group that carries 5 to 7 pct runaway rates and triple the median WER. Do the `probe` run first so the fix targets the right character.
+**Clean the text before generating.** Replace U+00A0, U+2009 and U+202F with an ordinary space. The probe measured this as a 4.5x cut in median WER and 16 unusable takes down to 3 on the sentences that carry them, and it is worth more than any voice selection. Leave the guillemets alone, they were measured to be innocent.
 
 **Keep the retry loop on, and expect it to clear about three quarters of the damage.** Runaways are detected from the waveform, not from the ASR, so retrying them with a different seed cannot flatter the benchmark. `driver.sh` runs tts, stt and retry in a loop until no take is suspicious, `stats --attempt first` keeps reporting the unaided number whatever the retries did, and `retries.md` says how well it worked. With retries the fragile hybrids stop being dangerous, but the residue is text-driven and a retry loop cannot fix that.
 
 ## What this does not tell you
 
 - **Whether the 37 stuck takes are fixable at all.** Three seeds were not enough for them. Whether a fourth or a tenth would work, or whether those (voice, sentence) pairs are genuinely impossible, is unknown: raising `MAX_ATTEMPTS` is the cheap experiment, but the text fix is the better one if the probe confirms the thin space.
-- **Whether guillemets or the thin space is the cause.** They co-occur in 11 of the 15 stuck sentences. The evidence points hard at the space (present in 15 of 15), but that is a correlation over 15 sentences, and the `probe` 2x2 is what would settle it.
 - **How these voices sound.** ECAPA answers "same speaker or not", and WER answers "were the words right". Neither says whether a voice is pleasant, whether a hybrid inherits the donor's prosody or the semantic donor's, or whether the accent survives in a way a listener would notice. That needs ears on a sample.
 - **Whether whisper is fair to every voice.** The ASR is one model with its own accent biases, so a foreign-accented voice may be penalised for being correctly transcribable by a human but not by this model. The CER table is the partial check: where WER is high and CER is low, the words were nearly right, which is a scoring artifact more than a generation failure.
