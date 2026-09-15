@@ -16,6 +16,8 @@
 #   similarity.md     the N x N speaker-embedding cosine matrix, plus what it implies
 #   distinct.md       how many DIFFERENT speakers those voices actually are, and which
 #                     name to use for each
+#   retries.md        whether a second seed fixed the degenerate takes, and where the
+#                     ones it could not fix pile up (skipped if nothing was retried)
 #   RESULTS.md        the three above assembled, with the written analysis last
 #
 # The analysis is prose and lives in a tracked file (fleurs_analysis.md) rather than
@@ -76,6 +78,11 @@ fi
 echo "=== speaker similarity matrix"
 run voice_distance.py matrix --only-file "${VOICES}" --out "${STAGE_DIR}/similarity.md"
 
+echo "=== retries"
+# Only meaningful once the retry rounds have run, and saying so is better than failing:
+# the first pass over a fresh benchmark has nothing to report here.
+run sweep.py retry-report || echo "--- nothing retried yet, skipping"
+
 echo "=== distinct speakers (threshold ${SPEAKER})"
 run voice_distance.py select --threshold "${SPEAKER}" --out "${STAGE_DIR}/distinct.md"
 
@@ -97,6 +104,10 @@ splice() { sed 's/^\(#\{1,5\}\) /#\1 /' "$1"; }
     splice "${STAGE_DIR}/similarity.md"
     echo
     splice "${STAGE_DIR}/distinct.md"
+    if [[ -f "${STAGE_DIR}/retries.md" ]]; then
+        echo
+        splice "${STAGE_DIR}/retries.md"
+    fi
     if [[ -f "${HERE}/fleurs_analysis.md" ]]; then
         echo
         splice "${HERE}/fleurs_analysis.md"

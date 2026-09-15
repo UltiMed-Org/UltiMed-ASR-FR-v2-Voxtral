@@ -1608,13 +1608,156 @@ PROBE_VARIANTS = {
 }
 
 
+@cli.command("retry-report")
+@click.option("--out", default=None, help="Where to write the markdown (default: <stage>/retries.md).")
+@click.option("--runaway-factor", default=RUNAWAY_FACTOR, show_default=True,
+              help="Duration multiple of a voice's own speaking rate that counts as a runaway.")
+def cmd_retry_report(out: str | None, runaway_factor: float) -> None:
+    """Did retrying with a different seed actually fix the degenerate takes.
+
+    This is the question the retry loop was built to answer and the one thing the loop
+    cannot be trusted to answer about itself: a loop that retries until the take looks
+    fine will always report that takes end up looking fine. So the report is written from
+    the whole attempt history, counts how many takes ran out of budget still broken, and
+    keeps the first-attempt population number next to the best-attempt one so the cost of
+    quoting the flattering figure is visible.
+
+    A take converging on attempt 2 also means something specific about the model: the
+    degeneration is a property of the sampled noise, not of the (voice, sentence) pair,
+    and generating a dataset only needs a retry loop rather than a different voice list.
+    """
+    by_sid = {entry["sid"]: entry["text"] for entry in load_sentences()}
+
+    def words_of(sid: str) -> int:
+        """Word count of a sentence."""
+        return len(by_sid[sid].split())
+
+    # Rates come from the surviving attempt of every row, which is what `diagnose` uses, so
+    # the two agree on what "runaway" means. A median over 332 takes does not move for the
+    # 1 pct that degenerate.
+    settled = [dict(record, voice=voice, sid=sid)
+               for (voice, sid), record in read_ledger().items()
+               if sid in by_sid and record.get("seconds")]
+    rates = voice_rates(settled, words_of=words_of)
+
+    def broken(take: dict, sid: str, voice: str) -> bool:
+        """Whether one attempt degenerated, from its waveform alone."""
+        if not take.get("seconds"):
+            return False
+        return stretch_of(seconds=take["seconds"], words=words_of(sid),
+                          rate=rates[voice]) >= runaway_factor
+
+    history = {key: attempts for key, attempts in read_attempts().items()
+               if key[1] in by_sid and len(attempts) > 1}
+    if not history:
+        raise SystemExit(f"no take in {STAGE_DIR} has been retried yet")
+
+    # Per take: where it started, where it ended, and on which attempt it stopped breaking.
+    fixed_on: dict[int, int] = {}
+    unfixed, gains = [], []
+    for (voice, sid), attempts in history.items():
+        landed = None
+        for index, take in enumerate(attempts):
+            if not broken(take, sid, voice):
+                landed = index
+                break
+        if landed is None:
+            unfixed.append((voice, sid, attempts))
+        else:
+            fixed_on[landed] = fixed_on.get(landed, 0) + 1
+            if "wer" in attempts[0] and "wer" in attempts[landed]:
+                gains.append((attempts[0]["wer"], attempts[landed]["wer"]))
+
+    lines = [f"# {RUN}: did the retries converge", "",
+             f"{len(history)} takes were retried at least once. A take is counted as fixed "
+             f"on the first attempt whose audio is under {runaway_factor:g}x the voice's own "
+             "speaking rate, measured from the waveform, so the ASR has no say in it.", "",
+             f"- **{sum(fixed_on.values())} of {len(history)} converged**, "
+             f"{len(unfixed)} ran out of attempts still degenerate.", ""]
+    if gains:
+        before = statistics.median([pair[0] for pair in gains])
+        after = statistics.median([pair[1] for pair in gains])
+        lines += [f"- Median WER of a retried take: **{100 * before:.1f}% -> {100 * after:.1f}%** "
+                  "between its first attempt and the one that converged.", ""]
+    lines += ["| converged on | takes |", "|---|---|"]
+    for attempt in sorted(fixed_on):
+        label = "first attempt (never broken)" if attempt == 0 else f"attempt {attempt + 1}"
+        lines.append(f"| {label} | {fixed_on[attempt]} |")
+    lines.append(f"| never, budget exhausted | {len(unfixed)} |")
+
+    # Which voices cost the retries, and whether any of them is hopeless rather than unlucky.
+    per_voice: dict[str, list[int]] = {}
+    for (voice, sid), attempts in history.items():
+        ok = any(not broken(take, sid, voice) for take in attempts)
+        per_voice.setdefault(voice, [0, 0])
+        per_voice[voice][0] += 1
+        per_voice[voice][1] += 0 if ok else 1
+    lines += ["", "## Per voice", "",
+              "`retried` is how many of its takes needed a second seed, `still broken` how "
+              "many never came good. A voice with a high second number is failing on the "
+              "sentence, not on the seed, and no amount of retrying will save it.", "",
+              "| voice | retried | still broken |", "|---|---|---|"]
+    for voice, (retried, still) in sorted(per_voice.items(), key=lambda item: (-item[1][1], -item[1][0])):
+        lines.append(f"| `{voice}` | {retried} | {still} |")
+
+    # Grouped by sentence, because that is the test of whether a retry loop is the right
+    # tool at all: failures spread thinly across many sentences are bad luck and more
+    # attempts would clear them, failures piled on a few sentences are the text, and the
+    # fix is to change the text rather than to keep paying for seeds.
+    if unfixed:
+        stuck: dict[str, int] = {}
+        for voice, sid, _ in unfixed:
+            stuck[sid] = stuck.get(sid, 0) + 1
+        features = {sid: text_features(by_sid[sid]) for sid in stuck}
+        everything = {sid: text_features(text) for sid, text in by_sid.items()}
+        lines += ["", "## Where the unfixable takes pile up", "",
+                  f"The {len(unfixed)} takes that never converged land on only "
+                  f"**{len(stuck)} sentences**. Comparing what those sentences contain "
+                  "against the corpus they were drawn from says whether the retry budget "
+                  "was too small or the text is the trigger: a feature present in nearly "
+                  "every stuck sentence but a minority of the corpus is not luck.", "",
+                  "| feature | stuck sentences | whole corpus |", "|---|---|---|"]
+        for label, key in (("guillemets «»", "quoted"), ("nbsp / thin space", "nbsp"),
+                           ("digits", "digits"), ("parentheses", "parens"),
+                           ("several sentences", "multi")):
+            here = sum(1 for sid in stuck if features[sid][key])
+            there = sum(1 for feature in everything.values() if feature[key])
+            lines.append(f"| {label} | {here}/{len(stuck)} ({100 * here / len(stuck):.0f}%) | "
+                         f"{there}/{len(everything)} ({100 * there / len(everything):.0f}%) |")
+        lines += ["",
+                  "| sid | voices stuck | «» | nbsp | digits | words | text |",
+                  "|---|---|---|---|---|---|---|"]
+        for sid, count in sorted(stuck.items(), key=lambda item: -item[1]):
+            feature = features[sid]
+            lines.append(f"| `{sid}` | {count} | {'yes' if feature['quoted'] else ''} | "
+                         f"{'yes' if feature['nbsp'] else ''} | "
+                         f"{'yes' if feature['digits'] else ''} | {feature['words']} | "
+                         + by_sid[sid][:60].replace("|", "/") + "… |")
+
+    if unfixed:
+        lines += ["", "## The takes that never converged", "",
+                  "Same sentence, same voice, a different noise seed each time. These are "
+                  "the rows to look at if the degeneration turns out to be a property of "
+                  "the text rather than of the sampling.", "",
+                  "| voice | sid | attempts | text |", "|---|---|---|---|"]
+        for voice, sid, attempts in sorted(unfixed)[:40]:
+            lines.append(f"| `{voice}` | `{sid}` | {len(attempts)} | "
+                         + by_sid[sid][:60].replace("|", "/") + "… |")
+
+    destination = Path(out) if out else STAGE_DIR / "retries.md"
+    destination.write_text("\n".join(lines) + "\n")
+    logger.success(f"{len(history)} retried takes, {len(unfixed)} still broken, wrote {destination}")
+
+
 @cli.command("probe")
 @click.option("--from-run", default="FLEURS", show_default=True,
               help="Run whose hardest sentences are re-read as variants.")
 @click.option("--worst", default=8, show_default=True, help="How many hard sentences to probe.")
-@click.option("--require", default="quoted", show_default=True,
+@click.option("--require", default="nbsp", show_default=True,
               help="Only probe sentences with this text feature (empty = any).")
-def cmd_probe(from_run: str, worst: int, require: str) -> None:
+@click.option("--voices", default=6, show_default=True,
+              help="How many voices to probe with: the most fragile ones, plus one control.")
+def cmd_probe(from_run: str, worst: int, require: str, voices: int) -> None:
     """Mint a tiny run that re-reads the hardest sentences with the text cleaned up.
 
     `diagnose` can only say that guillemets and non-breaking spaces travel with the
@@ -1622,6 +1765,12 @@ def cmd_probe(from_run: str, worst: int, require: str) -> None:
     non-breaking space inside every pair of guillemets, so the two features are almost the
     same set of sentences. The only way to separate them is to change one at a time and
     re-synthesize, which is what this mints the sentence list for.
+
+    The default filter is the non-breaking space rather than the guillemets, on the
+    evidence of `retry-report`: all 15 sentences whose takes were still degenerate after
+    three different seeds carry one, against 18 pct of the corpus, while only 11 of the 15
+    carry guillemets. Filtering on it also puts both kinds of sentence in the sample, since
+    every guillemet pair contains one, which is what lets the 2x2 separate them.
 
     Each source sentence becomes four rows sharing one pinned noise seed, so the audio
     differs by the text and by nothing else: `raw` as FLEURS ships it, `nbsp` with the
@@ -1643,6 +1792,9 @@ def cmd_probe(from_run: str, worst: int, require: str) -> None:
     require : str
         A `text_features` key the sentence must have, so the probe spends its rows on the
         suspected trigger rather than on whatever happened to score badly. Empty for any.
+    voices : int
+        Size of the voice list written to `voices.txt`: the most fragile voices of the
+        source run, plus one control that never degenerated.
     """
     source = REPO_ROOT / "cache" / "cloning" / from_run
     sentences = json.loads((source / "sentences.json").read_text())
@@ -1651,6 +1803,11 @@ def cmd_probe(from_run: str, worst: int, require: str) -> None:
     # Ranked by how badly the *sentence* does across voices, which is the only ranking that
     # points at the text rather than at one unlucky voice.
     per_sid: dict[str, list[float]] = {}
+    # Degenerate takes per voice, counted the one way that needs no rate model: a take at
+    # the token ceiling generated until it ran out of tokens, whatever its speaking rate.
+    # This is what picks the probe's voices, so the probe spends its rows on the voices
+    # that actually break rather than on a hand-picked list.
+    ceiling: dict[str, int] = {}
     for line in (source / "ledger.jsonl").read_text(errors="replace").splitlines():
         try:
             record = json.loads(line)
@@ -1658,6 +1815,8 @@ def cmd_probe(from_run: str, worst: int, require: str) -> None:
             continue
         if "wer" in record and record["sid"] in by_sid:
             per_sid.setdefault(record["sid"], []).append(record["wer"])
+        if record.get("seconds", 0) >= 327.0:
+            ceiling[record["voice"]] = ceiling.get(record["voice"], 0) + 1
     if not per_sid:
         raise SystemExit(f"no scores in {source}/ledger.jsonl")
     ranked = sorted(per_sid.items(), key=lambda item: -statistics.median(item[1]))
@@ -1682,8 +1841,17 @@ def cmd_probe(from_run: str, worst: int, require: str) -> None:
     (STAGE_DIR / "sentences.json").write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
     logger.success(f"{len(chosen)} sentences x {len(PROBE_VARIANTS)} variants = {len(out)} rows "
                    f"to {STAGE_DIR / 'sentences.json'}")
-    keepers = REPO_ROOT / "cache" / "cloning" / "A6" / "keepers.txt"
-    logger.info(f"pick the voices to probe with, e.g.  head -6 {keepers} > {STAGE_DIR / 'voices.txt'}")
+    # The voice list is written here rather than left to the caller, because the driver
+    # command in the docstring names it and a probe run that dies on a missing file is a
+    # wasted container flip. The fragile voices come first (they are the ones that can show
+    # a text fix working) and a control that never breaks comes last, so a variant that
+    # still fails on the control is the corpus, not the recipe.
+    fragile = sorted(ceiling, key=lambda name: -ceiling[name])[:max(voices - 1, 1)]
+    control = "fr_female" if "fr_female" not in fragile else "fr_male"
+    chosen_voices = fragile + [control]
+    (STAGE_DIR / "voices.txt").write_text("\n".join(chosen_voices) + "\n")
+    logger.success(f"probing with {', '.join(chosen_voices)} "
+                   f"-> {STAGE_DIR / 'voices.txt'}")
 
 
 @cli.command("probe-report")
