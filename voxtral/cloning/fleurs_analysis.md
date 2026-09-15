@@ -90,13 +90,23 @@ The median take also got shorter, 18.2 s to 13.8 s, which is the same fact seen 
 
 Caveat on the size of the test: 48 takes per variant, 8 sentences, 6 voices. The direction is consistent and large, but the exact multiplier is not.
 
+## Yield, which is what actually decides the dataset
+
+Quantiles say how wrong a take is. For generating a corpus the question is different: how many takes can be kept, and how many have to be caught and redone. The yield table inverts the ranking in a way the WER tables hide.
+
+`fr_female` and `fr_male` transcribe exactly on 57.8 pct and 53.9 pct of sentences and produce zero junk takes (past 50 pct WER) in 332. No other voice is close on both counts. `ar_male` is the best of the rest at 49.7 pct perfect and 0.9 pct junk, then `it_female` at 45.2 pct and 0.3 pct.
+
+The hybrids land more clean takes than the voices they copied, by a lot: `h_frm_nlf` gets 49.7 pct perfect against `nl_female`'s 26.5 pct, `h_frm_esm` 49.4 pct against `es_male`'s 20.8 pct, `h_frm_itm` 48.2 pct against `it_male`'s 29.8 pct. They also produce three to five times the junk (4.8, 3.6 and 4.2 pct against 1.2, 1.5 and 0.0 pct).
+
+That is the whole trade in one line: **a hybrid is a better producer if there is a QC pass, and a worse one if there is not.** With the retry loop catching degenerate takes from the waveform and regenerating them, the junk column is work to redo, not files that ship. Without it, the junk column is what ends up in the dataset.
+
 ## The recommendation
 
 **Use the 20 shipped voices as the diversity backbone.** They are the entire acoustic space available, every one of them has a 0.0 pct runaway rate (`casual_male` has a single one in 332), and their medians run from 0.0 pct to 9.1 pct WER. `distinct.md` lists them in most-different-first order, so if the dataset needs fewer than 20 speakers, take the first N rows of that table and they will be the most spread-out N available.
 
 Weight `fr_female` and `fr_male` heavily. They are not just the best of the 20, they are in a different class: 0.0 pct median and 3.7 pct mean WER against a pool median of 5.3 pct, with the fastest and second-fastest delivery. Everything else is a non-native speaker reading French, which is a genuine acoustic axis for an ASR dataset but should not dominate it.
 
-**Add hybrids only for delivery variety, and only with the retry loop on.** One rule keeps the list honest: beat your donor's median, and degenerate less than 3 pct of the time. Nine voices pass, and the "derived voice against the voice it copied" table is where to check it: `h_frm_esm`, `h_frm_itm`, `h_frm_itf`, `h_frm_nlf`, `h_frf_nlm`, `h_frf_chf`, `h_frf_dem`, `h_frm_ptf`, `h_frm_ptm`. Each is the same speaker as its donor, so the pair buys prosodic variation, not a new voice.
+**Add hybrids for yield and delivery variety, and only with the retry loop on.** One rule keeps the list honest: beat your donor's median, and degenerate less than 3 pct of the time. Nine voices pass, and the "derived voice against the voice it copied" table is where to check it: `h_frm_esm`, `h_frm_itm`, `h_frm_itf`, `h_frm_nlf`, `h_frf_nlm`, `h_frf_chf`, `h_frf_dem`, `h_frm_ptf`, `h_frm_ptm`. Each is the same speaker as its donor, so the pair buys prosodic variation, not a new voice.
 
 **Drop the rest.** Two ways to fail the rule, and every remaining derived voice fails one of them. Too fragile: `h_frf_cam` is the worst voice in the pool on every axis (9.3 pct runaway, 31 takes in 332, and a worse median than its donor), followed by `h_frm_nem` at 4.2 pct, `h_frf_nef` and `h_frm_esf` at 3.6 pct, and `h_frf_caf` at 3.3 pct. Pointless: `h_def_frm`, `h_def_hif`, `h_def_him`, `h_frf_arm` and `x_frf_caf_nlm` are stable but read no better than the voices they copied, so the donor is strictly the better choice.
 

@@ -1279,9 +1279,17 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     for voice, takes in scored.items():
         shared = [takes[sid] for sid in common]
         cers = [record["cer"] for record in shared if "cer" in record]
+        wers = [record["wer"] for record in shared]
         rows.append({"voice": voice,
-                     "wer": summarise([record["wer"] for record in shared]),
+                     "wer": summarise(wers),
                      "cer": summarise(cers) if cers else None,
+                     # Yield, which is what a generator actually budgets against: quantiles
+                     # say how bad a typical take is, these say how many takes survive a
+                     # threshold. The two answer different questions and a median of 6 pct
+                     # can hide either 30 pct or 60 pct perfect takes.
+                     "perfect": sum(1 for wer in wers if wer == 0) / len(wers),
+                     "usable": sum(1 for wer in wers if wer <= 0.10) / len(wers),
+                     "junk": sum(1 for wer in wers if wer > 0.50) / len(wers),
                      "seconds": sum(record.get("seconds", 0.0) for record in shared)})
     rows.sort(key=lambda row: row["wer"]["median"])
     # Surfaced because it is the one artifact that could make a slow voice look broken
@@ -1342,6 +1350,18 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
         shown = csv_path.relative_to(REPO_ROOT)
     except ValueError:
         shown = csv_path
+    lines += ["", "## Yield: how many takes you keep", "",
+              "The tables above say how wrong a take is; this says how many takes are "
+              "worth keeping, which is what a dataset run budgets against. `perfect` is "
+              "takes the ASR transcribed exactly, `usable` is at or under 10 pct WER, "
+              "`junk` is past 50 pct and has to be caught and regenerated. Ordered by "
+              "`perfect`, and note this reorders the voices against the WER tables: a "
+              "voice can have a good median and still land fewer clean takes.", "",
+              "| voice | takes | perfect | usable (<= 10%) | junk (> 50%) |",
+              "|---|---|---|---|---|"]
+    for row in sorted(rows, key=lambda row: -row["perfect"]):
+        lines.append(f"| {row['voice']} | {row['wer']['n']} | {100 * row['perfect']:.1f}% | "
+                     f"{100 * row['usable']:.1f}% | {100 * row['junk']:.1f}% |")
     lines += ["", f"Per-sentence detail, one row per (voice, sentence): `{shown}`.", ""]
 
     destination = Path(out) if out else STAGE_DIR / "stats.md"
