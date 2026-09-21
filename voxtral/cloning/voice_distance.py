@@ -49,7 +49,8 @@ from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sweep import RUN, STAGE_DIR, WER_REJECT, load_pool, read_ledger, voice_profiles  # noqa: E402
+from sweep import (RUN, STAGE_DIR, WER_REJECT, declared_identity, load_pool,
+                   read_ledger, speaker_components, voice_profiles)  # noqa: E402
 from wav_stats import read_wav  # noqa: E402
 
 # VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
@@ -370,23 +371,13 @@ def cmd_select(anchor: str, threshold: float, out: str | None) -> None:
     # than shipping two names for one speaker.
     profiles = voice_profiles()
 
-    parent = {name: name for name in names}
+    components = speaker_components(names=names, similarity=similarity,
+                                    index_of=index_of, threshold=threshold)
+    root_of = {member: root for root, family in components.items() for member in family}
 
     def find(name: str) -> str:
-        """Root of this voice's cluster, with path compression."""
-        while parent[name] != name:
-            parent[name] = parent[parent[name]]
-            name = parent[name]
-        return name
-
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            if similarity[index_of[a], index_of[b]] >= threshold:
-                parent[find(a)] = find(b)
-
-    components: dict[str, list[str]] = {}
-    for name in names:
-        components.setdefault(find(name), []).append(name)
+        """Root of this voice's cluster."""
+        return root_of[name]
 
     def robustness(name: str) -> tuple[float, float]:
         """Sort key: degenerate rarely first, then be accurate on average."""
@@ -597,34 +588,6 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
         path.write_text("\n".join(shortlist) + "\n")
         logger.info(f"{len(shortlist)} contenders written to {path}: re-sweep them with "
                     f"ONLY_FILE={path} DEPTH=12 sudo -E ./voxtral/cloning/driver.sh")
-
-
-def declared_identity(voice: str, pool: dict) -> str:
-    """Which shipped speaker a candidate is supposed to sound like, by construction.
-
-    This is the *claim*, read off the recipe, not a measurement: the similarity matrix
-    exists to check it. A6 established that identity travels in the 36 acoustic codes, so
-    a hybrid `h_<semantic>_<acoustic>` should sound like its acoustic donor (the last
-    parent) and not at all like its semantic one. A sparse `x_` mix blends whole frames
-    with a dominant first component rather than splitting semantic from acoustic, so its
-    claim is that first parent. A shipped voice is its own identity.
-
-    Parameters
-    ----------
-    voice : str
-        Voice name.
-    pool : dict
-        `{name: entry}` from the candidate manifest.
-
-    Returns
-    -------
-    str
-        Name of the shipped voice this one is expected to resemble.
-    """
-    entry = pool.get(voice)
-    if entry is None or not entry.get("parents"):
-        return voice
-    return entry["parents"][-1] if entry["kind"] == "hybrid" else entry["parents"][0]
 
 
 def seriate(names: list[str], similarity: np.ndarray) -> list[int]:

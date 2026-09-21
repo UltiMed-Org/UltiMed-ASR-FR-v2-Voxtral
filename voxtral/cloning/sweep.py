@@ -500,6 +500,82 @@ def stretch_of(*, seconds: float, words: int, rate: float) -> float:
     return seconds / (words / rate)
 
 
+def declared_identity(voice: str, pool: dict) -> str:
+    """Which shipped speaker a candidate is supposed to sound like, by construction.
+
+    This is the *claim*, read off the recipe, not a measurement: the similarity matrix
+    exists to check it. A6 established that identity travels in the 36 acoustic codes, so
+    a hybrid `h_<semantic>_<acoustic>` should sound like its acoustic donor (the last
+    parent) and not at all like its semantic one. A sparse `x_` mix blends whole frames
+    with a dominant first component rather than splitting semantic from acoustic, so its
+    claim is that first parent. A shipped voice is its own identity.
+
+    Parameters
+    ----------
+    voice : str
+        Voice name.
+    pool : dict
+        `{name: entry}` from the candidate manifest.
+
+    Returns
+    -------
+    str
+        Name of the shipped voice this one is expected to resemble.
+    """
+    entry = pool.get(voice)
+    if entry is None or not entry.get("parents"):
+        return voice
+    return entry["parents"][-1] if entry["kind"] == "hybrid" else entry["parents"][0]
+
+
+def speaker_components(*, names: list[str], similarity: "np.ndarray",
+                       index_of: dict[str, int], threshold: float) -> dict[str, list[str]]:
+    """Group voices into speakers: connected components of the "at or above threshold" graph.
+
+    Components rather than neighbourhoods, because cosine similarity is not transitive.
+    `de_female` sits at 0.58 from `pt_female`, which sits at 0.97 from `h_frm_ptf`, so the
+    neighbourhood of one kept voice overlaps another's and the same name ends up listed
+    under two speakers. Components cannot do that. Merging a borderline chain is the
+    conservative error here: it under-counts diversity rather than shipping two names for
+    one speaker.
+
+    Parameters
+    ----------
+    names : list of str
+        Voices to cluster.
+    similarity : numpy.ndarray
+        Square cosine-similarity matrix.
+    index_of : dict
+        Voice name to its row in `similarity`.
+    threshold : float
+        At or above this cosine, two voices are the same speaker.
+
+    Returns
+    -------
+    dict
+        `{root_voice: [members]}`, one entry per speaker. The root is an arbitrary member
+        and carries no meaning beyond identifying the cluster.
+    """
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        """Root of this voice's cluster, with path compression."""
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for position, a in enumerate(names):
+        for b in names[position + 1:]:
+            if similarity[index_of[a], index_of[b]] >= threshold:
+                parent[find(a)] = find(b)
+
+    components: dict[str, list[str]] = {}
+    for name in names:
+        components.setdefault(find(name), []).append(name)
+    return components
+
+
 RUNAWAY_FACTOR = 3.0
 
 
@@ -1296,6 +1372,14 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
                      "usable": sum(1 for wer in wers if wer <= 0.10) / len(wers),
                      "junk": sum(1 for wer in wers if wer > 0.50) / len(wers),
                      "seconds": sum(record.get("seconds", 0.0) for record in shared)})
+    # Degeneration and pace come from `voice_profiles` rather than being recomputed here,
+    # so "runaway" means one thing across stats.md, failures.md and the roster. It reads
+    # the same ledger and is keyed by voice, so the merge is a lookup.
+    profiles = voice_profiles(only=wanted, which=which)
+    for row in rows:
+        profile = profiles.get(row["voice"], {})
+        row["runaway"] = profile.get("runaway")
+        row["words_per_second"] = profile.get("rate")
     rows.sort(key=lambda row: row["wer"]["median"])
     # Surfaced because it is the one artifact that could make a slow voice look broken
     # rather than merely slow: whisper works in 30 s windows, FLEURS runs to 65 words, and
@@ -1371,8 +1455,25 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
 
     destination = Path(out) if out else STAGE_DIR / "stats.md"
     destination.write_text("\n".join(lines) + "\n")
+
+    # The same rows as a machine-readable summary, beside the markdown. This exists so a
+    # report spanning SEVERAL runs (grid_report.py, which compares one voice across eight
+    # languages) can read what this command already computed instead of re-deriving the
+    # common-sentence set, the CER back-fill and the yield buckets. A second
+    # implementation of those would eventually disagree with this one, and the whole
+    # point of the cross-language table is that its cells are comparable.
+    summary_path = destination.with_name("summary.json")
+    summary_path.write_text(json.dumps({
+        "run": RUN,
+        "attempt": which,
+        "shared_sentences": len(common),
+        "sentences_in_run": len(by_sid),
+        "audio_hours": round(audio_hours, 2),
+        "voices": rows,
+    }, indent=2))
+
     logger.success(f"{len(rows)} voices over {len(common)} shared sentences, "
-                   f"wrote {destination} and {csv_path}")
+                   f"wrote {destination}, {summary_path} and {csv_path}")
 
 
 def text_features(text: str) -> dict:
