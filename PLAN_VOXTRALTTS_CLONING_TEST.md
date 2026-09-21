@@ -342,6 +342,19 @@ So: the full ordered grid, 380 hybrids over the 20 shipped voices, plus 100 spar
 
 **Not yet run.** Pool minted (480 candidates, 337 MB, registered: 508 voices total). The sweep itself needs the GPU for days.
 
+**Disk, and why `cache/cloning/GRID_<lang>` is a symlink.** Measured on the finished A7 run: 13,148 takes occupy 10.0 GB, so a take averages 743 KB (24 kHz 16-bit mono = 48 KB/s). The median is only 529 KB; the mean sits above it because 1.8 pct of takes run away and carry 24 pct of the bytes, one runaway being up to 15.4 MB at the 4096-frame ceiling. 120,000 takes is therefore about 85 GB at A7's runaway rate and about 126 GB at the rate A7's own first-30-sentence subset showed, and the grid runs the untested candidates A7 had already discarded, so the budget is 120 to 130 GB. Retries cost nothing extra: a re-synthesis overwrites `wav/<voice>/<sid>.wav` in place. Everything non-audio is rounding error (pool 337 MB, ledgers ~50 MB, per-sentence CSVs ~40 MB).
+
+That does not belong on the pool the repo lives on (79 pct full before the run, ~88 pct after), so each of the eight `cache/cloning/GRID_<lang>` directories is a **symlink onto an external drive**, which needs no code change at all: `STAGE_DIR` is `REPO_ROOT/cache/cloning/<RUN>` and every script works relative to it, symlink or not. Recreate them on a fresh machine before starting the sweep, with `BULK` pointing anywhere with ~150 GB free:
+
+```bash
+for lang in fr_fr de_de es_419 it_it nl_nl pt_br ar_eg hi_in; do
+    mkdir -p "${BULK}/GRID_${lang}"
+    ln -sfn "${BULK}/GRID_${lang}" "cache/cloning/GRID_${lang}"
+done
+```
+
+The one caveat is that a symlink inside `cache/` dangles when the container sees that bind mount as `/cache`. It is harmless here because the wavs are written host-side by `sweep.py`; the only path the container reads under `/cache` is `VOXTRAL_CODE_DUMP_DIR`, which stays a real directory.
+
 **Result:** TODO
 
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
