@@ -48,6 +48,7 @@ Usage
 
 from __future__ import annotations
 
+import collections
 import json
 import random
 import shutil
@@ -223,6 +224,59 @@ def prefix_from_codes(codes: np.ndarray, table: torch.Tensor, offsets: list[int]
     return sum(table[offsets[g] + rows[:, g]] for g in range(len(offsets)))
 
 
+# Default sparse-mix tiers, as COUNT:WEIGHTS strings, dominant weight first.
+#
+# The first tier is A6's exact set (40 three-way at 0.6/0.3/0.1) and must stay first and
+# unchanged: with a fixed --seed the draws are positional, so re-ordering or re-weighting
+# this tier would silently mint a DIFFERENT 40 voices under the same names as A6's, and
+# every number already measured against them would quietly stop meaning anything.
+#
+# The 4- and 5-way tiers extend the same dominant-plus-traces shape rather than flattening
+# it. A flat average of N prefixes contracts toward the global centroid by roughly
+# sqrt(N), which is the regression-to-the-mean that made B6's regression head useless, so
+# a flat 5-way mix would be a predictably bland voice rather than a new one. Keeping the
+# dominant parent near 0.5 and spending the rest on a longer tail asks the actual open
+# question: does a longer tail move the embedding further, or only blur it?
+MIX_TIERS = (
+    "40:0.6,0.3,0.1",
+    "30:0.55,0.25,0.12,0.08",
+    "30:0.5,0.22,0.13,0.09,0.06",
+)
+
+
+def parse_mix_spec(spec: str) -> tuple[int, list[float]]:
+    """Parse one `COUNT:W1,W2,...` sparse-mix tier.
+
+    Parameters
+    ----------
+    spec
+        For example `"30:0.55,0.25,0.12,0.08"`: thirty four-way mixes whose dominant
+        parent gets 0.55. The arity of the tier is the number of weights.
+
+    Returns
+    -------
+    tuple of (int, list of float)
+        How many mixes to draw, and the weights to apply to the drawn parents in order.
+
+    Raises
+    ------
+    SystemExit
+        If the spec is malformed or asks for fewer than two parents. Two parents is the
+        floor because a one-parent "mix" is just a scaled copy of a shipped voice.
+    """
+    count_text, _, weight_text = spec.partition(":")
+    if not weight_text:
+        raise SystemExit(f"mix tier '{spec}' is not COUNT:W1,W2,...")
+    try:
+        count = int(count_text)
+        weights = [float(w) for w in weight_text.split(",")]
+    except ValueError as error:
+        raise SystemExit(f"mix tier '{spec}': {error}") from error
+    if len(weights) < 2:
+        raise SystemExit(f"mix tier '{spec}' needs at least two weights")
+    return count, weights
+
+
 def hybrid_codes(semantic: str, acoustic: str) -> np.ndarray:
     """Take the semantic code column from one voice and the 36 acoustic ones from another.
 
@@ -351,17 +405,16 @@ def cmd_build(dry_run: bool, force: bool) -> None:
 @cli.command("pool")
 @click.option("--grid/--no-grid", default=True, show_default=True,
               help="Every ordered pair of bases as a semantic/acoustic hybrid (380 voices).")
-@click.option("--mixes", default=40, show_default=True,
-              help="Sparse three-way embedding mixes to add (0 disables).")
-@click.option("--weights", default="0.6,0.3,0.1", show_default=True,
-              help="Comma-separated weights for a sparse mix, dominant first.")
-@click.option("--seed", default=0, show_default=True, help="Seed for the mix triples.")
+@click.option("--mix", "mix_specs", multiple=True, default=MIX_TIERS, show_default=True,
+              help="Sparse-mix tier as COUNT:W1,W2,... (dominant weight first). Repeatable, "
+                   "one tier per arity. The default reproduces A6's 40 three-way mixes exactly.")
+@click.option("--seed", default=0, show_default=True, help="Seed for the mix parent draws.")
 @click.option("--limit", default=0, show_default=True,
               help="Keep only the first N candidates (0 = all). For a quick smoke run.")
 @click.option("--dry-run", is_flag=True, help="Print the pool, write and register nothing.")
 @click.option("--register/--no-register", default=True, show_default=True,
               help="Register the pool with voices_tool after writing it.")
-def cmd_pool(grid: bool, mixes: int, weights: str, seed: int, limit: int,
+def cmd_pool(grid: bool, mix_specs: tuple[str, ...], seed: int, limit: int,
              dry_run: bool, register: bool) -> None:
     """Build stage A6's candidate pool: code-level hybrids plus sparse mixes.
 
@@ -375,6 +428,28 @@ def cmd_pool(grid: bool, mixes: int, weights: str, seed: int, limit: int,
     - **Sparse mixes** (`x_<a>_<b>_<c>`) are embedding-space weighted averages with one
       dominant voice. These are the ones I expect to disappoint, for the reason in
       `apply_op`, and they are cheap enough to be worth disproving.
+
+    Mixes are drawn in **tiers**, one per arity, because the interesting question about
+    them is whether more parents buys more distance or only more blandness. A flat
+    average of N voices shrinks the distance to the global centroid by roughly sqrt(N),
+    so a 5-way mix at flat weights would be predictably bland; every tier therefore keeps
+    the dominant-plus-traces shape and only the tail gets longer. A6 ran one tier (40
+    three-way at 0.6/0.3/0.1) and could not tell the two apart at 12 sentences.
+
+    Parameters
+    ----------
+    grid
+        Build the full ordered hybrid grid (`n_bases * (n_bases - 1)` voices).
+    mix_specs
+        One `COUNT:W1,W2,...` string per tier. Arity is the number of weights.
+    seed
+        Seed for the parent draws. The same seed and tier list reproduce the same pool.
+    limit
+        Truncate the plan to N candidates, for a smoke run.
+    dry_run
+        Print the plan and write nothing.
+    register
+        Hand the written pool to `voices_tool add` afterwards.
     """
     snapshot = snapshot_dir()
     logger.info(f"snapshot: {snapshot}")
@@ -395,33 +470,53 @@ def cmd_pool(grid: bool, mixes: int, weights: str, seed: int, limit: int,
     if len(set(shorts.values())) != len(shorts):
         raise SystemExit(f"abbreviations collide: {sorted(shorts.values())}")
 
-    # (name, kind, parents) triples. Built before any tensor is touched so --dry-run
-    # costs nothing and the count is known up front.
-    plan: list[tuple[str, str, list[str]]] = []
+    # (name, kind, parents, weights) rows. Built before any tensor is touched so
+    # --dry-run costs nothing and the count is known up front. The weights travel WITH
+    # the row rather than being re-parsed at build time, because tiers of different
+    # arity are now in flight at once and a single shared list would silently pair a
+    # 5-way mix with three weights.
+    plan: list[tuple[str, str, list[str], list[float]]] = []
     if grid:
         for sem in bases:
             for ac in bases:
                 if sem != ac:
-                    plan.append((f"h_{shorts[sem]}_{shorts[ac]}", "hybrid", [sem, ac]))
-    if mixes:
-        weight_list = [float(w) for w in weights.split(",")]
-        rng = random.Random(seed)
-        seen = set()
-        attempts = 0
-        while len(seen) < mixes and attempts < mixes * 50:
+                    plan.append((f"h_{shorts[sem]}_{shorts[ac]}", "hybrid", [sem, ac], []))
+
+    rng = random.Random(seed)
+    seen: set[tuple[str, ...]] = set()
+    for spec in mix_specs:
+        count, weight_list = parse_mix_spec(spec)
+        if not count:
+            continue
+        if len(weight_list) > len(bases):
+            raise SystemExit(f"mix tier '{spec}' wants {len(weight_list)} parents "
+                             f"but only {len(bases)} base voices exist")
+        drawn, attempts = 0, 0
+        # The draw is rejection sampling against `seen`, shared across tiers so a repeated
+        # tier cannot mint the same voice twice. The attempt cap keeps a tier that asks for
+        # more distinct combinations than exist from spinning forever.
+        while drawn < count and attempts < count * 50:
             attempts += 1
             picked = tuple(rng.sample(bases, len(weight_list)))
             if picked in seen:
                 continue
             seen.add(picked)
-            plan.append(("x_" + "_".join(shorts[n] for n in picked), "mixn", list(picked)))
+            drawn += 1
+            plan.append(("x_" + "_".join(shorts[n] for n in picked), "mixn",
+                         list(picked), weight_list))
+        if drawn < count:
+            logger.warning(f"mix tier '{spec}' only found {drawn} distinct combinations")
+
     if limit:
         plan = plan[:limit]
-    logger.info(f"pool: {sum(1 for _, k, _ in plan if k == 'hybrid')} hybrids, "
-                f"{sum(1 for _, k, _ in plan if k == 'mixn')} mixes, {len(plan)} total")
+    by_arity = collections.Counter(len(parents) for _, kind, parents, _ in plan if kind == "mixn")
+    logger.info(f"pool: {sum(1 for _, k, _, _ in plan if k == 'hybrid')} hybrids, "
+                f"{sum(by_arity.values())} mixes "
+                f"({', '.join(f'{n} x {k}-way' for k, n in sorted(by_arity.items()))}), "
+                f"{len(plan)} total")
 
     if dry_run:
-        for name, kind, parents in plan[:10]:
+        for name, kind, parents, _ in plan[:10]:
             logger.info(f"would build {name} = {kind}{tuple(parents)}")
         logger.info(f"... {len(plan)} candidates, nothing written")
         return
@@ -429,12 +524,11 @@ def cmd_pool(grid: bool, mixes: int, weights: str, seed: int, limit: int,
     POOL_DIR.mkdir(parents=True, exist_ok=True)
     # One read of the 3 GB safetensors for the whole pool, and one load per base voice.
     sizes, offsets = codebook_layout(snapshot)
-    table = load_embedding_table(snapshot) if any(k == "hybrid" for _, k, _ in plan) else None
-    voices = {n: load_voice(snapshot, n) for n in bases} if any(k == "mixn" for _, k, _ in plan) else {}
-    weight_list = [float(w) for w in weights.split(",")]
+    table = load_embedding_table(snapshot) if any(k == "hybrid" for _, k, _, _ in plan) else None
+    voices = {n: load_voice(snapshot, n) for n in bases} if any(k == "mixn" for _, k, _, _ in plan) else {}
 
     manifest = []
-    for name, kind, parents in plan:
+    for name, kind, parents, weight_list in plan:
         if kind == "hybrid":
             codes = hybrid_codes(parents[0], parents[1])
             derived = prefix_from_codes(codes, table, offsets)
@@ -443,6 +537,7 @@ def cmd_pool(grid: bool, mixes: int, weights: str, seed: int, limit: int,
         derived = derived.to(torch.bfloat16).contiguous()
         torch.save(derived, POOL_DIR / f"{name}.pt")
         manifest.append({"name": name, "kind": kind, "parents": parents,
+                         "weights": weight_list,
                          "frames": len(derived), "seconds": len(derived) / 12.5})
 
     manifest_path = POOL_DIR.parent / "pool.json"
