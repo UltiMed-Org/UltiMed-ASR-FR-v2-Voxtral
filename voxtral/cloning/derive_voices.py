@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -69,7 +70,12 @@ VOICES_TOOL = Path(__file__).resolve().parent / "voices_tool.py"
 OUT_DIR = REPO_ROOT / "cache" / "cloning" / "A2" / "pt"
 # Stage A6's pool lives apart from A2's eight hand-picked variants so that
 # `clean` and the sweep can address one without touching the other.
-POOL_DIR = REPO_ROOT / "cache" / "cloning" / "A6" / "pt"
+# Where a minted pool lands: `cache/cloning/<CLONING_POOL>/pt` for the tensors and
+# `pool.json` beside it for the manifest. Selected by the same environment variable
+# sweep.py reads, so the script that WRITES a pool and the sweep that READS it cannot
+# disagree about which one is in play. Default A6 keeps the existing screen pool's path.
+POOL = os.environ.get("CLONING_POOL", "A6")
+POOL_DIR = REPO_ROOT / "cache" / "cloning" / POOL / "pt"
 # B1's output: the exact discrete codes behind each shipped prefix, [N, 37] int16.
 CODES_DIR = REPO_ROOT / "cache" / "cloning" / "codes"
 

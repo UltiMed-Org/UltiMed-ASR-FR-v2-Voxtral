@@ -44,6 +44,12 @@
 # Environment:
 #   RUN              which run directory under cache/cloning/ to work in (default A6).
 #                    Exported to the Python passes as CLONING_RUN.
+#   POOL             which directory under cache/cloning/ holds the pool.json naming the
+#                    voices to sweep (default A6). Exported as CLONING_POOL. A run reads
+#                    a pool, it does not own one, so two runs can share a pool and one
+#                    pool can be re-measured by several runs; what must NOT happen is a
+#                    bigger pool appearing under a finished run's feet, which is why this
+#                    is a knob and not the run directory.
 #   DEPTH            sentences per voice to reach this run (default 2), 0 = every
 #                    sentence in the run. Raising it and re-running deepens the sweep;
 #                    rows already done are skipped.
@@ -51,6 +57,10 @@
 #   INCLUDE_BASES    1 (default) sweeps the 20 shipped voices too, as controls
 #   TTS_CONCURRENCY  parallel speech requests (default 4; throughput saturates at 4-8)
 #   STT_CONCURRENCY  parallel transcriptions (default 6, one per whisper replica)
+#   STT_LANGUAGE     ISO language hint given to the ASR (default fr). It MUST match the
+#                    language of this run's sentences: whisper will happily transcribe
+#                    Italian audio under a French hint and score it as catastrophic WER,
+#                    which reads exactly like a degenerate take and is not one.
 #   STT_SCALE        whisper replicas to run (default 6)
 #   EULER_STEPS      ODE steps per frame, 0 = server default (quality/speed lever)
 #   MAX_ATTEMPTS     attempts allowed per take including the first (default 3). 1 turns
@@ -84,9 +94,11 @@ STAGE_DIR="${REPO_ROOT}/cache/cloning/${RUN}"
 STOP_FLAG="${STAGE_DIR}/STOP"
 
 DEPTH="${DEPTH:-2}"
+POOL="${POOL:-A6}"
 INCLUDE_BASES="${INCLUDE_BASES:-1}"
 TTS_CONCURRENCY="${TTS_CONCURRENCY:-4}"
 STT_CONCURRENCY="${STT_CONCURRENCY:-6}"
+STT_LANGUAGE="${STT_LANGUAGE:-fr}"
 STT_SCALE="${STT_SCALE:-6}"
 EULER_STEPS="${EULER_STEPS:-0}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
@@ -181,13 +193,13 @@ run_pass() {
     [[ "${INCLUDE_BASES}" == 1 ]] || common+=(--no-include-bases)
     case "${mode}" in
         tts)   common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}") ;;
-        stt)   common+=(--concurrency "${STT_CONCURRENCY}") ;;
+        stt)   common+=(--concurrency "${STT_CONCURRENCY}" --language "${STT_LANGUAGE}") ;;
         retry) common+=(--max-attempts "${MAX_ATTEMPTS}" --on "${RETRY_ON}") ;;
     esac
     runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" \
         PATH="${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         CRISPASR_API_KEY="${CRISPASR_API_KEY}" \
-        CLONING_RUN="${RUN}" \
+        CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
         nice -n 40 "${UV_BIN}" run "${HERE}/sweep.py" "${mode}" "${common[@]}" || rc=$?
     return "${rc}"
 }
@@ -207,7 +219,7 @@ if [[ ! -f "${STAGE_DIR}/sentences.json" ]]; then
     }
     echo "--- $(date '+%F %T') preparing the sentence list: sweep.py ${PREPARE}"
     # shellcheck disable=SC2086 # PREPARE carries its own arguments on purpose
-    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" \
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
         "${UV_BIN}" run "${HERE}/sweep.py" ${PREPARE}
 fi
 
@@ -259,7 +271,7 @@ done
 # The report is offline, so it costs nothing to leave one behind for whoever reads the
 # log in the morning.
 for summary in report stats; do
-    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" \
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
         "${UV_BIN}" run "${HERE}/sweep.py" "${summary}" || true
 done
 echo "=== $(date '+%F %T') driver done. Containers are still up; ${HERE}/stop_all.sh frees the GPU."

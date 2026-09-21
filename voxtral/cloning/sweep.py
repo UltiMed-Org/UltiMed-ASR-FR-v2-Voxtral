@@ -107,9 +107,14 @@ from wav_stats import median_f0, read_wav  # noqa: E402
 RUN = os.environ.get("CLONING_RUN", "A6")
 STAGE_DIR = REPO_ROOT / "cache" / "cloning" / RUN
 # The candidate pool is a property of the voices, not of a run: derive_voices.py mints it
-# once into the A6 directory, and every later run reads that same file rather than
-# carrying its own copy out of sync.
-POOL_PATH = REPO_ROOT / "cache" / "cloning" / "A6" / "pool.json"
+# once and every later run reads that same file rather than carrying its own copy out of
+# sync. Which pool, though, IS a choice, so `CLONING_POOL` names the directory holding it
+# (default A6, the 420-candidate screen pool that A6 and A7 were both measured against).
+# Without this knob a second, larger pool minted in place would silently hand every
+# finished run a set of voices it never benchmarked, and those runs would report
+# themselves unconverged forever.
+POOL = os.environ.get("CLONING_POOL", "A6")
+POOL_PATH = REPO_ROOT / "cache" / "cloning" / POOL / "pool.json"
 FLEURS_TSV = "https://huggingface.co/datasets/google/fleurs/resolve/main/data/{lang}/{split}.tsv"
 CORPUS = REPO_ROOT / "cache" / "cloning" / "corpus" / "fr.txt"
 # Touching this file asks a running pass to park at the next row boundary. stop_all.sh
