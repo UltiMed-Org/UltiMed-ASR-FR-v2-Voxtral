@@ -107,6 +107,14 @@ def fold_numbers(words: list[str]) -> list[str]:
     Applied to both sides of the comparison, so it does not matter which one spells them
     out; what matters is that both end up in the same form.
 
+    French-only, and deliberately left that way even now that the sweep reads eight
+    languages. The table is applied to reference and hypothesis alike, so on a non-French
+    corpus it can only ever fold both sides identically (Spanish "un libro" becomes
+    "1 libro" on both), which changes no error rate. It simply does no useful work there:
+    an Italian take that reads "sei" where the text says "6" is still charged for it. The
+    cost of that is a slightly pessimistic WER on number-heavy sentences outside French,
+    and the fix is a per-language table rather than anything structural here.
+
     Parameters
     ----------
     words : list[str]
@@ -132,14 +140,30 @@ def fold_numbers(words: list[str]) -> list[str]:
     return out
 
 
+# German is the one Latin language whose accent folding NFKD cannot do: U+00DF has no
+# decomposition, so it would be stripped as punctuation and turn "Straße" into two tokens
+# ("stra", "e"), charging every take for a letter the ASR spelled correctly. Mapped to the
+# conventional "ss" instead, on both sides, so the two agree either way it was written.
+_LETTER_SUBSTITUTIONS = {"\u00df": "ss"}
+
+
 def normalise(text: str) -> list[str]:
-    """Reduce a transcript to comparable words.
+    """Reduce a transcript to comparable words, in any script.
 
     Case, punctuation and accents all differ between what was asked for and what an ASR
     returns without either being an error, so they are removed. Spelled-out numbers are
     folded to digits on both sides: the reference avoids digits on purpose, but the ASR
     writes them anyway ("75" for "soixante-quinze"), and charging a take for that would
     invert the very thing the number-heavy text is there to measure.
+
+    **Accents are folded on Latin text only, and that restriction is load-bearing.** In
+    Latin script a combining mark is a diacritic an ASR may or may not emit; in Devanagari
+    the same Unicode category holds the vowel signs, which are not decoration but part of
+    the syllable, and in Arabic it holds harakat. Folding them globally deleted every
+    Hindi and Arabic word, and the ASCII allowlist that followed deleted whatever was
+    left, so both scripts normalised to the empty list and every take scored NaN. What
+    survives here is therefore "letters, marks and digits of any script", with diacritics
+    dropped only where the base character was ASCII.
 
     Parameters
     ----------
@@ -149,11 +173,24 @@ def normalise(text: str) -> list[str]:
     Returns
     -------
     list[str]
-        Lowercased, unaccented, punctuation-free words.
+        Lowercased, punctuation-free words, unaccented where the script is Latin.
     """
-    folded = unicodedata.normalize("NFKD", text.lower())
-    folded = "".join(c for c in folded if not unicodedata.combining(c))
-    return fold_numbers(re.sub(r"[^a-z0-9\s]", " ", folded).split())
+    lowered = "".join(_LETTER_SUBSTITUTIONS.get(character, character)
+                      for character in text.lower())
+    kept: list[str] = []
+    latin_base = False
+    for character in unicodedata.normalize("NFKD", lowered):
+        if unicodedata.combining(character):
+            # A diacritic on an ASCII base is decoration an ASR may drop; anywhere else it
+            # carries the sound, so it stays.
+            if not latin_base:
+                kept.append(character)
+            continue
+        latin_base = character.isascii()
+        # Letters (L*), marks (M*) and numbers (N*) are content in every script; the rest
+        # is punctuation, symbols and separators, and becomes a word break.
+        kept.append(character if unicodedata.category(character)[0] in "LMN" else " ")
+    return fold_numbers("".join(kept).split())
 
 
 def _levenshtein(reference: Sequence, hypothesis: Sequence) -> int:
