@@ -760,6 +760,50 @@ def voice_profiles(*, only: set[str] | None = None,
     return profiles
 
 
+def trimmed_median(values: list[float], *, factor: float, rounds: int = 8) -> float:
+    """Median of `values`, recomputed over the entries the previous estimate did not condemn.
+
+    The plain median poisons itself here. A voice's speaking rate is the reference the
+    runaway test measures against, and a runaway take contributes a very LOW words/second,
+    so once more than half of a voice's takes run away the median IS a runaway and the
+    voice's predicted duration becomes enormous. Measured on GRID_fr_fr,
+    `x_ptm_def_chf_esf_nef` has six of fourteen takes pinned at the 327.7 s ceiling and a
+    plain median rate of 0.24 words/s, which predicts 110 s for a 26-word sentence and so
+    declares the voice 86 pct healthy. Trimming lifts it to 0.67 words/s and the voice
+    reads as 50 pct junk, which is what it is.
+
+    A take is a runaway when `seconds >= factor * words / rate`, which rearranges to
+    `words / seconds <= rate / factor`, so the trim can be done in rate space without
+    carrying durations around. On voices that are not degenerate the first pass condemns
+    nothing and this returns the plain median unchanged: re-running the finished FLEURS
+    report over 12948 takes moves its runaway count by one take.
+
+    Parameters
+    ----------
+    values : list of float
+        Words per second, one entry per take.
+    factor : float
+        The runaway multiple, `RUNAWAY_FACTOR`.
+    rounds : int
+        Cap on refinement passes; convergence is typically two or three.
+
+    Returns
+    -------
+    float
+        The refined median, or the plain one when nothing is condemned.
+    """
+    rate = statistics.median(values)
+    for _ in range(rounds):
+        kept = [value for value in values if value > rate / factor]
+        if not kept or len(kept) == len(values):
+            break
+        refined = statistics.median(kept)
+        if refined == rate:
+            break
+        rate = refined
+    return rate
+
+
 def voice_rates(takes: list[dict], *, words_of) -> dict[str, float]:
     """Each voice's median speaking rate, in words per second.
 
@@ -779,7 +823,8 @@ def voice_rates(takes: list[dict], *, words_of) -> dict[str, float]:
     for take in takes:
         if take.get("seconds"):
             per.setdefault(take["voice"], []).append(words_of(take["sid"]) / take["seconds"])
-    return {voice: statistics.median(values) for voice, values in per.items()}
+    return {voice: trimmed_median(values, factor=RUNAWAY_FACTOR)
+            for voice, values in per.items()}
 
 
 @click.group()
