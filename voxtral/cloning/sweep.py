@@ -1358,7 +1358,7 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
 
     rows = []
     for voice, takes in scored.items():
-        shared = [takes[sid] for sid in common]
+        shared = [takes[sid] for sid in sorted(common)]
         cers = [record["cer"] for record in shared if "cer" in record]
         wers = [record["wer"] for record in shared]
         rows.append({"voice": voice,
