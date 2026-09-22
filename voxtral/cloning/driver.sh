@@ -71,8 +71,16 @@
 #   MIN_FREE_GB      refuse to start a pass with less than this free on the stage
 #                    filesystem (default 25). sweep.py parks at its own 20 GB floor
 #                    mid-pass; this is the earlier, friendlier refusal.
-#   MAX_ATTEMPTS     attempts allowed per take including the first (default 3). 1 turns
-#                    retrying off entirely.
+#   MAX_ATTEMPTS     attempts allowed per take including the first (default 5). 1 turns
+#                    retrying off entirely. A7 measured what the budget buys: of the
+#                    takes that started as a runaway, 63 pct were rescued by the first
+#                    retry and 12 pct more by the second, so a WER is recovered for
+#                    roughly three in four. The tail is why this is 5 and not 3, and
+#                    the junk gate below is what keeps that tail affordable.
+#   JUNK_THRESHOLD   abandon a voice once this fraction of its first attempts is junk
+#                    (default 0.25). 1.0 disables the gate.
+#   JUNK_AFTER       first-attempt takes a voice needs before it can be judged
+#                    (default 12, i.e. 12 of a 30-sentence language).
 #   RETRY_ON         comma-separated retry triggers (default "runaway"). Adding "wer"
 #                    turns the benchmark into best-of-N: see `sweep.py retry --help`
 #                    before you do, and read the results with `stats --attempt first`.
@@ -111,7 +119,9 @@ STT_SCALE="${STT_SCALE:-6}"
 EULER_STEPS="${EULER_STEPS:-0}"
 MAX_TOKENS="${MAX_TOKENS:-1125}"
 MIN_FREE_GB="${MIN_FREE_GB:-25}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-5}"
+JUNK_THRESHOLD="${JUNK_THRESHOLD:-0.25}"
+JUNK_AFTER="${JUNK_AFTER:-12}"
 RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
 
@@ -203,7 +213,9 @@ run_pass() {
     [[ "${INCLUDE_BASES}" == 1 ]] || common+=(--no-include-bases)
     case "${mode}" in
         tts)   common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}"
-                        --max-tokens "${MAX_TOKENS}") ;;
+                        --max-tokens "${MAX_TOKENS}"
+                        --junk-threshold "${JUNK_THRESHOLD}"
+                        --junk-after "${JUNK_AFTER}") ;;
         stt)   common+=(--concurrency "${STT_CONCURRENCY}" --language "${STT_LANGUAGE}") ;;
         retry) common+=(--max-attempts "${MAX_ATTEMPTS}" --on "${RETRY_ON}") ;;
     esac

@@ -83,6 +83,7 @@ import re
 import shutil
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -98,7 +99,7 @@ import tts  # noqa: E402 (needs REPO_ROOT on the path first)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voice_survey import character_error_rate, transcribe, word_error_rate  # noqa: E402
-from wav_stats import median_f0, read_wav  # noqa: E402
+from wav_stats import median_f0, read_wav, wav_seconds  # noqa: E402
 
 # A run is one (voice set, sentence set) pair with its own sentences, wavs, ledger and
 # reports: "A6" is the 420-candidate screen on 12 Wikipedia sentences, "FLEURS" is the
@@ -631,6 +632,142 @@ SERVER_DEFAULT_MAX_TOKENS = 4096
 TTS_MAX_TOKENS = 1125
 
 
+def is_junk(*, seconds: float, words: int, rate: float, max_tokens: int | None) -> bool:
+    """Whether a take is unusable, by the waveform alone.
+
+    Two ways to be unusable and they are not the same one. A **runaway** ran at least
+    `RUNAWAY_FACTOR` times longer than the voice's own rate predicts. A take **at its
+    token ceiling** never terminated and was cut off mid-word.
+
+    Before the sweep capped `max_new_tokens` the second was a subset of the first: at
+    327.7 s everything is a runaway. At the 90 s cap it is not, and that is the trap. A
+    voice whose honest rate is 0.7 words/s is predicted to need 39 s for a 26-word
+    sentence, so its runaway threshold is 117 s, past the cap: every one of its cut-off
+    takes would measure as healthy and the voice would look clean precisely because it is
+    so broken that it was capped. Hence the ceiling test stands on its own.
+
+    Parameters
+    ----------
+    seconds : float
+        Duration of the take.
+    words : int
+        Words in the reference sentence.
+    rate : float
+        The voice's own words per second, from `trimmed_median`.
+    max_tokens : int or None
+        The take's token budget; None means the server's default.
+
+    Returns
+    -------
+    bool
+        True when the take should not be scored as if it were speech.
+    """
+    if at_ceiling({"seconds": seconds, "max_tokens": max_tokens}):
+        return True
+    return stretch_of(seconds=seconds, words=words, rate=rate) >= RUNAWAY_FACTOR
+
+
+# When a voice has produced enough takes to judge, and how much junk condemns it. A
+# candidate that cannot read a sentence one time in four is not going into the catalogue,
+# so every further take of it, and every one of its retries, is spent on an answer already
+# known. Judging at 12 of 30 sentences is a deliberate trade: with 12 takes the 25 pct bar
+# is 3 of 12, which condemns a voice whose true junk rate is 10 pct about 11 pct of the
+# time. Losing a fair candidate out of 500 costs almost nothing (the catalogue needs tens,
+# not hundreds); spending five attempts each on a voice that was never viable costs hours.
+JUNK_THRESHOLD = 0.25
+JUNK_AFTER = 12
+
+
+class JunkWatch:
+    """Tracks each voice's junk rate during a tts pass and condemns the hopeless ones.
+
+    This is the only thing in the sweep that decides something mid-pass, so two properties
+    matter. It judges on **first attempts only**, because a retried take is a second draw
+    and counting it would let the retry budget flatter the very voices the gate exists to
+    catch. And it is seeded from the ledger, so a resumed run condemns a known-bad voice on
+    its first job rather than re-measuring twelve takes of it per restart.
+
+    The verdict is recorded per skipped row rather than held in memory, so the run stays
+    resumable and the report can say which voices were abandoned and on what evidence.
+
+    Parameters
+    ----------
+    words_of : callable
+        Maps a sid to the word count of its sentence.
+    threshold : float
+        Junk fraction at or above which a voice is condemned.
+    after : int
+        First-attempt takes required before any verdict is passed.
+    """
+
+    def __init__(self, *, words_of, threshold: float = JUNK_THRESHOLD,
+                 after: int = JUNK_AFTER) -> None:
+        self._words_of = words_of
+        self._threshold = threshold
+        self._after = after
+        self._takes: dict[str, list[tuple[int, float, int | None]]] = {}
+        self._verdicts: dict[str, str] = {}
+        # Four worker threads share this, and `d[k] = d.get(k) + 1` is not atomic.
+        self._lock = threading.Lock()
+
+    def seed(self, state: dict) -> int:
+        """Replay what the ledger already knows about first attempts.
+
+        Parameters
+        ----------
+        state : dict
+            `read_ledger()` output.
+
+        Returns
+        -------
+        int
+            Voices condemned on the strength of the existing ledger alone.
+        """
+        for (voice, sid), row in state.items():
+            if row.get("attempt", 0) or row.get("skipped"):
+                continue
+            seconds = row.get("seconds")
+            if not seconds and row.get("wav"):
+                # Takes synthesized before the tts pass recorded a duration: the header is
+                # on disk and costs microseconds, which beats guessing from the byte count.
+                path = REPO_ROOT / row["wav"]
+                seconds = wav_seconds(path) if path.is_file() else 0.0
+            if seconds:
+                self.observe(voice=voice, sid=sid, seconds=seconds,
+                             max_tokens=row.get("max_tokens"))
+        return len(self._verdicts)
+
+    def observe(self, *, voice: str, sid: str, seconds: float,
+                max_tokens: int | None) -> None:
+        """Record one first-attempt take and re-judge its voice."""
+        with self._lock:
+            takes = self._takes.setdefault(voice, [])
+            takes.append((self._words_of(sid), seconds, max_tokens))
+            if len(takes) < self._after:
+                return
+            # The rate has to be re-derived each time rather than cached: it is a trimmed
+            # median over this voice's own takes, so it moves as the sample grows, and a
+            # stale one would judge later takes against an earlier voice.
+            rate = trimmed_median([words / duration for words, duration, _ in takes
+                                   if duration > 0], factor=RUNAWAY_FACTOR)
+            bad = sum(1 for words, duration, budget in takes
+                      if is_junk(seconds=duration, words=words, rate=rate,
+                                 max_tokens=budget))
+            share = bad / len(takes)
+            if share >= self._threshold:
+                self._verdicts[voice] = f"{bad}/{len(takes)} junk ({100 * share:.0f} pct)"
+
+    def verdict(self, voice: str) -> str | None:
+        """Why this voice was condemned, or None while it is still in the running."""
+        with self._lock:
+            return self._verdicts.get(voice)
+
+    def condemned(self) -> dict[str, str]:
+        """Every verdict so far, voice to evidence."""
+        with self._lock:
+            return dict(self._verdicts)
+
+
 def at_ceiling(take: dict) -> bool:
     """Whether a take was cut off by the token budget rather than finishing.
 
@@ -776,7 +913,7 @@ def trimmed_median(values: list[float], *, factor: float, rounds: int = 8) -> fl
     `words / seconds <= rate / factor`, so the trim can be done in rate space without
     carrying durations around. On voices that are not degenerate the first pass condemns
     nothing and this returns the plain median unchanged: re-running the finished FLEURS
-    report over 12948 takes moves its runaway count by one take.
+    report over 12948 takes gives the same 37 runaways either way.
 
     Parameters
     ----------
@@ -989,12 +1126,17 @@ def cmd_fleurs(lang: str, split: str, limit: int, seed: int) -> None:
 @click.option("--euler-steps", default=0, show_default=True, help="Override the ODE step count (0 = server default).")
 @click.option("--max-tokens", default=TTS_MAX_TOKENS, show_default=True,
               help="Per-take token budget at 12.5 Hz, so 1125 = 90 s (0 = server default, 4096 = 327.7 s). Caps what a runaway costs.")
+@click.option("--junk-threshold", default=JUNK_THRESHOLD, show_default=True,
+              help="Abandon a voice once this fraction of its first attempts is junk (1.0 disables the gate).")
+@click.option("--junk-after", default=JUNK_AFTER, show_default=True,
+              help="First-attempt takes a voice needs before it can be judged.")
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Sweep the shipped voices too, as controls.")
 @click.option("--limit", default=0, show_default=True, help="Stop after N rows this pass (0 = all pending).")
 @click.option("--only-file", default=None, help="Restrict to the voices named in this file (one per line).")
 def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: int,
-            euler_steps: int, max_tokens: int, include_bases: bool, limit: int,
+            euler_steps: int, max_tokens: int, junk_threshold: float,
+            junk_after: int, include_bases: bool, limit: int,
             only_file: str | None) -> None:
     """Synthesize every pending row of the grid."""
     sentences = load_sentences()
@@ -1018,6 +1160,10 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         row = state.get((voice, sid), {})
         if "wer" in row:
             return True
+        # A row the junk gate abandoned is finished business, not pending work. Without
+        # this every pass would rediscover it, and the driver would never converge.
+        if row.get("skipped"):
+            return True
         return bool(row.get("wav")) and wav_for(voice, sid, row.get("attempt", 0)).is_file()
 
     pending = [(voice, sentence, state.get((voice, sentence["sid"]), {}).get("attempt", 0))
@@ -1030,13 +1176,31 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
     if limit:
         pending = pending[:limit]
 
+    words_of = {sentence["sid"]: len(sentence["text"].split())
+                for sentence in sentences}.get
+    watch = JunkWatch(words_of=lambda sid: words_of(sid, 0),
+                      threshold=junk_threshold, after=junk_after)
+    already = watch.seed(state)
+    if already:
+        logger.info(f"{already} voice(s) already over the {100 * junk_threshold:.0f} pct "
+                    "junk bar in the ledger; they will be skipped, not synthesized")
+
     endpoint = f"{url.rstrip('/')}/v1/audio/speech"
-    counters = {"ok": 0, "failed": 0, "seconds": 0.0}
+    counters = {"ok": 0, "failed": 0, "skipped": 0, "seconds": 0.0}
     started = time.monotonic()
 
     def run(job: tuple[str, dict, int]) -> None:
         voice, sentence, attempt = job
         sid = sentence["sid"]
+        # Checked here rather than when `pending` was built, because the verdict is
+        # reached during this very pass: the grid is walked sentence-major, so a voice
+        # crosses the junk bar partway through and every later row of it is skipped.
+        condemned = watch.verdict(voice)
+        if condemned is not None:
+            counters["skipped"] += 1
+            append_ledger({"voice": voice, "sid": sid, "attempt": attempt,
+                           "skipped": condemned})
+            return
         # Same seed for every voice reading this sentence: the take then differs only by
         # the prefix, which is what makes cross-voice comparison (and a later speaker
         # embedding distance) mean anything. A retry moves the seed by a fixed stride, so
@@ -1069,16 +1233,30 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         destination.write_bytes(payload)
         counters["ok"] += 1
         counters["seconds"] += elapsed
+        # Duration is recorded at synthesis rather than waiting for the stt pass, because
+        # the junk gate has to act now and the whole point of the runaway measure is that
+        # it needs no ASR. The stt pass writes the same number again later; they agree.
+        budget = max_tokens or SERVER_DEFAULT_MAX_TOKENS
+        audio_seconds = wav_seconds(payload)
         append_ledger({"voice": voice, "sid": sid, "attempt": attempt, "noise_seed": seed,
                        "wav": str(destination.relative_to(REPO_ROOT)),
                        "bytes": len(payload), "request_seconds": round(elapsed, 2),
-                       "max_tokens": max_tokens or SERVER_DEFAULT_MAX_TOKENS})
+                       "seconds": round(audio_seconds, 2), "max_tokens": budget})
+        if attempt == 0:
+            watch.observe(voice=voice, sid=sid, seconds=audio_seconds, max_tokens=budget)
 
     stopped = run_pool(jobs=pending, work=run, concurrency=concurrency,
                        chunk=concurrency * 4, desc=f"tts {RUN}")
     per_call = counters["seconds"] / max(counters["ok"], 1)
     logger.info(f"tts pass: {counters['ok']} ok, {counters['failed']} failed, "
-                f"{per_call:.1f}s per call, {(time.monotonic() - started) / 60:.1f} min")
+                f"{counters['skipped']} skipped as junk, {per_call:.1f}s per call, "
+                f"{(time.monotonic() - started) / 60:.1f} min")
+    condemned = watch.condemned()
+    if condemned:
+        logger.warning(f"{len(condemned)} voice(s) abandoned at the "
+                       f"{100 * junk_threshold:.0f} pct junk bar:")
+        for voice, evidence in sorted(condemned.items()):
+            logger.warning(f"  {voice}: {evidence}")
     if stopped:
         logger.warning("STOP flag seen, parking")
         sys.exit(20)
@@ -1246,9 +1424,19 @@ def cmd_retry(depth: int, max_attempts: int, runaway_factor: float, triggers: st
         sys.exit(11)
     rates = voice_rates([take for take in scored if take.get("seconds")], words_of=words_of)
 
+    # Voices the tts pass abandoned at the junk bar. Their finished takes stay in the
+    # ledger and still get scored, because the junk rate is a result worth reporting, but
+    # retrying them is the one thing the gate exists to prevent: a voice that fails one
+    # take in four would otherwise absorb the whole retry budget on every one of them.
+    abandoned = {voice for (voice, _), record in state.items() if record.get("skipped")}
+    if abandoned:
+        logger.info(f"{len(abandoned)} abandoned voice(s) excluded from retries")
+
     broken: list[tuple[str, str, int, str]] = []
     exhausted = 0
     for take in scored:
+        if take["voice"] in abandoned:
+            continue
         attempt = take.get("attempt", 0)
         reasons = []
         seconds = take.get("seconds") or 0.0

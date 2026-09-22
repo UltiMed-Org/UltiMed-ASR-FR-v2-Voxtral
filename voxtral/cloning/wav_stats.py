@@ -31,6 +31,7 @@ Usage
 from __future__ import annotations
 
 import array
+import io
 import statistics
 import wave
 from pathlib import Path
@@ -50,6 +51,35 @@ SILENCE_ENERGY = 1e6
 VOICING_THRESHOLD = 0.3
 
 _WIDTH_TO_TYPECODE = {1: "b", 2: "h", 4: "i"}
+
+
+def wav_seconds(source: Path | bytes) -> float:
+    """Duration of a PCM wav, from its header alone.
+
+    `read_wav` decodes every sample, which is far too much work when the only question is
+    how long a take ran; the sweep asks that of every take it synthesizes, in flight, to
+    decide whether a voice is degenerating. Reading the header answers it in microseconds,
+    and accepting raw bytes means the freshly received response never has to be read back
+    off the disk.
+
+    Parameters
+    ----------
+    source : Path or bytes
+        A PCM wav, either on disk or still in memory.
+
+    Returns
+    -------
+    float
+        Seconds of audio, 0.0 when the header cannot be parsed (a truncated or empty
+        response, which the caller treats as a failed take rather than a crash).
+    """
+    handle = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else str(source)
+    try:
+        with wave.open(handle) as reader:
+            rate = reader.getframerate()
+            return reader.getnframes() / rate if rate else 0.0
+    except (wave.Error, EOFError):
+        return 0.0
 
 
 def read_wav(path: Path) -> tuple[list[int], int]:
