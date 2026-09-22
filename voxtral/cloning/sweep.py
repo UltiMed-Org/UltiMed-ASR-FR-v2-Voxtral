@@ -80,6 +80,7 @@ import json
 import os
 import random
 import re
+import shutil
 import statistics
 import sys
 import time
@@ -140,6 +141,29 @@ def stop_requested() -> bool:
         True when a pass should park.
     """
     return STOP_FLAG.exists()
+
+
+# How little free space on the stage filesystem is too little to keep synthesizing. A full
+# FLEURS-sized language is about 15 GB of wav, and the failure mode without this check is
+# ugly: `write_bytes` raises ENOSPC halfway through a take, leaving a truncated wav with no
+# ledger record (so it is re-synthesized, fine) but also stopping `append_ledger` from
+# recording the takes that DID succeed, and every other process sharing the filesystem
+# starts failing at the same moment. Parking with 20 GB still free costs one restart and
+# keeps the run resumable, which is the whole point of the ledger.
+MIN_FREE_BYTES = 20 * 1024 ** 3
+
+
+def space_exhausted() -> int:
+    """Free bytes on the stage filesystem, or 0 when there is still room.
+
+    Returns
+    -------
+    int
+        The free byte count when it has fallen below `MIN_FREE_BYTES`, else 0. Returning
+        the number rather than a bool lets the caller say how bad it is.
+    """
+    free = shutil.disk_usage(STAGE_DIR).free
+    return free if free < MIN_FREE_BYTES else 0
 
 
 def load_sentences() -> list[dict]:
@@ -409,6 +433,17 @@ def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str) -> bo
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             for start in range(0, len(jobs), chunk):
                 if stop_requested():
+                    stopped = True
+                    break
+                # Checked per chunk rather than per take: one chunk of wav cannot cross
+                # a 20 GB margin, and this way the cost is one statvfs per few dozen
+                # takes instead of one per take.
+                free = space_exhausted()
+                if free:
+                    logger.error(f"only {free / 1024 ** 3:.1f} GB free on {STAGE_DIR}, "
+                                 f"below the {MIN_FREE_BYTES / 1024 ** 3:.0f} GB floor: "
+                                 "parking before a write fails mid-take. Free space or "
+                                 "move the run, then restart; the ledger resumes it.")
                     stopped = True
                     break
                 for _ in pool.map(work, jobs[start:start + chunk]):

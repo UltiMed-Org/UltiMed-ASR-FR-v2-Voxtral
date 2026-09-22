@@ -68,6 +68,9 @@
 #                    away whatever its length, so this only decides how much GPU and
 #                    disk it wastes on the way: measured on GRID_fr_fr, capping at 90 s
 #                    truncates 3.5 pct of takes and saves 22.8 pct of both.
+#   MIN_FREE_GB      refuse to start a pass with less than this free on the stage
+#                    filesystem (default 25). sweep.py parks at its own 20 GB floor
+#                    mid-pass; this is the earlier, friendlier refusal.
 #   MAX_ATTEMPTS     attempts allowed per take including the first (default 3). 1 turns
 #                    retrying off entirely.
 #   RETRY_ON         comma-separated retry triggers (default "runaway"). Adding "wer"
@@ -107,6 +110,7 @@ STT_LANGUAGE="${STT_LANGUAGE:-fr}"
 STT_SCALE="${STT_SCALE:-6}"
 EULER_STEPS="${EULER_STEPS:-0}"
 MAX_TOKENS="${MAX_TOKENS:-1125}"
+MIN_FREE_GB="${MIN_FREE_GB:-25}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
@@ -210,6 +214,20 @@ run_pass() {
         nice -n 40 "${UV_BIN}" run "${HERE}/sweep.py" "${mode}" "${common[@]}" || rc=$?
     return "${rc}"
 }
+
+# Fail before the GPU is warmed rather than hours in. A language is about 15 GB of wav and
+# ENOSPC mid-pass is the worst shape of failure available here: a truncated wav on disk, no
+# ledger record for the takes that did land, and every other writer on the filesystem
+# breaking at the same instant. sweep.py has its own floor for the case where the space
+# runs out during a pass; this one just means nobody waits for that to happen.
+mkdir -p "${STAGE_DIR}"
+free_gb="$(df -BG --output=avail "${STAGE_DIR}" | tail -1 | tr -dc '0-9')"
+if (( free_gb < MIN_FREE_GB )); then
+    echo "driver: only ${free_gb} GB free on ${STAGE_DIR}, need ${MIN_FREE_GB}. Free space," \
+         "move the run, or lower MIN_FREE_GB if you know better." >&2
+    exit 1
+fi
+echo "=== $(date '+%F %T') ${free_gb} GB free on the stage filesystem"
 
 DEPTH_LABEL="${DEPTH}"
 [[ "${DEPTH}" -le 0 ]] && DEPTH_LABEL="all"
