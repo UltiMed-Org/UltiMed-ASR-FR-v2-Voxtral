@@ -578,6 +578,50 @@ def speaker_components(*, names: list[str], similarity: "np.ndarray",
 
 RUNAWAY_FACTOR = 3.0
 
+# Stage 0 emits one audio frame per decode step at 12.5 Hz, so a token budget IS a
+# duration: tokens / FRAME_RATE_HZ = seconds. The server's packaged budget is 4096 tokens
+# (327.68 s), which is what a take that never terminates costs in full.
+FRAME_RATE_HZ = 12.5
+SERVER_DEFAULT_MAX_TOKENS = 4096
+
+# What the sweep asks for instead, and why it is far below the server's budget. A take is
+# a runaway when it lasts RUNAWAY_FACTOR x what the voice's own speaking rate predicts,
+# and it is then discarded whatever its length, so every second generated past that
+# threshold is pure waste. Measured on the first 6610 takes of GRID_fr_fr: the longest
+# honest sentence (41 words) has a median duration of 21.8 s across 500 voices, so the
+# runaway threshold tops out near 66 s; 3.5 pct of takes ran past 90 s and those alone
+# burned 22.8 pct of the GPU time and the disk. 1125 tokens is 90 s: comfortably above
+# every honest take, comfortably above the threshold that condemns a take anyway, and a
+# 3.6x cheaper way to find out that a voice has lost the plot.
+TTS_MAX_TOKENS = 1125
+
+
+def at_ceiling(take: dict) -> bool:
+    """Whether a take was cut off by the token budget rather than finishing.
+
+    The budget is per take and recorded in the ledger, because a run spans regimes: the
+    takes synthesized before `--max-tokens` existed ran to the server's 4096 and a take at
+    327 s is a genuine ceiling hit for them, while a later take pinned at 90 s is the same
+    failure under the smaller budget. Comparing every take against one hardcoded 327.0
+    would silently reclassify both halves.
+
+    Parameters
+    ----------
+    take : dict
+        A merged ledger row; needs `seconds`, and reads `max_tokens` when present.
+
+    Returns
+    -------
+    bool
+        True when the take's duration sits at its own budget.
+    """
+    seconds = take.get("seconds") or 0.0
+    budget = take.get("max_tokens") or SERVER_DEFAULT_MAX_TOKENS
+    # 1 pct of slack: the decoder overshoots its frame count slightly (takes land at
+    # 329.3 s against a 327.68 s budget), and a take that stopped on its own never lands
+    # within a percent of the budget by accident.
+    return seconds >= 0.99 * budget / FRAME_RATE_HZ
+
 
 ATTEMPT_CHOICES = ("first", "last", "best")
 
@@ -863,12 +907,15 @@ def cmd_fleurs(lang: str, split: str, limit: int, seed: int) -> None:
 @click.option("--noise-seed", default=7, show_default=True,
               help="Base noise seed; sentence index is added so takes stay comparable across voices.")
 @click.option("--euler-steps", default=0, show_default=True, help="Override the ODE step count (0 = server default).")
+@click.option("--max-tokens", default=TTS_MAX_TOKENS, show_default=True,
+              help="Per-take token budget at 12.5 Hz, so 1125 = 90 s (0 = server default, 4096 = 327.7 s). Caps what a runaway costs.")
 @click.option("--include-bases/--no-include-bases", default=True, show_default=True,
               help="Sweep the shipped voices too, as controls.")
 @click.option("--limit", default=0, show_default=True, help="Stop after N rows this pass (0 = all pending).")
 @click.option("--only-file", default=None, help="Restrict to the voices named in this file (one per line).")
 def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: int,
-            euler_steps: int, include_bases: bool, limit: int, only_file: str | None) -> None:
+            euler_steps: int, max_tokens: int, include_bases: bool, limit: int,
+            only_file: str | None) -> None:
     """Synthesize every pending row of the grid."""
     sentences = load_sentences()
     voices = restrict(load_voices(include_bases=include_bases), only_file)
@@ -923,7 +970,8 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         # `raw` variant.
         body = tts.build_speech_body(text=sentence["text"], response_format="wav", speed=1.0,
                                      voice=voice, noise_seed=seed, raw_spaces=True,
-                                     euler_steps=euler_steps or None)
+                                     euler_steps=euler_steps or None,
+                                     max_new_tokens=max_tokens or None)
         try:
             status, payload, _, elapsed = tts._post_json(endpoint, body, timeout)
         except OSError as error:
@@ -943,7 +991,8 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         counters["seconds"] += elapsed
         append_ledger({"voice": voice, "sid": sid, "attempt": attempt, "noise_seed": seed,
                        "wav": str(destination.relative_to(REPO_ROOT)),
-                       "bytes": len(payload), "request_seconds": round(elapsed, 2)})
+                       "bytes": len(payload), "request_seconds": round(elapsed, 2),
+                       "max_tokens": max_tokens or SERVER_DEFAULT_MAX_TOKENS})
 
     stopped = run_pool(jobs=pending, work=run, concurrency=concurrency,
                        chunk=concurrency * 4, desc=f"tts {RUN}")
@@ -1127,8 +1176,8 @@ def cmd_retry(depth: int, max_attempts: int, runaway_factor: float, triggers: st
             if stretch_of(seconds=seconds, words=words_of(take["sid"]),
                           rate=rates[take["voice"]]) >= runaway_factor:
                 reasons.append("runaway")
-        # 4096 tokens at 12.5 Hz: generation that never terminated and was cut off.
-        if "ceiling" in wanted_triggers and seconds >= 327.0:
+        # Generation that never terminated and was cut off by its token budget.
+        if "ceiling" in wanted_triggers and at_ceiling(take):
             reasons.append("ceiling")
         if "empty" in wanted_triggers and take.get("stt_error"):
             reasons.append("empty")
@@ -1567,8 +1616,8 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
         take["stretch"] = stretch_of(seconds=take["seconds"], words=words_of(take["sid"]),
                                      rate=rates[take["voice"]])
     runaways = [take for take in takes if take["stretch"] >= runaway_factor]
-    # 4096 tokens at 12.5 Hz. A take at the cap did not finish, it was cut off.
-    ceiling = [take for take in takes if take["seconds"] >= 327.0]
+    # A take at its token budget did not finish, it was cut off.
+    ceiling = [take for take in takes if at_ceiling(take)]
 
     lines = [f"# {RUN}: failure modes", "",
              f"{len(takes)} scored takes over {len({t['sid'] for t in takes})} sentences "
@@ -1580,8 +1629,10 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
              f"meaning the audio ran at least {runaway_factor:g}x longer than that voice's own "
              "median speaking rate predicts. This is measured from the waveform, not from the "
              "transcript, so it does not depend on the ASR being right.",
-             f"- **{len(ceiling)} takes pinned at the 327.7 s token ceiling**, which is "
-             "generation that never terminated and was cut off mid-word.", ""]
+             f"- **{len(ceiling)} takes pinned at their token ceiling** "
+             f"({', '.join(f'{budget / FRAME_RATE_HZ:.1f} s' for budget in sorted({take.get('max_tokens') or SERVER_DEFAULT_MAX_TOKENS for take in ceiling}))} "
+             "in this run), which is generation that never terminated and was cut off "
+             "mid-word.", ""]
 
     # Per-sentence first: if the hard sentences are the same ones for everybody, the
     # problem is the corpus and no amount of choosing between voices fixes it.
@@ -1743,7 +1794,7 @@ def cmd_diagnose(out: str | None, only_file: str | None, include_bases: bool,
         wers = [take["wer"] for take in group]
         lines.append(f"| `{voice}` | {len(group)} | "
                      f"{sum(1 for t in group if t['stretch'] >= runaway_factor)} | "
-                     f"{sum(1 for t in group if t['seconds'] >= 327.0)} | "
+                     f"{sum(1 for t in group if at_ceiling(t))} | "
                      f"{100 * statistics.median(wers):.1f}% | {100 * statistics.fmean(wers):.1f}% | "
                      f"{rates[voice]:.2f} |")
 
@@ -1995,7 +2046,7 @@ def cmd_probe(from_run: str, worst: int, require: str, voices: int) -> None:
             continue
         if "wer" in record and record["sid"] in by_sid:
             per_sid.setdefault(record["sid"], []).append(record["wer"])
-        if record.get("seconds", 0) >= 327.0:
+        if at_ceiling(record):
             ceiling[record["voice"]] = ceiling.get(record["voice"], 0) + 1
     if not per_sid:
         raise SystemExit(f"no scores in {source}/ledger.jsonl")

@@ -63,6 +63,11 @@
 #                    which reads exactly like a degenerate take and is not one.
 #   STT_SCALE        whisper replicas to run (default 6)
 #   EULER_STEPS      ODE steps per frame, 0 = server default (quality/speed lever)
+#   MAX_TOKENS       per-take token budget at 12.5 Hz, so 1125 (the default) is 90 s and
+#                    0 means the server's own 4096 = 327.7 s. A runaway take is thrown
+#                    away whatever its length, so this only decides how much GPU and
+#                    disk it wastes on the way: measured on GRID_fr_fr, capping at 90 s
+#                    truncates 3.5 pct of takes and saves 22.8 pct of both.
 #   MAX_ATTEMPTS     attempts allowed per take including the first (default 3). 1 turns
 #                    retrying off entirely.
 #   RETRY_ON         comma-separated retry triggers (default "runaway"). Adding "wer"
@@ -101,6 +106,7 @@ STT_CONCURRENCY="${STT_CONCURRENCY:-6}"
 STT_LANGUAGE="${STT_LANGUAGE:-fr}"
 STT_SCALE="${STT_SCALE:-6}"
 EULER_STEPS="${EULER_STEPS:-0}"
+MAX_TOKENS="${MAX_TOKENS:-1125}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
@@ -192,7 +198,8 @@ run_pass() {
     [[ -n "${ONLY_FILE:-}" ]] && common+=(--only-file "${ONLY_FILE}")
     [[ "${INCLUDE_BASES}" == 1 ]] || common+=(--no-include-bases)
     case "${mode}" in
-        tts)   common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}") ;;
+        tts)   common+=(--concurrency "${TTS_CONCURRENCY}" --euler-steps "${EULER_STEPS}"
+                        --max-tokens "${MAX_TOKENS}") ;;
         stt)   common+=(--concurrency "${STT_CONCURRENCY}" --language "${STT_LANGUAGE}") ;;
         retry) common+=(--max-attempts "${MAX_ATTEMPTS}" --on "${RETRY_ON}") ;;
     esac
