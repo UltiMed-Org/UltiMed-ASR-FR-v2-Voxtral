@@ -270,6 +270,74 @@ def ledger_path() -> Path:
     return STAGE_DIR / "ledger.jsonl"
 
 
+# The other runs this one is part of, named by grid.sh so a single language's process can
+# draw a bar for the whole sweep. Empty for a standalone run (A6, FLEURS), which then
+# behaves exactly as before and shows one bar.
+GRID_RUNS = tuple(name for name in os.environ.get("CLONING_GRID_RUNS", "").split() if name)
+
+
+def rows_finished_in(run: str) -> int:
+    """How many rows of another run are done, synthesized or abandoned.
+
+    Reads that run's ledger directly rather than going through `read_ledger`, which is
+    bound to this process's own `STAGE_DIR`. Called once per pass, so parsing a few
+    hundred thousand lines is paid once against hours of GPU.
+
+    Parameters
+    ----------
+    run : str
+        A run directory name under `cache/cloning`, e.g. `GRID_de_de`.
+
+    Returns
+    -------
+    int
+        Distinct `(voice, sid)` rows that will not need synthesizing again. 0 when that
+        run has not started.
+    """
+    path = REPO_ROOT / "cache" / "cloning" / run / "ledger.jsonl"
+    if not path.is_file():
+        return 0
+    done: set[tuple[str, str]] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("wav") or record.get("skipped"):
+                done.add((record.get("voice"), record.get("sid")))
+    return len(done)
+
+
+def grid_bar(*, rows_here: int, pending_here: int):
+    """A second progress bar spanning every language, or None when there is only one run.
+
+    The sweep runs one language per process, so no process can see the whole grid without
+    being told what it belongs to. `CLONING_GRID_RUNS` is that telling. Every language
+    draws the same voices from the same pool and reads the same number of sentences, so
+    the grid's size is this run's size times the number of runs; if that ever stops being
+    true the total is wrong and the per-pass bar is still right.
+
+    Parameters
+    ----------
+    rows_here : int
+        Rows in this language's grid.
+    pending_here : int
+        Rows of it still to do, so the rest count as already finished.
+
+    Returns
+    -------
+    tqdm or None
+        A bar positioned under the per-pass one, already advanced to the work behind it.
+    """
+    if len(GRID_RUNS) < 2:
+        return None
+    done = sum(rows_finished_in(run) for run in GRID_RUNS if run != RUN)
+    done += rows_here - pending_here
+    return tqdm(total=rows_here * len(GRID_RUNS), initial=done, position=1, leave=True,
+                desc=f"grid, {len(GRID_RUNS)} languages", unit="take", smoothing=0.02)
+
+
 def iter_ledger():
     """Yield every well-formed record in the ledger, oldest first.
 
@@ -399,7 +467,8 @@ def grid(*, voices: list[str], sentences: list[dict], depth: int) -> list[tuple[
     return [(voice, sentence) for sentence in at_depth(sentences, depth) for voice in voices]
 
 
-def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str) -> bool:
+def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str,
+             overall=None) -> bool:
     """Run `work` over `jobs` in a thread pool, with a progress bar and STOP handling.
 
     Chunked submission rather than one map over everything is the only way a thread pool
@@ -421,6 +490,9 @@ def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str) -> bo
         sooner: a few multiples of the concurrency is the useful range.
     desc : str
         Progress bar label.
+    overall : tqdm or None
+        A second bar advanced in step with the first, for progress across every language
+        rather than this one. None draws a single bar.
 
     Returns
     -------
@@ -449,6 +521,8 @@ def run_pool(*, jobs: list, work, concurrency: int, chunk: int, desc: str) -> bo
                     break
                 for _ in pool.map(work, jobs[start:start + chunk]):
                     bar.update(1)
+                    if overall is not None:
+                        overall.update(1)
     return stopped
 
 
@@ -1245,8 +1319,15 @@ def cmd_tts(depth: int, url: str, concurrency: int, timeout: float, noise_seed: 
         if attempt == 0:
             watch.observe(voice=voice, sid=sid, seconds=audio_seconds, max_tokens=budget)
 
-    stopped = run_pool(jobs=pending, work=run, concurrency=concurrency,
-                       chunk=concurrency * 4, desc=f"tts {RUN}")
+    # The cross-language bar rides the tts pass only: synthesis is what turns a pending
+    # row into a finished one, and it is where nearly all the GPU time goes.
+    overall = grid_bar(rows_here=len(rows), pending_here=len(pending))
+    try:
+        stopped = run_pool(jobs=pending, work=run, concurrency=concurrency,
+                           chunk=concurrency * 4, desc=f"tts {RUN}", overall=overall)
+    finally:
+        if overall is not None:
+            overall.close()
     per_call = counters["seconds"] / max(counters["ok"], 1)
     logger.info(f"tts pass: {counters['ok']} ok, {counters['failed']} failed, "
                 f"{counters['skipped']} skipped as junk, {per_call:.1f}s per call, "

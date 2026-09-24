@@ -56,6 +56,13 @@ REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 # ar and hi have no European-ASR coverage; see the header.
 LANGS="${LANGS:-fr_fr:fr de_de:de es_419:es it_it:it nl_nl:nl pt_br:pt ar_eg:ar hi_in:hi}"
 LIMIT="${LIMIT:-30}"
+
+# Every run name the sweep is part of, so a single language's sweep.py can draw a second
+# progress bar for the whole grid instead of only its own language. Derived from LANGS so
+# the two can never disagree; a language dropped from LANGS disappears from the bar too.
+CLONING_GRID_RUNS=""
+for _pair in ${LANGS}; do CLONING_GRID_RUNS="${CLONING_GRID_RUNS} GRID_${_pair%%:*}"; done
+export CLONING_GRID_RUNS="${CLONING_GRID_RUNS# }"
 POOL="${POOL:-GRID}"
 
 POOL_MANIFEST="${REPO_ROOT}/cache/cloning/${POOL}/pool.json"

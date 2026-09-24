@@ -81,6 +81,9 @@
 #                    (default 0.25). 1.0 disables the gate.
 #   JUNK_AFTER       first-attempt takes a voice needs before it can be judged
 #                    (default 12, i.e. 12 of a 30-sentence language).
+#   CLONING_GRID_RUNS  space-separated run names this sweep belongs to, set by grid.sh.
+#                    Only effect: sweep.py draws a second progress bar covering every
+#                    language. Unset (a standalone run) draws the usual single bar.
 #   RETRY_ON         comma-separated retry triggers (default "runaway"). Adding "wer"
 #                    turns the benchmark into best-of-N: see `sweep.py retry --help`
 #                    before you do, and read the results with `stats --attempt first`.
@@ -222,7 +225,7 @@ run_pass() {
     runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" \
         PATH="${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         CRISPASR_API_KEY="${CRISPASR_API_KEY}" \
-        CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
+        CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" CLONING_GRID_RUNS="${CLONING_GRID_RUNS:-}" \
         nice -n 40 "${UV_BIN}" run "${HERE}/sweep.py" "${mode}" "${common[@]}" || rc=$?
     return "${rc}"
 }
@@ -256,7 +259,7 @@ if [[ ! -f "${STAGE_DIR}/sentences.json" ]]; then
     }
     echo "--- $(date '+%F %T') preparing the sentence list: sweep.py ${PREPARE}"
     # shellcheck disable=SC2086 # PREPARE carries its own arguments on purpose
-    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" CLONING_GRID_RUNS="${CLONING_GRID_RUNS:-}" \
         "${UV_BIN}" run "${HERE}/sweep.py" ${PREPARE}
 fi
 
@@ -308,7 +311,7 @@ done
 # The report is offline, so it costs nothing to leave one behind for whoever reads the
 # log in the morning.
 for summary in report stats; do
-    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" \
+    runuser -u "${TARGET_USER}" -- env HOME="${TARGET_HOME}" CLONING_RUN="${RUN}" CLONING_POOL="${POOL}" CLONING_GRID_RUNS="${CLONING_GRID_RUNS:-}" \
         "${UV_BIN}" run "${HERE}/sweep.py" "${summary}" || true
 done
 echo "=== $(date '+%F %T') driver done. Containers are still up; ${HERE}/stop_all.sh frees the GPU."
