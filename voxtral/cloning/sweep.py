@@ -1285,6 +1285,11 @@ def cmd_stt(depth: int, url: str, api_key: str | None, model: str | None, langua
     for voice, sentence in grid(voices=voices, sentences=sentences, depth=depth):
         sid = sentence["sid"]
         row = state.get((voice, sid), {})
+        # A row the junk gate abandoned will never have a wav, so counting it as "not
+        # synthesized yet" makes the driver believe the run is unfinished forever and end
+        # every language on "both passes ran dry without converging".
+        if row.get("skipped"):
+            continue
         if not (row.get("wav") and wav_for(voice, sid, row.get("attempt", 0)).is_file()):
             missing += 1
             continue
@@ -1657,8 +1662,21 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
     # The common set is what makes the table a comparison rather than a list. It is
     # recomputed here rather than assumed, because a benchmark is normally read while it
     # is still running and the voices are never exactly level.
-    common = set.intersection(*(set(rows) for rows in scored.values()))
+    #
+    # Voices the junk gate abandoned are deliberately excluded from the intersection. They
+    # stop partway through by design, so leaving them in punishes every other voice for
+    # their absence: on GRID_fr_fr, 23 abandoned voices held 14 sentences between them and
+    # dragged the comparison for the 477 that finished all 30 down to those same 14, which
+    # is less than half the evidence for no reason. They are still reported, still counted
+    # in the junk rate, and still marked as short by `ragged` below.
+    abandoned = {voice for (voice, _), record in read_ledger().items()
+                 if record.get("skipped")}
+    levelling = {voice: rows for voice, rows in scored.items() if voice not in abandoned}
+    common = set.intersection(*(set(rows) for rows in (levelling or scored).values()))
     ragged = {voice: len(rows) for voice, rows in scored.items() if len(rows) != len(common)}
+    if abandoned:
+        logger.info(f"{len(abandoned)} abandoned voice(s) left out of the common set; "
+                    f"it is {len(common)} sentences over the {len(levelling)} that finished")
 
     csv_path = Path(csv_out) if csv_out else STAGE_DIR / "per_sentence.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
@@ -1675,7 +1693,7 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
 
     rows = []
     for voice, takes in scored.items():
-        shared = [takes[sid] for sid in sorted(common)]
+        shared = [takes[sid] for sid in sorted(common) if sid in takes]
         cers = [record["cer"] for record in shared if "cer" in record]
         wers = [record["wer"] for record in shared]
         rows.append({"voice": voice,
@@ -1745,7 +1763,8 @@ def cmd_stats(out: str | None, csv_out: str | None, include_bases: bool,
                 if longest[0] > 30 else ""), ""]
     if ragged:
         lines += [f"Note: {len(ragged)} voice(s) have a different number of takes than the "
-                  f"common set and were trimmed to it for this table, e.g. "
+                  f"common set ({len(abandoned)} of them abandoned at the junk bar, which "
+                  f"is why they are short) and were trimmed to it for this table, e.g. "
                   + ", ".join(f"`{voice}` ({count})" for voice, count in
                               sorted(ragged.items())[:4]) + ".", ""]
     lines += ["## Word error rate", ""] + table("wer")
