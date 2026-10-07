@@ -19,6 +19,8 @@ roster rather than two files disagreeing about what a roster is.
 It works in a throwaway directory and needs no server, GPU or sweep data, but when a real
 roster exists for `CLONING_RUN` it holds that one to the same contract.
 """
+import collections
+import json
 import os
 import shutil
 import sys
@@ -120,5 +122,41 @@ assert first[("b", "f1")].name == "b1.wav", first[("b", "f1")]
 assert len(first) == 2, first
 shutil.rmtree(led, ignore_errors=True)
 print("5. first attempt by value, both conventions OK")
+
+# 6. The alternates roster is read by the same parser and really excludes what was already
+# auditioned. Two defaults were wrong on the first cut and both failed silently, by offering
+# a voice that had in fact been heard rather than by raising: it defaulted `--heard` to
+# keepers.txt (which omits the 20 shipped voices the first tree also contained, so every
+# shipped voice came back as "unheard"), and it offered sparse mixes, the one kind whose WER
+# gate does not predict how it is received. An over-offering roster wastes a listening
+# session, which is the scarce resource here, so pin both.
+import subprocess
+
+run = os.environ.get("CLONING_RUN")
+stage = REPO / "cache" / "cloning" / (run or "_unset")
+if run and (stage / "keepers_and_bases.txt").is_file() and (stage / "embeddings.npz").is_file():
+    dest = REPO / "cache" / "cloning" / "ZZALT.txt"
+    subprocess.run(
+        ["uv", "run", str(REPO / "voxtral" / "cloning" / "voice_distance.py"), "alternates",
+         "--per-identity", "2", "--out", str(dest)],
+        cwd=REPO, check=True, capture_output=True,
+    )
+    rows = audition.read_voice_list(dest)
+    alts = [voice for _, _, voice in rows]
+    heard = set((stage / "keepers_and_bases.txt").read_text().split())
+    pool = {entry["name"]: entry for entry in json.loads(
+        (stage.parent / os.environ.get("CLONING_POOL", "GRID") / "pool.json").read_text())}
+    assert alts, "alternates wrote no rows"
+    assert len(alts) == len(set(alts)), "a voice is offered twice"
+    assert not (set(alts) & heard), f"already auditioned: {sorted(set(alts) & heard)}"
+    assert all(pool[voice]["kind"] == "hybrid" for voice in alts), \
+        f"not a hybrid: {[v for v in alts if pool[v]['kind'] != 'hybrid']}"
+    counts = collections.Counter(cluster for cluster, _, _ in rows)
+    assert max(counts.values()) <= 2, f"--per-identity 2 exceeded: {counts}"
+    dest.unlink()
+    print(f"6. {run}: {len(alts)} alternates, none heard, all hybrids OK")
+else:
+    print("6. no alternates inputs for CLONING_RUN SKIP")
+
 
 print("\nall checks passed")

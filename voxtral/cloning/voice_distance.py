@@ -618,6 +618,94 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
                     f"ONLY_FILE={path} DEPTH=12 sudo -E ./voxtral/cloning/driver.sh")
 
 
+@cli.command("alternates")
+@click.option("--max-wer", default=0.15, show_default=True,
+              help="Clarity an alternate must reach to be worth auditioning.")
+@click.option("--per-identity", default=2, show_default=True,
+              help="How many alternates to offer per identity.")
+@click.option("--kind", default="hybrid", show_default=True,
+              help="Only alternates of this kind (hybrid, mixn, base, or 'any').")
+@click.option("--heard", default=None,
+              help="Voices already auditioned, one per line "
+                   "(default: <stage>/keepers_and_bases.txt, what audition.py was last given).")
+@click.option("--out", default=None, help="Where to write the roster (default: <stage>/alternates.txt).")
+def cmd_alternates(max_wer: float, per_identity: int, kind: str, heard: str | None,
+                   out: str | None) -> None:
+    """Roster the next-best voice per identity, ranked by raw WER instead of excess.
+
+    `keepers` ranks each identity's candidates by mean excess WER, which is the right
+    metric for comparing across languages because it prices in how hard each sentence is.
+    But a listening session is held in one language, and there the question is only "does
+    this read cleanly", so the ordering that matters is raw median WER in that language.
+    The two disagree often: on GRID_fr_fr the keeper was the lowest-raw-WER member for just
+    4 of 20 identities, so 16 identities were judged by ear on a variant that another
+    variant already beat on paper. Three identities kept their shipped voice and so were
+    judged without any hybrid being heard at all, while `h_frf_esm` sat unheard at 0 pct.
+
+    This writes the alternates nobody listened to, in audition.py's roster format, so a
+    second pass costs no GPU: every take is already synthesized and scored in the ledger.
+
+    Accent does not move here and the roster should not be read as if it did. A hybrid's
+    perceived speaker is its acoustic donor (the second name), verified 380/380 on A6 at
+    median cosine 0.96, so every alternate for an identity sounds like the same person.
+    What moves is pronunciation and stability, which the semantic donor (the first name)
+    owns. So this rescues "unreliable", never "too strongly accented".
+
+    `--kind` defaults to hybrid rather than to everything because the WER gate does not
+    predict how a sparse mix is received: both mixes auditioned from A6/GRID_fr_fr passed
+    it and were still judged unreliable to the point of being incomprehensible. A mix that
+    lands far from every shipped voice has left the code manifold (cosine under 0.70 means
+    median WER 100 pct over 43 candidates), and the ones that stay on it buy nothing a
+    two-way hybrid does not. Pass `--kind any` to see them anyway.
+    """
+    names, vectors = load_embeddings()
+    index_of = {name: i for i, name in enumerate(names)}
+    gate = passing_voices()
+    pool = load_pool()
+    bases = [name for name in names if name not in pool]
+    similarity = vectors @ vectors.T
+
+    # Same identity assignment as `keepers`, so the two agree on who a voice stands in for.
+    groups: dict[str, list[tuple[float, str]]] = {base: [] for base in bases}
+    for name in names:
+        if name not in gate or gate[name] > max_wer:
+            continue
+        if kind != "any" and pool.get(name, {"kind": "base"})["kind"] != kind:
+            continue
+        identity = max(bases, key=lambda base: similarity[index_of[name], index_of[base]])
+        groups[identity].append((gate[name], name))
+
+    # keepers_and_bases.txt is the right default: it is the list audition.py was handed for
+    # the first pass (keepers plus all 20 shipped voices), so "unheard" means unheard.
+    # Defaulting to keepers.txt instead re-offered the shipped voices as if they were new.
+    heard_path = Path(heard) if heard else STAGE_DIR / "keepers_and_bases.txt"
+    already = set(heard_path.read_text(encoding="utf-8").split()) if heard_path.is_file() else set()
+    if not already:
+        logger.warning(f"no voices listed in {heard_path}: every candidate counts as unheard")
+
+    destination = Path(out) if out else STAGE_DIR / "alternates.txt"
+    rows: list[tuple[int, str, str, float, str]] = []
+    cluster = 0
+    for base in sorted(groups):
+        # An identity whose own shipped voice was the keeper still gets alternates: that is
+        # precisely the case where no hybrid was ever auditioned for it.
+        offered = [(wer, name) for wer, name in sorted(groups[base]) if name not in already]
+        if not offered:
+            continue
+        cluster += 1
+        for rank, (wer, name) in enumerate(offered[:per_identity], start=1):
+            rows.append((cluster, f"alt{rank}", name, wer, base))
+
+    header = [f"# Unheard alternates of {RUN}, best raw WER first, grouped by the identity",
+              (f"# each one is heard as. For: audition.py --voice-list"
+               f" cache/cloning/{RUN}/{destination.name}"),
+              "# cluster<TAB>role<TAB>voice"]
+    destination.write_text("\n".join(
+        header + [f"{cluster}\t{role}\t{name}" for cluster, role, name, _, _ in rows]) + "\n")
+    for cluster, role, name, wer, base in rows:
+        logger.info(f"{base}: {role} {name} at {100 * wer:.0f}% median WER")
+    logger.success(f"{len(rows)} alternates across {cluster} identities -> {destination}")
+
 def seriate(names: list[str], similarity: np.ndarray) -> list[int]:
     """Order voices so that similar ones sit next to each other.
 
