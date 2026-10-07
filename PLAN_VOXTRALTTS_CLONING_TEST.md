@@ -367,7 +367,88 @@ done
 
 The one caveat is that a symlink inside `cache/` dangles when the container sees that bind mount as `/cache`. It is harmless here because the wavs are written host-side by `sweep.py`; the only path the container reads under `/cache` is `VOXTRAL_CODE_DUMP_DIR`, which stays a real directory.
 
-**Result:** TODO
+**Result (French only; the other seven languages are still unscored).** The grid ran
+fr_fr to completion: 15,000 distinct (voice, sentence) pairs over 480 candidates plus the
+20 shipped voices, 31,331 ledger rows including the retry budget. End-to-end throughput
+measured on the final resume was **636 takes/h** (7,796 takes in 12.25 h), ASR included.
+
+The screening metrics did their job, and then a listening pass moved the answer twice, so
+both are recorded here.
+
+**Cosine 0.70 is the edge of the code manifold, not a speaker boundary.** Binning all 480
+candidates by ECAPA cosine to their nearest shipped voice:
+
+| cos to nearest shipped | n | median WER | junk rate |
+|---|---|---|---|
+| 0.00 to 0.50 | 33 | 100 % | 33 % |
+| 0.50 to 0.70 | 10 | 100 % | 40 % |
+| 0.70 to 0.80 | 14 | 8 % | 0 % |
+| 0.80 to 0.90 | 60 | 8 % | 10 % |
+| 0.90 to 1.01 | 363 | 8 % | 1 % |
+
+A two-way hybrid escapes below 0.70 once in 380; a mix3 11/40, a mix4 12/30, a mix5 19/30
+at median cosine 0.51. This is B1's "a blend of two code sums is not itself a code sum"
+showing up at scale, and it settles the sparse-mix question: **the N-way mixes buy no new
+speaker.** The ones that stay on the manifold are near a shipped voice anyway, and the ones
+that leave it are unusable. Two mix5 voices that passed the WER gate were auditioned and
+judged "unreliable and sometimes incomprehensible", which also shows the gate does not
+predict how a mix is received, only how a hybrid is.
+
+So every usable voice is a **two-way hybrid standing in for one of the 20 shipped
+identities**, and the perceived speaker is always the **second** parent (the acoustic
+donor): verified on all 380 hybrids, whose ECAPA-nearest shipped voice is the second parent
+every time, median cosine 0.96. The first parent (semantic donor) moves pronunciation and
+stability but not accent. That asymmetry is what makes the French yield possible at all:
+an identity that cannot read French can be given a French semantic donor and keep its own
+voice.
+
+**The ranking metric had to be chosen per purpose.** `keepers` ranks by mean excess WER
+against each sentence's own difficulty, which is right for comparing across languages, but
+a listening session happens in one language where raw median WER is what matters. The two
+disagree badly: the keeper was its identity's lowest-raw-French-WER member for only **4 of
+20** identities, and three identities kept their shipped voice and so were auditioned with
+no hybrid heard at all. Hence `voice_distance.py alternates`, which rosters the unheard
+variants by raw WER for a second pass costing no GPU (the takes already exist). That second
+pass rescued three rejected identities and upgraded four kept ones.
+
+**The French production set: 12 voices, 7F/5M.** WER is the median over 30 FLEURS
+sentences.
+
+| identity heard | voice | WER | came from |
+|---|---|---|---|
+| ar_male | `h_itf_arm` | 0 % | round 2 upgrade |
+| de_female | `h_itf_def` | 3 % | round 1 |
+| es_female | `h_ptf_esf` | 4 % | round 1 |
+| es_male | `h_frf_esm` | 0 % | round 2 rescue |
+| fr_female | `fr_female` | 0 % | shipped, good in French by ear |
+| fr_male | `fr_male` | 0 % | shipped, good in French by ear |
+| hi_female | `h_frf_hif` | 3 % | round 1 |
+| it_female | `h_frm_itf` | 2 % | round 2 rescue, off a sparse mix |
+| it_male | `h_frf_itm` | 4 % | round 2 rescue |
+| nl_female | `h_frm_nlf` | 0 % | round 2 upgrade |
+| nl_male | `h_ptm_nlm` | 3 % | round 1 |
+| pt_female | `h_frm_ptf` | 5 % | round 1 |
+
+The two French identities use the **shipped** voices rather than a hybrid: both read French
+well by ear, so there is nothing for a semantic donor to fix. `keepers` had picked sparse
+mixes for them (`x_frf_nlf_nem`, `x_frm_itf_itm_cam`) because excess WER saw no difference
+between a 0 pct mix and a 0 pct shipped voice; the mixes are dropped on the manifold
+argument above. `h_frm_frf` and `h_frf_frm` are equally clean at 0 pct (the latter
+confirmed by ear) if more French variety is ever wanted from the same two identities.
+
+Marginal, usable if a dataset needs more range: `h_frf_him` (hi_male), `h_frf_ptm`
+(pt_male, "too accented but almost ok"), `h_frm_chf` (cheerful_female, 0 % WER and clean
+but reads as strongly Canadian), `h_frm_def` (de_female, strong accent but usable).
+
+Eight identities yield nothing in French. `casual_male`, `casual_female`, `neutral_male`,
+`neutral_female` fail on **accent**, which no hybrid can fix because accent is locked to
+the acoustic donor, and for two of them the alternates scored worse than the keeper as
+well. `de_male` and `pt_male` fail on quality at every variant tried. The remaining
+rejections were the sparse mixes.
+
+The practical lesson for the other seven languages: WER screening plus `keepers` plus
+`alternates` narrows 500 voices to about 40 clips worth hearing, and the ear then decides,
+mostly on accent, which no metric here predicts.
 
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
