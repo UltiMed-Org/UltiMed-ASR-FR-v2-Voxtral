@@ -105,7 +105,14 @@ def read_first_attempts(path: Path) -> dict[tuple[str, str], Path]:
     found: dict[tuple[str, str], Path] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         record = json.loads(line)
-        if "wav" not in record or "attempt" in record:
+        # A missing `attempt` and `attempt: 0` both mean first attempt, and the two
+        # conventions coexist in the cache. A7's sweep tagged only retries, so its first
+        # attempts carry no key at all (FLEURS: 12,948 of them); the sweep that grew the
+        # retry budget stamps every row, so the grid's first attempts are `attempt: 0`
+        # (GRID_fr_fr: 14,645). Testing `"attempt" in record` matched A7 and silently
+        # rejected every single grid take, which surfaced as "no takes in the ledger" for
+        # all 37 voices at once. Compare the value, never the key's presence.
+        if "wav" not in record or record.get("attempt", 0) != 0:
             continue
         found[(record["voice"], record["sid"])] = REPO_ROOT / record["wav"]
     return found

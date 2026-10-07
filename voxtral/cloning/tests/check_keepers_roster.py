@@ -97,4 +97,28 @@ if run and real.is_file():
 else:
     print("4. no real roster for CLONING_RUN   SKIP")
 
+# 5. First attempts are selected by VALUE, not by the presence of the `attempt` key. Two
+# ledger conventions coexist in the cache: A7's sweep tagged only retries, so its first
+# attempts carry no key, while the sweep that grew the retry budget stamps `attempt: 0` on
+# every row. `"attempt" in record` matched only the first and rejected every grid take.
+led = tmp_ledger = REPO / "cache" / "cloning" / "ZZROSTER2"
+shutil.rmtree(led, ignore_errors=True)
+led.mkdir(parents=True)
+(led / "ledger.jsonl").write_text(
+    # A7 convention: first attempt has no `attempt` key.
+    '{"voice": "a", "sid": "f1", "wav": "cache/x/a1.wav"}\n'
+    '{"voice": "a", "sid": "f1", "attempt": 1, "wav": "cache/x/a1b.wav"}\n'
+    # Grid convention: first attempt is an explicit 0.
+    '{"voice": "b", "sid": "f1", "attempt": 0, "wav": "cache/x/b1.wav"}\n'
+    '{"voice": "b", "sid": "f1", "attempt": 2, "wav": "cache/x/b1c.wav"}\n'
+    # A scored row with no wav must not shadow the take it scores.
+    '{"voice": "b", "sid": "f1", "attempt": 0, "wer": 0.1}\n'
+)
+first = audition.read_first_attempts(led / "ledger.jsonl")
+assert first[("a", "f1")].name == "a1.wav", first[("a", "f1")]
+assert first[("b", "f1")].name == "b1.wav", first[("b", "f1")]
+assert len(first) == 2, first
+shutil.rmtree(led, ignore_errors=True)
+print("5. first attempt by value, both conventions OK")
+
 print("\nall checks passed")
