@@ -543,6 +543,10 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
              "| identity | keep | kind | own WER | kept WER | excess | takes |",
              "|---|---|---|---|---|---|---|"]
     keepers = []
+    # Rows for audition.py's roster, collected in this loop rather than rebuilt afterwards:
+    # this is the only place that knows both the identity a voice represents and its kind,
+    # so reconstructing them downstream would duplicate the grouping logic above.
+    roster_rows: list[tuple[int, str, str]] = []
     for base in sorted(groups):
         if not groups[base]:
             lines.append(f"| {base} | (none clears {100 * max_wer:.0f} pct) | | "
@@ -555,6 +559,15 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
         own = f"{100 * gate[base]:.0f}%" if base in gate else "fails gate"
         lines.append(f"| {base} | {best} | {kind} | {own} | {100 * gate[best]:.0f}% | "
                      f"{100 * best_excess:+.1f} | {len(scores[best])} |")
+        # One cluster per identity, numbered in the table's own sorted order so the roster
+        # and keepers.md line up row for row. The shipped donor is emitted next to its
+        # keeper because audition.py keeps same-cluster rows adjacent on purpose: a keeper
+        # only sounds good or bad next to the speaker it stands in for, the same argument
+        # behind keepers_and_bases.txt. A keeper that IS its own donor gets one row, not two.
+        cluster = len(keepers)
+        if best != base:
+            roster_rows.append((cluster, "shipped", base))
+        roster_rows.append((cluster, kind if best in pool else "shipped", best))
 
     lines += ["", f"**{len(keepers)} of {len(bases)} identities have a usable French voice.**", "",
               "Use them straight from tts.py:", "", "```",
@@ -575,8 +588,23 @@ def cmd_keepers(max_wer: float, out: str | None, contenders: int) -> None:
     # the number its own donor scores on the same sentence.
     both = list(dict.fromkeys(keepers + sorted(bases)))
     (STAGE_DIR / "keepers_and_bases.txt").write_text("\n".join(both) + "\n")
+
+    # The same set once more, in the one format audition.py reads. Its `read_voice_list`
+    # wants `cluster<TAB>role<TAB>voice` rows while keepers.txt is one bare name per line,
+    # so pointing `--voice-list` at keepers.txt died on `line.split("\t")` with "not enough
+    # values to unpack". Writing the roster here keeps the two tools in this directory
+    # agreeing on one format instead of needing a converter between them.
+    roster_path = STAGE_DIR / "keepers_roster.txt"
+    # Repo-relative on purpose: an absolute path here would bake the user's home directory
+    # into a file that gets copied around and pasted into reports.
+    roster_path.write_text("\n".join(
+        [f"# Keepers of {RUN}, for: audition.py --voice-list "
+         f"cache/cloning/{RUN}/{roster_path.name}",
+         "# cluster<TAB>role<TAB>voice; the shipped donor precedes the voice kept for it."]
+        + [f"{cluster}\t{role}\t{voice}" for cluster, role, voice in roster_rows]) + "\n")
     logger.success(f"{len(keepers)} of {len(bases)} identities usable, wrote {destination}, "
-                   f"{keepers_path} and keepers_and_bases.txt ({len(both)} voices)")
+                   f"{keepers_path}, keepers_and_bases.txt ({len(both)} voices) and "
+                   f"{roster_path} ({len(roster_rows)} rows for audition.py)")
 
     if contenders:
         # Picking the best of ~19 variants on two sentences each is selection on noise:
