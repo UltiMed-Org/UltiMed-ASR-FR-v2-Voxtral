@@ -450,6 +450,80 @@ The practical lesson for the other seven languages: WER screening plus `keepers`
 `alternates` narrows 500 voices to about 40 clips worth hearing, and the ear then decides,
 mostly on accent, which no metric here predicts.
 
+### [x] A9. Re-audition the French set on medical text
+
+A8 cleared 12 French voices on FLEURS sentences, which is the wrong text to clear them on.
+UltiMed v2 speaks drug brand names, dosage strings, acronyms and suture gauges, and a
+voice that reads encyclopedia prose cleanly can still derail on "Epidyolex solution
+buvable a 100 milligrammes par millilitre". A8's own rejections were decided mostly on
+accent, which no metric predicted; the same is true of pronunciation under load, so the
+only way to know was to hear all 16 candidates on the real thing.
+
+`voxtral/cloning/corpus_medical_fr.txt` is the test: the ten highest-whisper-CER rows of
+the finished v1 run (CER 0.08 to 0.12), spread over its four categories, plus two
+sentences written for this file at 63 and 64 words. Those two are about 30 s at the grid's
+measured 2.15 words/s and test a different failure: Voxtral degenerates by looping
+syllables, and a voice can read three short sentences perfectly and lose the plot halfway
+through a long one, which matters because v2's rows average 18.6 s. Their length is pinned
+by the junk test, not chosen for roundness: at 64 words the runaway threshold
+(3.0 x words / rate) is 89.3 s, just inside the sweep's 90 s token cap, so both the
+runaway and the ceiling test still bite. At 73 words it is 102 s, past the cap, and a
+degenerate take would be truncated at 90 s and measure as healthy.
+
+Run by `voxtral/cloning/medical_audition.sh` on 2026-10-08: 16 voices x 12 sentences = 192
+takes, about 45 minutes of audio, roughly 10 minutes of wall clock, no ASR pass. Three
+tools needed a mode for this, each because they were built for the FLEURS screen and
+silently did the wrong thing on a curated corpus. `sweep.py sentences` rejects any line
+containing a digit (the ASR writes "75" where the text says "soixante-quinze"), which kept
+2 of these 10 and those 2 were the only ones with no dose or brand name: hence
+`--curated`. `audition.py` picks the clearest sentences in a 12-26 word window, which
+would have dropped the 4 longest of 10 and both long ones: hence `--sentences 0`. And
+scoring was unnecessary, since the ear is the judge here: hence `driver.sh SCORE=0`, which
+keeps the duration-based junk net (the tts pass records each take's `seconds` itself,
+expressly so the gate needs no ASR) and gives up only WER.
+
+**Result: 10 voices, and the second round was worth running.** The medical corpus disagrees
+with the FLEURS verdict about **6 of the 16** candidates: it drops 4 of A8's 12 keepers and
+promotes 2 of its 4 marginals.
+
+| voice | identity (acoustic donor) | A8, on FLEURS | A9, on medical text |
+|---|---|---|---|
+| `fr_female` | fr_female | keeper | go |
+| `fr_male` | fr_male | keeper | go |
+| `h_itf_arm` | ar_male | keeper | go |
+| `h_frf_esm` | es_male | keeper | go |
+| `h_frm_nlf` | nl_female | keeper | go |
+| `h_itf_def` | de_female | keeper | go |
+| `h_frf_itm` | it_male | keeper | go |
+| `h_frm_ptf` | pt_female | keeper | go |
+| `h_frf_ptm` | pt_male | marginal, "too accented but almost ok" | **go** |
+| `h_frm_chf` | cheerful_female | marginal, "strongly Canadian" | **go** |
+| `h_frm_itf` | it_female | keeper | **bof, out** |
+| `h_frf_hif` | hi_female | keeper | **bad, out** |
+| `h_ptm_nlm` | nl_male | keeper | **bad, out** |
+| `h_ptf_esf` | es_female | keeper | **bad, out** |
+| `h_frf_him` | hi_male | marginal | bof, out |
+| `h_frm_def` | de_female | marginal, "strong accent but usable" | bof, out |
+
+The ten survivors are ten **distinct** identities, five female and five male, which was not
+designed for and is worth keeping: the dataset gets ten speakers rather than ten variants
+of three. Every hybrid among them draws its semantic donor from `fr_female`, `fr_male` or
+`it_female`, consistent with A6 and A8 finding that the semantic donor must itself read
+the target language cleanly.
+
+Two findings beyond the roster. First, the two `de_female` variants **split**: `h_itf_def`
+passes and `h_frm_def` does not, same identity, different semantic donor. On FLEURS A8 had
+already ranked them in that order, so hard text widened an existing gap rather than
+inverting it, which is direct evidence that the semantic donor governs stability under
+load and not just articulation. Second, the 4 drops cross language and gender with no
+pattern (it_female, hi_female, nl_male, es_female, while it_male, nl_female and es_male
+all pass), so there is no shortcut: a voice that must speak medical French has to be heard
+speaking medical French.
+
+**Deliverable:** `voxtral/cloning/voices_fr_production.txt`, the ten names, which is what
+`--only-file` and the v2 generator read. Listening tree kept at
+`exports/audition_medical/`. Harness: Claude Code.
+
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
 Each `[N, 3072]` embedding is a sum of 37 rows from the known `[9088, 3072]` table, one row from each codebook's known offset range (offsets are `cumsum` of codebook sizes: 8194 for semantic, then 36 x 23 for acoustic, per `MultiVocabEmbeddings`). Recover the indices by coordinate descent: initialize by picking each codebook's nearest row to the residual, then repeatedly hold 36 fixed and re-solve the 37th exactly by nearest-row lookup on the residual.
