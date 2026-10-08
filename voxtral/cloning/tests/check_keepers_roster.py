@@ -158,5 +158,38 @@ if run and (stage / "keepers_and_bases.txt").is_file() and (stage / "embeddings.
 else:
     print("6. no alternates inputs for CLONING_RUN SKIP")
 
+# 7. `voice_distance.py roster` turns a bare voice list into the roster format, which is the
+# converter that closes the format gap check 3 pins open. Two bugs in it both failed by
+# WARNING rather than by raising, which is the dangerous shape here: the roster is still
+# written, so the audition proceeds on a file whose warning scrolled past. It warned that
+# the shipped fr_female/fr_male were "not in pool" (pool.json holds only the minted
+# candidates, so their absence is correct, not a typo), and clustering must group by
+# identity so a hybrid lands next to the other candidate for the same speaker: a hybrid is
+# heard as its SECOND name, so h_itf_def and h_frm_def are two takes on de_female and are
+# useless to compare nine directories apart.
+if run and (REPO / "cache" / "cloning" / os.environ.get("CLONING_POOL", "GRID") / "pool.json").is_file():
+    src = REPO / "cache" / "cloning" / "ZZLIST.txt"
+    dest = REPO / "cache" / "cloning" / "ZZLIST.roster.txt"
+    src.write_text("# a comment, must be ignored\nfr_female\nh_itf_def\nh_frf_hif\nh_frm_def\n")
+    done = subprocess.run(
+        ["uv", "run", str(REPO / "voxtral" / "cloning" / "voice_distance.py"), "roster",
+         str(src), "--out", str(dest)],
+        cwd=REPO, check=True, capture_output=True, text=True,
+    )
+    rows = audition.read_voice_list(dest)
+    names = [voice for _, _, voice in rows]
+    assert names == ["fr_female", "h_itf_def", "h_frm_def", "h_frf_hif"], names
+    # The two de_female candidates share a cluster; fr_female and h_frf_hif do not join it.
+    clusters = {voice: cluster for cluster, _, voice in rows}
+    assert clusters["h_itf_def"] == clusters["h_frm_def"], rows
+    assert len({clusters["fr_female"], clusters["h_frf_hif"], clusters["h_itf_def"]}) == 3, rows
+    assert "fr_female" not in done.stderr, \
+        f"shipped voice reported as a typo:\n{done.stderr}"
+    src.unlink()
+    dest.unlink()
+    print("7. roster: identities grouped, shipped voices not flagged OK")
+else:
+    print("7. no pool for CLONING_POOL              SKIP")
+
 
 print("\nall checks passed")

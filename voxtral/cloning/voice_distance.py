@@ -49,9 +49,12 @@ from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sweep import (RUN, STAGE_DIR, WER_REJECT, declared_identity, load_pool,
+from sweep import (POOL, RUN, STAGE_DIR, WER_REJECT, declared_identity, load_pool,
                    read_ledger, speaker_components, voice_profiles)  # noqa: E402
 from wav_stats import read_wav  # noqa: E402
+
+sys.path.insert(0, str(REPO_ROOT))
+from tts import VOXTRAL_VOICES  # noqa: E402
 
 # VoxCeleb-trained ECAPA-TDNN. Ungated, about 80 MB, and the standard baseline for
 # this exact question, which matters more than squeezing out the last point of EER.
@@ -705,6 +708,56 @@ def cmd_alternates(max_wer: float, per_identity: int, kind: str, heard: str | No
     for cluster, role, name, wer, base in rows:
         logger.info(f"{base}: {role} {name} at {100 * wer:.0f}% median WER")
     logger.success(f"{len(rows)} alternates across {cluster} identities -> {destination}")
+
+@cli.command("roster")
+@click.argument("voice_list", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out", default=None,
+              help="Where to write the roster (default: <voice_list> with a .roster.txt suffix).")
+def cmd_roster(voice_list: str, out: str | None) -> None:
+    """Turn a plain list of voice names into the roster format audition.py reads.
+
+    audition.py's `--voice-list` wants `cluster<TAB>role<TAB>voice` rows, because it keeps
+    same-cluster voices adjacent on purpose: a candidate only sounds good or bad next to
+    the speaker it stands in for. Every other file in this directory that names voices
+    (keepers.txt, contenders.txt, a hand-written shortlist) is one bare name per line, so
+    pointing --voice-list at one dies on `line.split("\t")` with "not enough values to
+    unpack". `keepers` and `alternates` write rosters directly; this command is for the
+    lists nothing generated, such as a hand-picked candidate set.
+
+    Clustering uses `declared_identity`, which reads the identity off the recipe (a
+    hybrid's acoustic donor, a mix's dominant parent, a shipped voice itself) rather than
+    measuring it. That is deliberate here: it needs no embeddings.npz, so this works in a
+    fresh run directory before anything has been synthesized, and A6 verified the claim on
+    all 380 hybrids anyway. The useful consequence is that two candidates standing in for
+    the same speaker land in one cluster and so get auditioned side by side, which is
+    exactly the comparison that decides between them.
+    """
+    pool = load_pool()
+    names = [line.split("#", 1)[0].strip()
+             for line in Path(voice_list).read_text(encoding="utf-8").splitlines()]
+    names = [name for name in names if name]
+    # pool.json holds only the minted candidates, so the 20 shipped voices are legitimately
+    # absent from it and must not be reported as typos. Anything in neither set is one.
+    unknown = [name for name in names if name not in pool and name not in VOXTRAL_VOICES]
+
+    # Group by identity, but keep each identity's first appearance order from the file so
+    # the roster stays readable against the list it came from rather than being re-sorted.
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        groups.setdefault(declared_identity(name, pool) if name in pool else name, []).append(name)
+
+    destination = Path(out) if out else Path(voice_list).with_suffix(".roster.txt")
+    rows = [(index, pool.get(name, {"kind": "base"})["kind"], name)
+            for index, identity in enumerate(groups, start=1) for name in groups[identity]]
+    destination.write_text("\n".join(
+        [f"# Roster of {Path(voice_list).name}, for: audition.py --voice-list {destination}",
+         "# cluster<TAB>role<TAB>voice; one cluster per identity, voices for the same",
+         "# identity adjacent so they can be compared back to back."]
+        + [f"{cluster}\t{role}\t{name}" for cluster, role, name in rows]) + "\n")
+    if unknown:
+        logger.warning(f"{len(unknown)} in neither pool {POOL} nor the shipped voices, "
+                       f"clustered alone (typo?): {unknown}")
+    logger.success(f"{len(rows)} voices in {len(groups)} clusters -> {destination}")
 
 def seriate(names: list[str], similarity: np.ndarray) -> list[int]:
     """Order voices so that similar ones sit next to each other.
