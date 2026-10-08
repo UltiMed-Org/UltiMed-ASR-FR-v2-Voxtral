@@ -1,0 +1,21 @@
+# The 16 French candidates for UltiMed v2, in the order their identities were settled.
+# First 12: cleared both audition rounds (GRID_fr_fr, see PLAN A8's Result table).
+# Last 4: marginal on TTS listening quality but plausibly useful as ASR training data,
+# where accent variety is a feature as long as the transcript is right. The point of the
+# medical audition is to decide whether these 4 join the set, so keep them last.
+fr_female
+fr_male
+h_itf_arm
+h_frf_esm
+h_frm_nlf
+h_frm_itf
+h_itf_def
+h_frf_hif
+h_ptm_nlm
+h_ptf_esf
+h_frf_itm
+h_frm_ptf
+h_frf_him
+h_frf_ptm
+h_frm_chf
+h_frm_def

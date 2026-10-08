@@ -1,0 +1,20 @@
+# Ten technical French medical sentences, for auditioning a voice on the text it will
+# actually have to speak. Hand-picked from the UltiMed v1 corpus as the HARDEST rows it
+# contains: these are the highest-whisper-CER sentences of the finished v1 run (CER 0.08
+# to 0.12 against a single voice), spread over its four categories so the test covers drug
+# brand names, acronym strings, surgical materials and unit-heavy prose rather than one of
+# them. FLEURS sentences cannot answer this question: a voice that reads Wikipedia prose
+# cleanly can still derail on 'Epidyolex solution buvable' or 'ypT2 N0 R0'.
+#
+# Source: UltiMed-ASR-FR-v1 (CC BY 4.0 subsets), via Claude Code. One sentence per line,
+# which is what `sweep.py sentences --corpus` expects.
+Le champ électrique entre deux plaques parallèles séparées de 2 centimètres sous une différence de potentiel de 10 volts est de 5 volts par centimètre, soit 500 volts par mètre.
+Elle a une consommation alcoolo-tabagique occasionnelle. Elle pèse 75 kilos pour une taille de 1 mètre 70.
+Une décision de soins de confort exclusif a été prise. Madame Jakymiw est décédée dans le service le 25 novembre à 1 heure 30.
+Administration de Synacthène 250 microgrammes en intramusculaire pour un test de stimulation surrénalienne, dosage du cortisol à la trentième et à la soixantième minute.
+Prescription d'un cliché de thorax de face. Utiliser le tube Coolidge du poste fixe avec une tension de 120 kilovolts et un débit de 3 milliamperes seconde.
+Renouvellement du traitement par Epidyolex solution buvable à 100 milligrammes par millilitre, posologie inchangée à 5 milligrammes par kilogramme 2 fois par jour pour un an.
+Consultation d'hématologie pour une hyperviscosité plasmatique. La viscosité dynamique mesurée à 37 degrés Celsius est de 2,5 millipascals par seconde, soit 2,5 millipoiseuilles, au-dessus de la normale du laboratoire.
+Prescription d'Ucedane 200 milligrammes par kilogramme par jour en trois prises, à débuter dès ce soir, pour une hyperammoniémie à 180 micromoles par litre.
+Fermeture du fascia superficialis au vicryl 3-0. Surjet intradermique au Monocryl 4-0. Application de colle cutanée.
+À l'arrivée du patient inconscient, l'infirmier a débuté une ventilation manuelle au BAVU en attendant l'intubation orotrachéale.
