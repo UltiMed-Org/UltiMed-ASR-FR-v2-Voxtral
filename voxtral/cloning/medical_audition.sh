@@ -11,13 +11,19 @@
 # buvable" or "Monocryl 4-0", so the corpus here is the ten highest-CER rows of the
 # finished v1 run (see corpus_medical_fr.txt).
 #
-# 160 takes, about 40 minutes of audio. By default it only SYNTHESIZES: no whisper pass,
-# no swap back to the ASR container, because judging these voices is your ears' job and
-# the second 9 GB model load costs more wall clock than the decode it would run. Set
-# SCORE=1 to also transcribe, score and auto-regenerate degenerate takes, which is worth
-# it when you want numbers next to the audio rather than instead of it. The one thing
-# SCORE=0 gives up: nothing detects a looped take, so you will hear it. For a voice
-# audition that is information, not noise.
+# 192 takes, about 45 minutes of audio. Ten sentences are ~12 s and the last two are ~30 s
+# (63 and 64 words at the grid's measured 2.15 words/s), because stability over length is a
+# separate failure from mispronunciation: Voxtral degenerates by looping syllables, and a
+# voice can read three short sentences perfectly and lose the plot halfway through a long
+# one. The long pair is sized so its runaway threshold (3 x words / rate = 89 s) still fits
+# under the 90 s token cap; see corpus_medical_fr.txt.
+#
+# By default it only SYNTHESIZES: no whisper pass, no swap back to the ASR container,
+# because judging these voices is your ears' job and the second 9 GB model load costs more
+# wall clock than the decode it would run. It still auto-repairs degenerate takes, because
+# the runaway test is duration-based and the tts pass records each take's duration itself.
+# What SCORE=1 adds is WER, i.e. whether the right words came out, which is a different
+# question from whether the take held together.
 #
 # Resumable: every take lands in the ledger as it completes, and the sentence list is
 # minted once, so re-running after an interruption costs only the take in flight.
@@ -32,7 +38,8 @@
 #             repo filesystem is the one driver.sh needs 25 GB of headroom on)
 #   RUN       stage directory name under cache/cloning (default MED16)
 #   VOICES    the candidate list (default voices_fr_16.txt)
-#   SENTENCES how many corpus sentences per voice (default 10, i.e. all of them)
+#   SENTENCES how many corpus sentences per voice (default 12, i.e. all of them; lowering
+#             it cuts from the END of the corpus, which is where the two long ones are)
 #   SCORE     1 to add the whisper pass and the numbers (default 0, audio only)
 #   Anything driver.sh reads also passes through, e.g. EULER_STEPS.
 set -euo pipefail
@@ -45,7 +52,7 @@ RUN="${RUN:-MED16}"
 POOL="${POOL:-GRID}"
 VOICES="${VOICES:-${HERE}/voices_fr_16.txt}"
 CORPUS="${CORPUS:-${HERE}/corpus_medical_fr.txt}"
-SENTENCES="${SENTENCES:-10}"
+SENTENCES="${SENTENCES:-12}"
 SCORE="${SCORE:-0}"
 # Derived, never hardcoded: a literal /media/<name> in a tracked file leaks the username.
 DEST="${DEST:-/media/$(id -un)/4TO_DRIVE/voxtral_grid/audition_medical}"
@@ -56,7 +63,8 @@ STAGE_DIR="${REPO_ROOT}/cache/cloning/${RUN}"
 # calls below (driver.sh gets them as sudo assignments instead, since sudo resets the env).
 export CLONING_RUN="${RUN}" CLONING_POOL="${POOL}"
 
-echo "== ${RUN}: $(grep -vc '^#\|^$' "${VOICES}") voices x ${SENTENCES} medical sentences -> ${DEST}"
+echo "== ${RUN}: $(grep -vc '^#\|^$' "${VOICES}") voices x ${SENTENCES} medical sentences" \
+     "(10 short, 2 of ~30s) -> ${DEST}"
 
 # 1. Synthesize. driver.sh owns the container swap, the health wait and the disk-space
 # floor, so nothing here reimplements any of it; it also drops privileges to TARGET_USER
@@ -108,8 +116,10 @@ cat <<SUMMARY
    h_frm_def, is NOT last: the roster sorts by identity, so it sits in cluster 7
    right beside h_itf_def, which is the point (both are de_female, and that pair
    is the one choice where you are picking a variant rather than a voice).
-   Each voice's directory holds all ten sentences, in corpus order: s00 to s09
-   are dictionary, PARHAF, drug names then acronyms.
-   If a take loops syllables it is a dead voice, not a bad sentence; SCORE=1
-   re-runs with whisper and regenerates those automatically.
+   Each voice's directory holds all twelve sentences, in corpus order: s00 to
+   s09 are dictionary, PARHAF, drug names then acronyms, and s10/s11 are the two
+   ~30s ones. Listen to those two first: they are the stability test, and a voice
+   that holds for 30 seconds of dense dosage text will hold for v2.
+   Runaway takes were already regenerated automatically (duration-based, no ASR
+   needed), so a take that still loops means the voice ran out of attempts.
 SUMMARY

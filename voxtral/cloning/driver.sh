@@ -127,14 +127,16 @@ JUNK_THRESHOLD="${JUNK_THRESHOLD:-0.25}"
 JUNK_AFTER="${JUNK_AFTER:-12}"
 RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
-# SCORE=0 produces audio and stops: no stt pass, no swap back to the ASR container, no
-# retry loop. For a listening session that is the whole job, and it halves the wall clock
-# because the second 9 GB model load is the expensive part, not the whisper decode.
-# What it gives up is the automatic junk net: a runaway is `seconds >= factor * words /
-# rate` and the tts pass records only `bytes` and `request_seconds`, never `seconds`, so
-# nothing detects a degenerate take without the ASR. With SCORE=0 a looped take reaches
-# your ears instead of being regenerated, which for a voice audition is informative
-# anyway. Keep SCORE=1 whenever the WER numbers are the point.
+# SCORE=0 produces audio and stops: no stt pass and no swap back to the ASR container.
+# For a listening session that is the whole job, and it roughly halves the wall clock,
+# because the second 9 GB model load costs more than the whisper decode it would run.
+# It keeps the junk net, which is the part worth being precise about: a runaway is
+# `seconds >= RUNAWAY_FACTOR * words / rate` and the tts pass records `seconds` from the
+# wav it just wrote (sweep.py `wav_seconds(payload)`), expressly so the gate can act
+# without an ASR. So the retry pass below still repairs degenerate takes under SCORE=0;
+# it is offline and swaps nothing. What SCORE=0 gives up is only WER, i.e. whether the
+# right words were said, not whether the take held together. Note RETRY_ON=wer would
+# have nothing to work with here; the default `runaway` is duration-based.
 SCORE="${SCORE:-1}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -283,11 +285,19 @@ while :; do
     tts_dry=$(( rc == 11 ? 1 : 0 ))
 
     if (( ! SCORE )); then
-        # Break rather than fall through: with no stt pass `stt_dry` stays 0, so the
-        # "both passes ran dry" test below could never fire and the loop would spin,
-        # re-running a tts pass that has nothing to do until someone killed it.
+        # Still repair runaways: the test is duration-based, so this costs no swap and no
+        # ASR. Terminate on the retry pass rather than falling through, because with no
+        # stt pass `stt_dry` stays 0, the "both passes ran dry" test below could never
+        # fire, and the loop would spin re-running an empty tts pass until someone
+        # killed it. retry returns 11 once every broken take is repaired or out of
+        # attempts, which is what ends the run.
         echo "=== $(date '+%F %T') SCORE=0: audio only, skipping the stt pass and its swap"
-        break
+        retry_rc=0; run_pass retry || retry_rc=$?
+        case "${retry_rc}" in
+            0)  echo "--- $(date '+%F %T') runaway repairs queued, going round again"; continue ;;
+            11) echo "=== $(date '+%F %T') nothing left to repair; done"; break ;;
+            *)  echo "!!! retry pass exited ${retry_rc}; aborting" >&2; exit "${retry_rc}" ;;
+        esac
     fi
 
     switch stt
