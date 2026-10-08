@@ -46,6 +46,7 @@ actually runs at the server's startup default.
    sudo docker compose run --rm --entrypoint bash voxtral-tts -lc \
      "cd /src/vllm-omni && python -m pytest tests/model_executor/models/voxtral_tts/test_per_request_noise_and_steps.py -q"
    ```
+4. **`0008` upstream backport.** Cherry-pick of upstream PR #5175 (merged for v0.26, commit `c446eed`): host-sync removal and cached flow-matching schedule constants on the Voxtral hot path, reported +5% throughput at concurrency 1 and +13% at 8. Two fork-specific changes in the conflict resolution: the schedule cache is keyed on `(dtype, n_steps)` so per-request euler steps stay cached, and the wrapper's new outer-capture fallback passes `noise=` so a seeded request keeps its seed. Drop this patch when rebasing `perso` onto v0.26 or later, where it is already upstream.
 
 ## History: the monkeypatch this replaces
 

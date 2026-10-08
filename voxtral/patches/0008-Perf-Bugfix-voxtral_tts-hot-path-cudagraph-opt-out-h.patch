@@ -1,0 +1,421 @@
+From 1217c2e1065b8b12a261b2f74f3b53bd7cc6105d Mon Sep 17 00:00:00 2001
+From: JuanPZuluaga <juanz9312@gmail.com>
+Date: Mon, 1 Jun 2026 06:34:15 +0000
+Subject: [PATCH 8/8] [Perf][Bugfix] voxtral_tts hot path: cudagraph opt-out,
+ host-sync removal, kernel caches
+
+Signed-off-by: JuanPZuluaga <juanz9312@gmail.com>
+
+Local fork resolution (perso): decode_one_frame keeps the per-request
+`noise` / `n_steps` overrides; the schedule cache is keyed on
+(dtype, n_steps) instead of dtype alone so per-request euler steps are
+cached too. Also pass `noise` in the new outer-capture fallback of the
+CUDA-graph wrapper, which would otherwise drop a request's seed.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../test_cuda_graph_acoustic_transformer.py   | 21 +++--
+ ...cuda_graph_acoustic_transformer_wrapper.py | 28 +++++--
+ .../models/voxtral_tts/voxtral_tts.py         |  9 +-
+ .../voxtral_tts_audio_generation.py           | 82 +++++++++++--------
+ .../voxtral_tts_audio_tokenizer.py            | 54 ++++++------
+ 5 files changed, 117 insertions(+), 77 deletions(-)
+
+diff --git a/tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py b/tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py
+index 3b64563..70c739a 100644
+--- a/tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py
++++ b/tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py
+@@ -83,11 +83,16 @@ class SyntheticAcousticTransformer(nn.Module):
+         # time_embedding: (B, 1) -> (B, dim)
+         self.time_embedding = nn.Linear(1, HIDDEN_DIM, bias=False)
+ 
+-        # _predict_velocity: takes x_t (B, C), llm_output (B, D), t_emb (B, D) -> (B, C)
++        # Identities: callers pass pre-projected inputs; the synthetic transformer folds
++        # everything into _velocity_proj.
++        self.llm_projection = nn.Identity()
++        self.time_projection = nn.Identity()
++
++        # _predict_velocity: takes x_t (B, C), llm_proj (B, D), t_proj (B, D) -> (B, C)
+         self._velocity_proj = nn.Linear(N_ACOUSTIC_CODEBOOK + HIDDEN_DIM + HIDDEN_DIM, N_ACOUSTIC_CODEBOOK, bias=False)
+ 
+-    def _predict_velocity(self, x_t: torch.Tensor, llm_output: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+-        combined = torch.cat([x_t, llm_output, t_emb], dim=-1)
++    def _predict_velocity(self, x_t: torch.Tensor, llm_proj: torch.Tensor, t_proj: torch.Tensor) -> torch.Tensor:
++        combined = torch.cat([x_t, llm_proj, t_proj], dim=-1)
+         return self._velocity_proj(combined)
+ 
+ 
+@@ -129,14 +134,18 @@ class SyntheticModel(nn.Module):
+         hidden_zero = torch.zeros_like(hidden_states)
+         timesteps = torch.linspace(0, 1, 16, device=hidden_states.device, dtype=hidden_states.dtype)
+ 
++        # llm_projection is constant across steps so hoist it (mirrors decode_one_frame).
++        llm_batched = torch.cat([hidden_states, hidden_zero], dim=0)
++        llm_proj_batched = at.llm_projection(llm_batched)
++
+         for i in range(len(timesteps) - 1):
+             t = timesteps[i]
+             dt = timesteps[i + 1] - timesteps[i]
+             t_emb = at.time_embedding(t.view(-1, 1).repeat(B, 1)).to(hidden_states.dtype)
++            t_proj = at.time_projection(t_emb)
+             x_batched = torch.cat([x, x], dim=0)
+-            llm_batched = torch.cat([hidden_states, hidden_zero], dim=0)
+-            t_emb_batched = t_emb.repeat(2, 1)
+-            v_all = at._predict_velocity(x_t=x_batched, llm_output=llm_batched, t_emb=t_emb_batched)
++            t_proj_batched = t_proj.repeat(2, 1)
++            v_all = at._predict_velocity(x_t=x_batched, llm_proj=llm_proj_batched, t_proj=t_proj_batched)
+             v_t, uncond_v_t = v_all[:B], v_all[B:]
+             cfg_alpha = 1.2
+             v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py b/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
+index 72601af..4665705 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
+@@ -74,6 +74,12 @@ class CUDAGraphAcousticTransformerWrapper:
+ 
+         # Pre-create persistent buffers
+         self.timesteps = torch.linspace(0, 1, self.n_steps + 1, device=device, dtype=dtype)
++        # Precompute schedule constants (dt, projected time embeddings) so the captured
++        # graph indexes a table instead of re-running them on every replay.
++        self.dts = self.timesteps[1:] - self.timesteps[:-1]
++        with torch.no_grad():
++            t_emb_table = self.acoustic_transformer.time_embedding(self.timesteps.view(-1, 1)).to(dtype)
++            self.t_proj_table = self.acoustic_transformer.time_projection(t_emb_table)
+         self.fake_eos_one = torch.tensor(1.0, dtype=dtype, device=device)
+         self.fake_eos_zero = torch.tensor(0.0, dtype=dtype, device=device)
+ 
+@@ -142,21 +148,21 @@ class CUDAGraphAcousticTransformerWrapper:
+ 
+         x = noise
+ 
+-        # Pre-compute zero hidden states for unconditional CFG branch
+-        hidden_states_zero = torch.zeros_like(hidden_states)
++        # Hoist the step-invariant concat + llm_projection out of the loop; inside the
++        # captured graph these would otherwise be baked in and replayed every step.
++        llm_batched = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=0)  # (2B, D)
++        llm_proj_batched = at.llm_projection(llm_batched)  # (2B, D)
+ 
+         timesteps = self.timesteps
+         for i in range(len(timesteps) - 1):
+-            t = timesteps[i]
+-            dt = timesteps[i + 1] - timesteps[i]
++            dt = self.dts[i]
+ 
+-            # Batch conditional + unconditional velocity in a single forward pass
+-            t_emb = at.time_embedding(t.view(-1, 1).repeat(B, 1)).to(hidden_states.dtype)
++            # Batch cond + uncond in a single pass; reuse the cached projected-t_emb row.
++            t_proj = self.t_proj_table[i].unsqueeze(0).expand(B, -1)
+             x_batched = torch.cat([x, x], dim=0)  # (2B, C)
+-            llm_batched = torch.cat([hidden_states, hidden_states_zero], dim=0)  # (2B, D)
+-            t_emb_batched = t_emb.repeat(2, 1)  # (2B, D)
++            t_proj_batched = t_proj.repeat(2, 1)  # (2B, D)
+ 
+-            v_all = at._predict_velocity(x_t=x_batched, llm_output=llm_batched, t_emb=t_emb_batched)
++            v_all = at._predict_velocity(x_t=x_batched, llm_proj=llm_proj_batched, t_proj=t_proj_batched)
+             v_t, uncond_v_t = v_all[:B], v_all[B:]
+ 
+             # CFG combination (cfg_alpha is (B, 1), v_t is (B, C))
+@@ -256,6 +262,10 @@ class CUDAGraphAcousticTransformerWrapper:
+         if not self.enabled or not self._warmed_up:
+             return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise)
+ 
++        # Inner graph replay is illegal during an outer stream capture.
++        if torch.cuda.is_current_stream_capturing():
++            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise)
++
+         padded_size = self._get_padded_size(actual_size)
+         if padded_size is None or padded_size not in self.graphs:
+             return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise)
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+index 59a8b3c..05dafa5 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+@@ -46,10 +46,12 @@ def parse_batched_audio_input(input_ids: torch.Tensor, num_codebooks: int) -> tu
+     """
+     all_audio_tokens: list[torch.Tensor] = []
+     all_ctx_frames: list[int] = []
++    # One D2H copy up-front avoids 2 syncs per request inside the loop.
++    header_view = input_ids.cpu() if input_ids.is_cuda else input_ids
+     offset = 0
+     while offset < input_ids.numel():
+-        ctx_frames = int(input_ids[offset].item())
+-        context_length = int(input_ids[offset + 1].item())
++        ctx_frames = int(header_view[offset])
++        context_length = int(header_view[offset + 1])
+         offset += 2
+ 
+         req_input_ids_length = (ctx_frames + context_length) * num_codebooks
+@@ -153,6 +155,9 @@ class VoxtralTTSForConditionalGeneration(
+                 architectures=["VoxtralTTSAudioTokenizer"],
+             )
+             self.model = self.audio_tokenizer
++            # forward() returns a runtime-length per-request list; FULL CUDAGraphWrapper
++            # would freeze that length at capture.
++            self.supports_cudagraph_full = False
+         else:
+             raise ValueError("Invalid model stage")
+ 
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
+index 58621ce..4b0514d 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
+@@ -450,6 +450,10 @@ class FlowMatchingAudioTransformer(nn.Module):
+             torch.linspace(0, 1, self._n_steps + 1),
+             persistent=False,
+         )
++        # Lazy per-(dtype, n_steps) cache of schedule constants: (timesteps, t_proj_table, dts) on device.
++        self._timesteps_cache: dict[
++            tuple[torch.dtype, int | None], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++        ] = {}
+ 
+     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
+         params_dict = dict(self.named_parameters())
+@@ -534,23 +538,34 @@ class FlowMatchingAudioTransformer(nn.Module):
+         # Skip decoding if codebook 0 is [END_AUDIO] token.
+         should_decode = semantic_code != self._end_audio_token_id
+ 
+-        # acoustic_codes starts from x_0
++        # acoustic_codes starts from x_0; generate directly on device to skip H2D.
+         if noise is None:
+-            x_0 = torch.randn(B, self.model_args.n_acoustic_codebook).to(
+-                dtype=llm_hidden.dtype, device=llm_hidden.device
+-            )
++            x_0 = torch.randn(B, self.model_args.n_acoustic_codebook, dtype=llm_hidden.dtype, device=llm_hidden.device)
+         else:
+             x_0 = noise.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+         x_0 = self._noise_scale * x_0
+ 
+-        if n_steps is None:
+-            timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
+-        else:
+-            # Rebuilt per frame on purpose: n_steps+1 scalars is nothing next to a
+-            # transformer forward pass, and caching it would need invalidation
+-            # keyed on a value that changes per request.
+-            timesteps = torch.linspace(0, 1, n_steps + 1, device=llm_hidden.device, dtype=llm_hidden.dtype)
+-        llm_hidden_zero = torch.zeros_like(llm_hidden)
++        # Build the schedule constants once per (dtype, step count) and reuse them every
++        # frame. Local fork: keying on n_steps too keeps per-request euler steps cached,
++        # and the set of distinct values a server sees in practice is tiny.
++        key = (llm_hidden.dtype, n_steps)
++        cache = self._timesteps_cache.get(key)
++        if cache is None:
++            if n_steps is None:
++                timesteps_d = self._timesteps.to(dtype=llm_hidden.dtype)
++            else:
++                timesteps_d = torch.linspace(0, 1, n_steps + 1, device=llm_hidden.device, dtype=llm_hidden.dtype)
++            t_emb_table = self.time_embedding(timesteps_d.view(-1, 1)).to(llm_hidden.dtype)
++            t_proj_table = self.time_projection(t_emb_table)
++            dts = timesteps_d[1:] - timesteps_d[:-1]
++            self._timesteps_cache[key] = (timesteps_d, t_proj_table, dts)
++            cache = self._timesteps_cache[key]
++        timesteps, t_proj_table, dts = cache
++
++        # Hoist the step-invariant concat + llm_projection out of the loop; inside the
++        # captured graph these would otherwise replay every step.
++        llm_batched = torch.cat([llm_hidden, torch.zeros_like(llm_hidden)], dim=0)
++        llm_proj_batched = self.llm_projection(llm_batched)
+ 
+         # Reshape cfg_alpha for broadcasting: (B,) -> (B, 1)
+         cfg_alpha = cfg_alpha.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+@@ -559,20 +574,19 @@ class FlowMatchingAudioTransformer(nn.Module):
+         # Euler integration with batched conditional + unconditional velocity
+         sampled = x_0
+         for i in range(len(timesteps) - 1):
+-            t = timesteps[i]
+-            dt = timesteps[i + 1] - timesteps[i]
++            dt = dts[i]  # precomputed constant step size
+ 
+-            t_emb = self.time_embedding(t.view(-1, 1).repeat(B, 1)).to(llm_hidden.dtype)
++            # Reuse cached projected-t_emb row, expanded along batch dim.
++            t_proj = t_proj_table[i].unsqueeze(0).expand(B, -1)
+ 
+             # Batch cond + uncond into a single forward pass (2B batch)
+             x_batched = torch.cat([sampled, sampled], dim=0)
+-            llm_batched = torch.cat([llm_hidden, llm_hidden_zero], dim=0)
+-            t_emb_batched = torch.cat([t_emb, t_emb], dim=0)
++            t_proj_batched = torch.cat([t_proj, t_proj], dim=0)
+ 
+             v_all = self._predict_velocity(
+                 x_t=x_batched,
+-                llm_output=llm_batched,
+-                t_emb=t_emb_batched,
++                llm_proj=llm_proj_batched,
++                t_proj=t_proj_batched,
+             )
+             v_t, uncond_v_t = v_all[:B], v_all[B:]
+             v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
+@@ -589,18 +603,16 @@ class FlowMatchingAudioTransformer(nn.Module):
+     def _predict_velocity(
+         self,
+         x_t: torch.Tensor,  # BxC
+-        llm_output: torch.Tensor,  # BxD
+-        t_emb: torch.Tensor,  # BxD
++        llm_proj: torch.Tensor,  # BxD, already through llm_projection
++        t_proj: torch.Tensor,  # BxD, already through time_projection
+     ) -> torch.Tensor:
+-        x_t = x_t.to(llm_output.dtype)
+-
+-        t_emb = self.time_projection(t_emb)
+-        llm_output = self.llm_projection(llm_output)
++        # llm_proj/t_proj arrive pre-projected (hoisted out of the per-step loop by callers).
++        x_t = x_t.to(llm_proj.dtype)
+ 
+         acoustic_and_semantic_embeddings = [
+             self.input_projection(x_t.unsqueeze(1)),  # Bx1xD
+-            t_emb.unsqueeze(1),
+-            llm_output.unsqueeze(1),
++            t_proj.unsqueeze(1),
++            llm_proj.unsqueeze(1),
+         ]
+         acoustic_transformer_inputs = torch.concatenate(acoustic_and_semantic_embeddings, dim=1)
+ 
+@@ -990,6 +1002,8 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
+         self.audio_tok_id = audio_encoder.audio_token
+         self.eos_tok_id = self.tokenizer.instruct.tokenizer.eos_id
+         self.vocab_size = config.text_config.vocab_size
++        self._end_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
++        self._fake_eos_consts: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+ 
+     def get_language_model(self) -> torch.nn.Module:
+         return self.language_model
+@@ -1107,11 +1121,15 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
+             noise=noise,
+             n_steps=n_steps,
+         )
+-        fake_eos = torch.where(
+-            audio_codes[:, 0] == AudioSpecialTokens.id(AudioSpecialTokens.end_audio),
+-            torch.tensor(1.0, dtype=torch.bfloat16),
+-            torch.tensor(0.0, dtype=torch.bfloat16),
+-        )
++        # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
++        consts = self._fake_eos_consts.get(audio_codes.device)
++        if consts is None:
++            consts = (
++                torch.tensor(1.0, dtype=torch.bfloat16, device=audio_codes.device),
++                torch.tensor(0.0, dtype=torch.bfloat16, device=audio_codes.device),
++            )
++            self._fake_eos_consts[audio_codes.device] = consts
++        fake_eos = torch.where(audio_codes[:, 0] == self._end_audio_token_id, consts[0], consts[1])
+         # BxC -> Bx1xC since this is per-step
+         # Make it a list for vllm-omni processing
+         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_tokenizer.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_tokenizer.py
+index fc753a5..23603bb 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_tokenizer.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_tokenizer.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import logging
+ import math
+ from copy import deepcopy
+ from dataclasses import dataclass
+@@ -9,6 +10,7 @@ import numpy as np
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++from torch.nn.utils.rnn import pad_sequence
+ from vllm.config import VllmConfig
+ 
+ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
+@@ -485,9 +487,10 @@ class Attention(nn.Module):
+                 )
+             return slopes  # shape [n_heads], values in (2^-8, 1]
+ 
++        # Keep alibi slopes in fp32 so `forward` can skip the per-call `.to(fp32)` cast.
+         self.register_buffer(
+             "alibi_slopes",
+-            get_alibi_slopes(self.n_local_heads),
++            get_alibi_slopes(self.n_local_heads).to(torch.float32).contiguous(),
+             persistent=False,
+         )
+ 
+@@ -552,8 +555,8 @@ class Attention(nn.Module):
+         # rel_pos[i, j] = j - i
+         rel_pos = positions.unsqueeze(0) - positions.unsqueeze(1)  # (S, S)
+ 
+-        # Alibi bias: slope * (j - i), shape (H, S, S)
+-        alibi_slopes = self.alibi_slopes.to(dtype=xq.dtype, device=xq.device)
++        # Alibi bias: slope * (j - i), shape (H, S, S). Cast only to xq dtype (already on device).
++        alibi_slopes = self.alibi_slopes.to(dtype=xq.dtype)
+         attn_bias = alibi_slopes.view(H, 1, 1) * rel_pos.unsqueeze(0).to(xq.dtype)
+ 
+         # Causal mask: mask out j > i (future positions)
+@@ -584,7 +587,7 @@ class Attention(nn.Module):
+         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.args.head_dim)
+ 
+         if HAS_FLASH_ATTN:
+-            alibi_slopes = self.alibi_slopes.to(torch.float32)
++            # alibi_slopes already fp32 — avoid per-call cast.
+             output = flash_attn_func(
+                 xq,
+                 xk,
+@@ -594,7 +597,7 @@ class Attention(nn.Module):
+                     self.sliding_window,
+                     0 if self.args.causal else self.sliding_window,
+                 ),
+-                alibi_slopes=alibi_slopes,
++                alibi_slopes=self.alibi_slopes,
+             )
+         else:
+             output = self._native_attention(xq, xk, xv)
+@@ -1052,14 +1055,15 @@ class VoxtralTTSAudioTokenizer(nn.Module):
+         """
+         chunk_size = 375  # TODO(chenyos): Hardcode. Fix it
+ 
+-        # Pre-process: find EOA and unshift tokens
+-        processed = []
+-        for codes in codes_list:
+-            eoa_mask = codes[:, 0] == 1
+-            eoa_indices = eoa_mask.nonzero(as_tuple=False)
+-            cutting_point = eoa_indices[0].item() if len(eoa_indices) > 0 else len(codes)
+-            audio_tokens = codes[:cutting_point] - 2
+-            processed.append(audio_tokens)
++        # Compute per-request EOA cutting points in a single D2H instead of one sync per request.
++        flags = []
++        for c in codes_list:
++            eoa_mask = c[:, 0] == 1
++            flags.append(torch.stack([eoa_mask.any().to(torch.long), eoa_mask.long().argmax()]))
++        resolved = torch.stack(flags).cpu().tolist() if flags else []
++        cutting_points = [int(idx) if has else c.shape[0] for (has, idx), c in zip(resolved, codes_list)]
++
++        processed = [c[:cp] - 2 for c, cp in zip(codes_list, cutting_points)]
+ 
+         # Separate empty and non-empty
+         results: list[torch.Tensor | None] = [None] * len(processed)
+@@ -1087,25 +1091,19 @@ class VoxtralTTSAudioTokenizer(nn.Module):
+             chunk_map.append((orig_idx, req_chunk_indices))
+ 
+         # Pad chunks to max length and batch decode
+-        max_chunk_len = max(chunk_lengths)
+-        K = all_chunks[0].shape[1]
+-        padded = torch.zeros(
+-            len(all_chunks),
+-            max_chunk_len,
+-            K,
+-            dtype=all_chunks[0].dtype,
+-            device=all_chunks[0].device,
+-        )
+-        for i, chunk in enumerate(all_chunks):
+-            padded[i, : len(chunk)] = chunk
++        padded = pad_sequence(all_chunks, batch_first=True, padding_value=0.0)
+ 
+         audio_codes = padded.to(device=current_omni_platform.device_type)  # [B, T, K]
+         audio_values = self.decode(audio_codes.transpose(1, 2), dtype=torch.bfloat16)  # [B, 1, T_out]
+         audio_values = audio_values.detach().cpu().float().squeeze(1)  # [B, T_out]
+-        if torch.min(audio_values) < -1.0:
+-            logger.warning("Min value of decoded waveform signal is %s", torch.min(audio_values))
+-        if torch.max(audio_values) > 1.0:
+-            logger.warning("Max value of decoded waveform signal is %s", torch.max(audio_values))
++        # Gate min/max reductions behind logger level.
++        if logger.isEnabledFor(logging.WARNING):
++            amin = float(audio_values.min())
++            amax = float(audio_values.max())
++            if amin < -1.0:
++                logger.warning("Min value of decoded waveform signal is %s", amin)
++            if amax > 1.0:
++                logger.warning("Max value of decoded waveform signal is %s", amax)
+ 
+         # Trim padding and reassemble per request
+         for orig_idx, chunk_indices in chunk_map:

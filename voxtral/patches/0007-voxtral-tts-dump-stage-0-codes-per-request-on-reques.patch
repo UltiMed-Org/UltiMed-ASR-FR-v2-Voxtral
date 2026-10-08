@@ -2,7 +2,7 @@ From 4265bca3ca3f0aff7748ae7867114f58b1064f24 Mon Sep 17 00:00:00 2001
 From: thiswillbeyourgithub
  <26625900+thiswillbeyourgithub@users.noreply.github.com>
 Date: Thu, 10 Sep 2026 12:21:09 +0200
-Subject: [PATCH] voxtral-tts: dump stage-0 codes per request, on request
+Subject: [PATCH 7/8] voxtral-tts: dump stage-0 codes per request, on request
 
 The open checkpoint ships no audio encoder, so the only source of real
 audio/codes pairs to train one on is this model generating them: stage 0 IS
@@ -269,6 +269,3 @@ index 9f9e812..59a8b3c 100644
                  return OmniOutput(
                      text_hidden_states=hidden_states,
                      multimodal_outputs=multimodal_outputs,
--- 
-2.43.0
-

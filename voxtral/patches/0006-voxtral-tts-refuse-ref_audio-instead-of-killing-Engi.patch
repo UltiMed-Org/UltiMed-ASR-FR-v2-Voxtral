@@ -2,7 +2,7 @@ From 0bc304710cf6a47f96a3b4605bc5ff8022bdfd79 Mon Sep 17 00:00:00 2001
 From: thiswillbeyourgithub
  <26625900+thiswillbeyourgithub@users.noreply.github.com>
 Date: Wed, 9 Sep 2026 23:06:14 +0200
-Subject: [PATCH 6/6] voxtral-tts: refuse ref_audio instead of killing
+Subject: [PATCH 6/8] voxtral-tts: refuse ref_audio instead of killing
  EngineCore
 
 The open-source checkpoint has no codec encoder, so encode_waveforms()
