@@ -127,6 +127,15 @@ JUNK_THRESHOLD="${JUNK_THRESHOLD:-0.25}"
 JUNK_AFTER="${JUNK_AFTER:-12}"
 RETRY_ON="${RETRY_ON:-runaway}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
+# SCORE=0 produces audio and stops: no stt pass, no swap back to the ASR container, no
+# retry loop. For a listening session that is the whole job, and it halves the wall clock
+# because the second 9 GB model load is the expensive part, not the whisper decode.
+# What it gives up is the automatic junk net: a runaway is `seconds >= factor * words /
+# rate` and the tts pass records only `bytes` and `request_seconds`, never `seconds`, so
+# nothing detects a degenerate take without the ASR. With SCORE=0 a looped take reaches
+# your ears instead of being regenerated, which for a voice audition is informative
+# anyway. Keep SCORE=1 whenever the WER numbers are the point.
+SCORE="${SCORE:-1}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "driver: needs root to switch containers. Run: sudo -E $0" >&2
@@ -272,6 +281,14 @@ while :; do
         *)  echo "!!! tts pass exited ${rc}; aborting" >&2; exit "${rc}" ;;
     esac
     tts_dry=$(( rc == 11 ? 1 : 0 ))
+
+    if (( ! SCORE )); then
+        # Break rather than fall through: with no stt pass `stt_dry` stays 0, so the
+        # "both passes ran dry" test below could never fire and the loop would spin,
+        # re-running a tts pass that has nothing to do until someone killed it.
+        echo "=== $(date '+%F %T') SCORE=0: audio only, skipping the stt pass and its swap"
+        break
+    fi
 
     switch stt
     rc=0; run_pass stt || rc=$?

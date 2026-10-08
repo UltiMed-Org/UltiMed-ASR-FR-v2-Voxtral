@@ -11,9 +11,16 @@
 # buvable" or "Monocryl 4-0", so the corpus here is the ten highest-CER rows of the
 # finished v1 run (see corpus_medical_fr.txt).
 #
-# 160 takes, about 40 minutes of audio, so roughly 10 minutes of GPU plus two container
-# swaps. Resumable: every take lands in the ledger as it completes, and the sentence list
-# is minted once, so re-running after an interruption costs only the take in flight.
+# 160 takes, about 40 minutes of audio. By default it only SYNTHESIZES: no whisper pass,
+# no swap back to the ASR container, because judging these voices is your ears' job and
+# the second 9 GB model load costs more wall clock than the decode it would run. Set
+# SCORE=1 to also transcribe, score and auto-regenerate degenerate takes, which is worth
+# it when you want numbers next to the audio rather than instead of it. The one thing
+# SCORE=0 gives up: nothing detects a looped take, so you will hear it. For a voice
+# audition that is information, not noise.
+#
+# Resumable: every take lands in the ledger as it completes, and the sentence list is
+# minted once, so re-running after an interruption costs only the take in flight.
 #
 # Do NOT run the whole script under sudo. Only the container swap needs root, and that is
 # the one line that asks for it; running the rest as root would leave root-owned wavs in
@@ -26,7 +33,8 @@
 #   RUN       stage directory name under cache/cloning (default MED16)
 #   VOICES    the candidate list (default voices_fr_16.txt)
 #   SENTENCES how many corpus sentences per voice (default 10, i.e. all of them)
-#   Anything driver.sh reads also passes through, e.g. STT_SCALE or EULER_STEPS.
+#   SCORE     1 to add the whisper pass and the numbers (default 0, audio only)
+#   Anything driver.sh reads also passes through, e.g. EULER_STEPS.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +46,7 @@ POOL="${POOL:-GRID}"
 VOICES="${VOICES:-${HERE}/voices_fr_16.txt}"
 CORPUS="${CORPUS:-${HERE}/corpus_medical_fr.txt}"
 SENTENCES="${SENTENCES:-10}"
+SCORE="${SCORE:-0}"
 # Derived, never hardcoded: a literal /media/<name> in a tracked file leaks the username.
 DEST="${DEST:-/media/$(id -un)/4TO_DRIVE/voxtral_grid/audition_medical}"
 STAGE_DIR="${REPO_ROOT}/cache/cloning/${RUN}"
@@ -49,29 +58,31 @@ export CLONING_RUN="${RUN}" CLONING_POOL="${POOL}"
 
 echo "== ${RUN}: $(grep -vc '^#\|^$' "${VOICES}") voices x ${SENTENCES} medical sentences -> ${DEST}"
 
-# 1. Synthesize and score. driver.sh owns the container swaps, the health waits, the retry
-# budget, the junk gate and the disk-space floor, so nothing here reimplements any of it;
-# it also drops privileges to TARGET_USER for every python call, which is why the files it
-# writes stay ours. PREPARE mints the sentence list on the first run only (driver.sh skips
-# it once sentences.json exists, so a resume cannot re-roll the corpus mid-run).
+# 1. Synthesize. driver.sh owns the container swap, the health wait and the disk-space
+# floor, so nothing here reimplements any of it; it also drops privileges to TARGET_USER
+# for every python call, which is why the files it writes stay ours. PREPARE mints the
+# sentence list on the first run only (driver.sh skips it once sentences.json exists, so a
+# resume cannot re-roll the corpus mid-run).
 #
-# --max-words 40 is not decoration: the default is 18 and seven of the ten sentences are
-# longer than that, so the default would silently audition the three shortest.
+# --curated is mandatory for this corpus, not a preference. `sentences` defaults to
+# screening prose out of a Wikipedia dump, and its filters are right for that and exactly
+# backwards here: it rejects any line containing a digit, so it keeps 2 of these 10 and
+# the 2 it keeps are the only ones with no drug name, dose or acronym in them.
 #
 # INCLUDE_BASES is deliberately left at its default 1. It is not "also add the 20 shipped
 # voices": `restrict(load_voices(include_bases=...), only_file)` intersects, so with 0 the
 # shipped fr_female and fr_male would be absent from the candidate set and ONLY_FILE would
 # quietly narrow 16 voices to 14, losing the two references the comparison rests on.
 sudo RUN="${RUN}" POOL="${POOL}" DEPTH="${SENTENCES}" ONLY_FILE="${VOICES}" \
-     STT_LANGUAGE=fr TARGET_USER="$(id -un)" \
-     PREPARE="sentences --corpus ${CORPUS} --count ${SENTENCES} --min-words 8 --max-words 40" \
+     SCORE="${SCORE}" STT_LANGUAGE=fr TARGET_USER="$(id -un)" \
+     PREPARE="sentences --curated --corpus ${CORPUS} --count ${SENTENCES}" \
      "${HERE}/driver.sh"
 
-# 2. What the numbers say, before any listening. A voice that is junk on this corpus is
-# junk on the text v2 is made of, whatever it sounded like on FLEURS. This also writes the
-# per_sentence.csv that step 4 reads to pick each voice's worst takes, so it is a
-# dependency, not a report: skipping it makes audition.py fall back to arbitrary sentences.
-uv run "${HERE}/sweep.py" stats --only-file "${VOICES}"
+# 2. The numbers, if there are any. driver.sh already runs `stats` itself when it scores,
+# so this is only here to restrict the tables to our 16 voices.
+if (( SCORE )); then
+    uv run "${HERE}/sweep.py" stats --only-file "${VOICES}"
+fi
 
 # 3. audition.py wants cluster/role/voice rows rather than bare names. The roster groups by
 # identity, which is what puts the two de_female candidates (h_itf_def and h_frm_def) in
@@ -80,8 +91,12 @@ ROSTER="${STAGE_DIR}/med_roster.txt"
 uv run "${HERE}/voice_distance.py" roster "${VOICES}" --out "${ROSTER}"
 
 # 4. The listening tree.
+# --sentences 0 means "every sentence in the list, in order". The default instead PICKS
+# the clearest few, which is right for a 300-line FLEURS slice and wrong for a corpus of
+# ten lines chosen by hand: its 12-26 word window alone would drop the 4 longest of ours,
+# and its clarity ranking needs a WER per voice, which an unscored run has none of.
 uv run "${HERE}/audition.py" --dest "${DEST}" --stage-dir "${STAGE_DIR}" \
-    --sentences "${SENTENCES}" --voice-list "${ROSTER}"
+    --sentences 0 --voice-list "${ROSTER}"
 
 cat <<SUMMARY
 
@@ -93,5 +108,8 @@ cat <<SUMMARY
    h_frm_def, is NOT last: the roster sorts by identity, so it sits in cluster 7
    right beside h_itf_def, which is the point (both are de_female, and that pair
    is the one choice where you are picking a variant rather than a voice).
-   Numbers: ${STAGE_DIR}/stats.md
+   Each voice's directory holds all ten sentences, in corpus order: s00 to s09
+   are dictionary, PARHAF, drug names then acronyms.
+   If a take loops syllables it is a dead voice, not a bad sentence; SCORE=1
+   re-runs with whisper and regenerates those automatically.
 SUMMARY
