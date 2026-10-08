@@ -6,8 +6,29 @@
 # them. FLEURS sentences cannot answer this question: a voice that reads Wikipedia prose
 # cleanly can still derail on 'Epidyolex solution buvable' or 'ypT2 N0 R0'.
 #
-# Source: UltiMed-ASR-FR-v1 (CC BY 4.0 subsets), via Claude Code. One sentence per line,
-# which is what `sweep.py sentences --corpus` expects.
+# The last TWO lines are different in kind and were written for this file rather than
+# taken from v1: they are ~65 words each, which at the grid's measured 2.15 words/second
+# (median over 9396 clean French takes) is about 30 seconds of speech, against ~12 s for
+# the ten above. They test stability over length, which is a separate failure from
+# mispronunciation: Voxtral degenerates by looping syllables, and a voice can read three
+# short sentences perfectly and still lose the plot halfway through a long one.
+#
+# Their length is pinned by the junk test, so do not lengthen them casually. A take is a
+# runaway at RUNAWAY_FACTOR (3.0) x what the voice's own rate predicts, and separately junk
+# if it hit the token ceiling, and the sweep caps takes at 1125 tokens = 90 s. At 64 words
+# the runaway threshold is 3 x 64 / 2.15 = 89.3 s, which just fits under that cap, so both
+# tests still work. At 73 words it is 102 s, past the cap: a degenerate take gets truncated
+# at 90 s, measures as healthy, and the voice looks clean precisely because it is broken.
+# The ceiling test does still catch it (see `is_junk`), but the runaway margin is gone, so
+# 64 words is the ceiling for this file unless the run also raises MAX_TOKENS.
+#
+# Neither verdict needs the ASR: the tts pass records each take's duration from the wav it
+# just wrote, so SCORE=0 keeps the junk net and loses only the WER numbers.
+#
+# Source: UltiMed-ASR-FR-v1 (CC BY 4.0 subsets) for the first ten, via Claude Code. One
+# sentence per line, which is what `sweep.py sentences --corpus --curated` expects.
+# `--curated` is required: the default screen rejects every line here, since they all
+# carry digits.
 Le champ électrique entre deux plaques parallèles séparées de 2 centimètres sous une différence de potentiel de 10 volts est de 5 volts par centimètre, soit 500 volts par mètre.
 Elle a une consommation alcoolo-tabagique occasionnelle. Elle pèse 75 kilos pour une taille de 1 mètre 70.
 Une décision de soins de confort exclusif a été prise. Madame Jakymiw est décédée dans le service le 25 novembre à 1 heure 30.
@@ -18,3 +39,5 @@ Consultation d'hématologie pour une hyperviscosité plasmatique. La viscosité 
 Prescription d'Ucedane 200 milligrammes par kilogramme par jour en trois prises, à débuter dès ce soir, pour une hyperammoniémie à 180 micromoles par litre.
 Fermeture du fascia superficialis au vicryl 3-0. Surjet intradermique au Monocryl 4-0. Application de colle cutanée.
 À l'arrivée du patient inconscient, l'infirmier a débuté une ventilation manuelle au BAVU en attendant l'intubation orotrachéale.
+Compte rendu d'intervention : patient installé en décubitus dorsal, induction par propofol 2 milligrammes par kilogramme et sufentanil 0,3 microgramme par kilogramme, curarisation au rocuronium 0,6 milligramme par kilogramme, intubation orotrachéale au premier essai avec une sonde de 7,5, ventilation en volume contrôlé à 6 millilitres par kilogramme, pression expiratoire positive à 5 centimètres d'eau, antibioprophylaxie par céfazoline 2 grammes en intraveineux lent.
+Synthèse de l'hospitalisation : la patiente a été admise pour une pyélonéphrite aiguë obstructive sur un calcul de l'uretère gauche de 8 millimètres, fébrile à 39,2 degrés, créatininémie à 148 micromoles par litre, protéine C réactive à 212 milligrammes par litre, hémocultures positives à Escherichia coli sensible à la ceftriaxone, montée de sonde JJ en urgence, relais par amoxicilline acide clavulanique pendant quatorze jours.

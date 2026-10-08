@@ -54,7 +54,8 @@ def mint(*flags: str) -> subprocess.CompletedProcess:
         Not checked: half of this file is about the failure path.
     """
     return subprocess.run(
-        ["uv", "run", str(SWEEP), "sentences", "--corpus", str(CORPUS), "--count", "10", *flags],
+        ["uv", "run", str(SWEEP), "sentences", "--corpus", str(CORPUS),
+         "--count", str(len(expected)), *flags],
         cwd=REPO, capture_output=True, text=True,
         # CLONING_POOL is irrelevant here (no pool is read) but CLONING_RUN decides where
         # sentences.json lands, so it must point somewhere disposable.
@@ -64,7 +65,15 @@ def mint(*flags: str) -> subprocess.CompletedProcess:
 
 expected = [line.strip() for line in CORPUS.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")]
-assert len(expected) == 10, f"corpus changed shape: {len(expected)} lines, expected 10"
+assert len(expected) == 12, f"corpus changed shape: {len(expected)} lines, expected 12"
+
+# The last two are the ~30 s stability pair, and their length is load-bearing in both
+# directions: under ~60 words they stop testing stability over length, and over 64 their
+# runaway threshold (3 x words / 2.15 words per second) passes the sweep's 90 s token cap,
+# at which point a degenerate take is truncated and measures as healthy.
+long_words = [len(line.split()) for line in expected[-2:]]
+assert all(60 <= count <= 64 for count in long_words), \
+    f"the long pair is {long_words} words; outside 60-64 the junk test stops working"
 
 # 1. Curated mode keeps every line, verbatim and in order. Verbatim matters beyond
 # tidiness: the sentence text IS the WER reference, so a corpus line silently reshaped
@@ -73,13 +82,16 @@ done = mint("--curated")
 assert done.returncode == 0, f"curated mode failed:\n{done.stderr}"
 rows = json.loads((stage / "sentences.json").read_text(encoding="utf-8"))
 assert [row["text"] for row in rows] == expected, "curated mode altered or reordered lines"
-assert [row["sid"] for row in rows] == [f"s{i:02d}" for i in range(10)], rows
-print(f"1. curated: all {len(rows)} lines verbatim, in file order  OK")
+assert [row["sid"] for row in rows] == [f"s{i:02d}" for i in range(len(expected))], rows
+# File order is the contract that puts the long pair last, so --sentences N trims the
+# short ones first and the stability test is the thing you keep, not the thing you lose.
+assert len(rows[-1]["text"].split()) >= 60, "the long pair did not land last"
+print(f"1. curated: all {len(rows)} lines verbatim, in file order, long pair last OK")
 
 # 2. The sid scheme is the join key for tts, stt, stats and audition.py, so both modes must
 # produce it identically. One shared writer is why; this notices if that is ever forked.
 assert all(row["sid"] == f"s{index:02d}" for index, row in enumerate(rows)), rows
-print("2. sids are s00..s09, the join key later passes use OK")
+print(f"2. sids are s00..s{len(rows) - 1:02d}, the join key later passes use OK")
 
 # 3. Screen mode must still reject this corpus, with the count it actually keeps. If this
 # ever passes, the prose filters went missing and every grid run's numbers changed meaning.
@@ -88,7 +100,7 @@ done = mint()
 assert done.returncode != 0, "screen mode accepted a digit-heavy medical corpus"
 assert "only 2 usable" in done.stderr + done.stdout, \
     f"screen mode failed differently than expected:\n{done.stderr}"
-print("3. screen: still rejects it, keeping 2 of 10         OK")
+print(f"3. screen: still rejects it, keeping 2 of {len(expected)}         OK")
 
 shutil.rmtree(stage, ignore_errors=True)
 if (REPO / "cache" / "cloning" / "ZZSENT").exists():
