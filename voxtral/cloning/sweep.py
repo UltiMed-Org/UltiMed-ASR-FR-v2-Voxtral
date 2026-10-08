@@ -1049,13 +1049,39 @@ def cli() -> None:
                colorize=True)
 
 
+def write_sentences(texts: list[str], *, kind: str) -> None:
+    """Write this run's sentence list, the one file every later pass keys off.
+
+    Shared by the screen and curated paths of `sentences` so the sid scheme lives in one
+    place: `tts`, `stt`, `stats` and audition.py all join on those sids, so a second
+    writer that numbered them differently would not fail, it would mis-join.
+
+    Parameters
+    ----------
+    texts : list[str]
+        Sentence texts, already selected and ordered.
+    kind : str
+        Label for the log line, so the boot record says which path produced the list.
+    """
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    sentences = [{"sid": f"s{index:02d}", "text": text} for index, text in enumerate(texts)]
+    (STAGE_DIR / "sentences.json").write_text(json.dumps(sentences, indent=2, ensure_ascii=False))
+    for entry in sentences:
+        logger.info(f"{entry['sid']}  {entry['text']}")
+    logger.success(f"{len(sentences)} {kind} sentences written to {STAGE_DIR / 'sentences.json'}")
+
+
 @cli.command("sentences")
 @click.option("--count", default=12, show_default=True, help="How many screen sentences to keep.")
 @click.option("--min-words", default=8, show_default=True, help="Shortest sentence to accept.")
 @click.option("--max-words", default=18, show_default=True, help="Longest sentence to accept.")
 @click.option("--seed", default=0, show_default=True, help="Seed for the sentence draw.")
 @click.option("--corpus", default=str(CORPUS), show_default=True, help="Source text, one paragraph per line.")
-def cmd_sentences(count: int, min_words: int, max_words: int, seed: int, corpus: str) -> None:
+@click.option("--curated/--screen", default=False, show_default=True,
+              help="Take the corpus lines verbatim instead of filtering prose out of it. "
+                   "For a hand-written corpus, where every filter below is wrong.")
+def cmd_sentences(count: int, min_words: int, max_words: int, seed: int, corpus: str,
+                  curated: bool) -> None:
     """Pick the screen texts out of the French corpus B7 already downloaded.
 
     Not FLEURS, and the reason is worth recording: FLEURS' value is its *human*
@@ -1069,10 +1095,38 @@ def cmd_sentences(count: int, min_words: int, max_words: int, seed: int, corpus:
     "soixante-quinze", and while `voice_survey.fold_numbers` repairs the common cases,
     the cheapest fix is to not create the problem. Dates, decimals and ranges are
     exactly where that repair is least reliable.
+
+    `--curated` turns every filter above off and takes the non-comment lines verbatim,
+    for the case the screen cannot serve: a corpus written by hand to be hard. The same
+    distinction `fleurs` already records, that a screen may reject a hard line to keep
+    the measurement about voices while a benchmark may not, except that here the hard
+    lines ARE the question. Measured on corpus_medical_fr.txt, ten sentences hand-picked
+    as the highest-CER rows of a finished run: the screen keeps 2 of 10, and the 2 it
+    keeps are the only two carrying no drug name, dose or acronym, so it answers the
+    opposite of what was asked. Every rejection was `digits` ("Synacthene 250
+    microgrammes"), plus the sentence splitter cutting multi-sentence lines into
+    sub-min-words fragments ("Surjet intradermique au Monocryl 4-0." is 5 words).
+
+    Curated mode also keeps file order rather than shuffling, because a hand-written
+    corpus is usually ordered on purpose (ours spreads 3/3/3/1 over dictionary, PARHAF,
+    drug names and acronyms), so `--count 3` should mean the first three, not a sample.
+    It ignores --min-words/--max-words too: honouring them here would reintroduce the
+    silent loss, since the default --max-words 18 drops 7 of those 10 lines.
     """
     source = Path(corpus)
     if not source.is_file():
         raise SystemExit(f"no corpus at {source}; run `mint_codes.py corpus --language fr`")
+
+    if curated:
+        # dict.fromkeys dedupes while keeping file order, unlike the sorted(set(...)) the
+        # screen uses: a repeated line is still a mistake, but the order is deliberate.
+        curated_lines = list(dict.fromkeys(
+            line.strip() for line in source.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")))
+        if len(curated_lines) < count:
+            raise SystemExit(f"only {len(curated_lines)} lines in {source}, wanted {count}")
+        write_sentences(curated_lines[:count], kind="curated")
+        return
 
     candidates: list[str] = []
     for paragraph in source.read_text().splitlines():
@@ -1104,14 +1158,7 @@ def cmd_sentences(count: int, min_words: int, max_words: int, seed: int, corpus:
     if len(unique) < count:
         raise SystemExit(f"only {len(unique)} usable sentences in {source}, wanted {count}")
     random.Random(seed).shuffle(unique)
-    chosen = unique[:count]
-
-    STAGE_DIR.mkdir(parents=True, exist_ok=True)
-    sentences = [{"sid": f"s{index:02d}", "text": text} for index, text in enumerate(chosen)]
-    (STAGE_DIR / "sentences.json").write_text(json.dumps(sentences, indent=2, ensure_ascii=False))
-    for entry in sentences:
-        logger.info(f"{entry['sid']}  {entry['text']}")
-    logger.success(f"{len(sentences)} screen sentences written to {STAGE_DIR / 'sentences.json'}")
+    write_sentences(unique[:count], kind="screen")
 
 
 @cli.command("fleurs")
