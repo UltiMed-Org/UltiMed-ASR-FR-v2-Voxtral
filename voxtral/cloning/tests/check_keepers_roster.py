@@ -191,5 +191,60 @@ if run and (REPO / "cache" / "cloning" / os.environ.get("CLONING_POOL", "GRID") 
 else:
     print("7. no pool for CLONING_POOL              SKIP")
 
+# 8. `--sentences 0` takes the run's sentence list as given, and an unscored run still
+# builds a tree. Both halves were broken for a listening session on a hand-written corpus:
+# pick_sentences exists to find EASY sentences in a 300-line FLEURS slice (clarity rank,
+# 12-26 word window, no guillemets), so on ten lines chosen to be hard it dropped the ones
+# that mattered; and with no stt pass there is no per_sentence.csv, which made read_wer
+# raise on open and write_index raise a KeyError AFTER the wavs were already copied, the
+# worst time to fail. Built from silent wavs so this needs no GPU, server or sweep data.
+import json as _json
+import struct
+import wave
+
+stage = REPO / "cache" / "cloning" / "ZZSENT0"
+shutil.rmtree(stage, ignore_errors=True)
+(stage / "wav").mkdir(parents=True)
+# 10 and 27 words: one under MIN_WORDS, one over MAX_WORDS, so both are invisible to the
+# picker. If a future change routes --sentences 0 back through it, they vanish and this
+# fails.
+texts = {"s00": " ".join(["mot"] * 10) + ".", "s01": " ".join(["mot"] * 27) + "."}
+(stage / "sentences.json").write_text(_json.dumps(
+    [{"sid": sid, "text": text} for sid, text in texts.items()]), encoding="utf-8")
+ledger = []
+for voice in ["fr_female", "h_itf_def"]:
+    (stage / "wav" / voice).mkdir(parents=True, exist_ok=True)
+    for sid in texts:
+        wav = stage / "wav" / voice / f"{sid}.wav"
+        with wave.open(str(wav), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(24000)
+            handle.writeframes(struct.pack("<h", 0) * 2400)
+        ledger.append({"voice": voice, "sid": sid, "attempt": 0,
+                       "wav": str(wav.relative_to(REPO)), "bytes": wav.stat().st_size})
+(stage / "ledger.jsonl").write_text("".join(_json.dumps(row) + "\n" for row in ledger))
+(stage / "roster.txt").write_text("1\tshipped\tfr_female\n2\thybrid\th_itf_def\n")
+assert not (stage / "per_sentence.csv").exists(), "the unscored case is the one under test"
+
+tree = REPO / "cache" / "cloning" / "ZZSENT0_tree"
+shutil.rmtree(tree, ignore_errors=True)
+done = subprocess.run(
+    ["uv", "run", str(REPO / "voxtral" / "cloning" / "audition.py"), "--dest", str(tree),
+     "--stage-dir", str(stage), "--sentences", "0", "--voice-list", str(stage / "roster.txt")],
+    cwd=REPO, capture_output=True, text=True,
+)
+assert done.returncode == 0, f"audition.py failed on an unscored run:\n{done.stderr}"
+wavs = sorted(path.name for path in tree.rglob("*.wav"))
+# 2 voices x 2 sentences, plus one side-by-side copy per voice.
+assert len(wavs) == 6, wavs
+assert (tree / "00_meme_phrase").is_dir(), "no side-by-side directory"
+readme = (tree / "README.md").read_text(encoding="utf-8")
+assert "SCORE=1" in readme, "the index does not say why the WER column is empty"
+assert "| - | - |" in readme, f"missing WER should render as a dash:\n{readme}"
+shutil.rmtree(stage, ignore_errors=True)
+shutil.rmtree(tree, ignore_errors=True)
+print("8. --sentences 0 on an unscored run: tree built  OK")
+
 
 print("\nall checks passed")

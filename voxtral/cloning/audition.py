@@ -239,16 +239,26 @@ def write_index(
     lines.append("")
     lines.append("## WER de chaque voix sur ces phrases")
     lines.append("")
-    lines.append(
-        "WER Whisper de la premiere tentative, en pourcent. Sert a savoir si une prise "
-        "deplaisante est un probleme de voix ou juste une prise ratee."
-    )
+    if wer:
+        lines.append(
+            "WER Whisper de la premiere tentative, en pourcent. Sert a savoir si une prise "
+            "deplaisante est un probleme de voix ou juste une prise ratee."
+        )
+    else:
+        # A run synthesized without the stt pass has no WER at all, which is a normal state
+        # for a listening session. Say so in the file rather than leaving an empty table or,
+        # as this did before, raising a KeyError after the tree was already written.
+        lines.append(
+            "Cette serie n'a pas ete transcrite (SCORE=0) : aucun WER disponible. "
+            "Relancer avec SCORE=1 pour les chiffres."
+        )
     lines.append("")
     header = "| locuteur | role | voix | " + " | ".join(str(i) for i in range(1, len(picked) + 1)) + " |"
     lines.append(header)
     lines.append("|---" * (3 + len(picked)) + "|")
     for cluster, role, voice in roster:
-        cells = [f"{100 * wer[(voice, sid)]:.0f}" for sid in picked]
+        cells = ["-" if (voice, sid) not in wer else f"{100 * wer[(voice, sid)]:.0f}"
+                 for sid in picked]
         lines.append(f"| {cluster} | {role} | `{voice}` | " + " | ".join(cells) + " |")
     lines.append("")
     (dest / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -266,7 +276,8 @@ def write_index(
     "sentence_count",
     default=8,
     show_default=True,
-    help="How many FLEURS sentences each voice reads.",
+    help="How many sentences each voice reads, picked for clarity (0 = every sentence in "
+         "the run's list, in order, unfiltered).",
 )
 @click.option(
     "--voice-list",
@@ -290,17 +301,30 @@ def main(*, dest: Path, sentence_count: int, voice_list: Path, stage_dir: Path) 
 
     sentences = {row["sid"]: row["text"] for row in json.loads((stage_dir / "sentences.json").read_text(encoding="utf-8"))}
     available = read_first_attempts(stage_dir / "ledger.jsonl")
-    wer = read_wer(stage_dir / "per_sentence.csv")
+    # A run that was never scored has no per_sentence.csv, which is a legitimate state
+    # rather than a missing step: `--sentences 0` needs no WER, since it picks nothing.
+    scored = stage_dir / "per_sentence.csv"
+    wer = read_wer(scored) if scored.is_file() else {}
 
     missing = [voice for voice in voices if not any(key[0] == voice for key in available)]
     if missing:
         raise click.ClickException(f"no takes in the ledger for: {', '.join(missing)}")
 
-    picked = pick_sentences(
-        sentences=sentences, voices=voices, wer=wer, available=available, count=sentence_count
-    )
-    if len(picked) < sentence_count:
-        logger.warning(f"only {len(picked)} sentences satisfied every kept voice")
+    if sentence_count == 0:
+        # Hand-picked corpus: the selection already happened, outside this tool. Every
+        # filter in pick_sentences would now work against the intent, since they exist to
+        # find EASY sentences in a big FLEURS slice (clarity ranking, a 12-26 word window,
+        # no guillemets) whereas a curated list is usually hard on purpose. On
+        # corpus_medical_fr.txt the window alone would drop the 4 longest of 10, and the
+        # clarity rank needs a WER for every voice, which an unscored run does not have.
+        picked = list(sentences)
+        logger.info(f"--sentences 0: taking all {len(picked)} sentences as listed")
+    else:
+        picked = pick_sentences(
+            sentences=sentences, voices=voices, wer=wer, available=available, count=sentence_count
+        )
+        if len(picked) < sentence_count:
+            logger.warning(f"only {len(picked)} sentences satisfied every kept voice")
     for index, sid in enumerate(picked, start=1):
         logger.info(f"sentence {index} {sid} ({len(sentences[sid].split())} words)")
 
