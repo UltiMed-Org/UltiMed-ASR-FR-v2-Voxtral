@@ -69,11 +69,16 @@ Batch mode (--batch FILE.jsonl): synthesize every row of a JSONL file
 instead of a single --text. Each row needs an `input` (or `text`) field;
 the output name is the row's `output` field, else `<id>.<format>`, else a
 zero-padded line number, written under --output (a DIRECTORY in this mode).
-All the voice/speed/sampling flags apply to every row. Existing files are
+All the voice/speed/sampling flags apply to every row, and a row may
+override any of them for itself by naming it as a key, e.g.
+{"input": "Bonjour.", "output": "a.wav", "voice": "fr_male",
+ "cfg_alpha": 2.5, "noise_seed": 7}. That is how a sweep over voices or
+cfg_alpha runs as one invocation rather than one process per cell. An
+unknown key is rejected rather than ignored. Existing files are
 skipped so an interrupted run resumes on re-run (unless --overwrite); rows
 go out --concurrency at a time (default 4), which a vLLM/Voxtral server
 batches server-side for a big speedup (use 1 for the single-context TADA
-backend).
+backend, or when sweeping euler_steps, which is shared per decode step).
 
 Refs:
   https://github.com/CrispStrobe/CrispASR/issues/86#issuecomment-4422827115
@@ -86,6 +91,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
+import inspect
 import io
 import json
 import subprocess
@@ -555,6 +562,63 @@ def _body_from_args(text: str, args: argparse.Namespace) -> dict:
     )
 
 
+# Keys a batch row may carry besides its text and its filename: every synthesis knob
+# build_speech_body accepts, derived from its signature rather than listed, so a knob added
+# there becomes per-row overridable with no second list to forget. `text` is the row's own
+# input and `response_format` is excluded on purpose: the extension of the output file and
+# the format asked for must not be able to disagree row by row.
+ROW_OVERRIDES = frozenset(inspect.signature(build_speech_body).parameters) - {
+    "text", "response_format",
+}
+# The row's own plumbing, not knobs. `text` is accepted as an alias for `input` because
+# cmd_batch already reads either.
+ROW_RESERVED = frozenset({"input", "text", "output", "id"})
+
+
+def row_overrides(row: dict) -> tuple[dict, str | None]:
+    """Split a batch row's per-request knobs out of its plumbing keys.
+
+    Parameters
+    ----------
+    row
+        One decoded JSONL object from `--batch`.
+
+    Returns
+    -------
+    tuple of (dict, str or None)
+        The overrides to apply for that row, and an error message if the row
+        names a key that is not a knob (in which case the overrides are empty).
+
+    An unknown key is an error rather than something ignored, because silently
+    ignoring it is the exact failure this whole repo keeps tripping on: stock
+    vllm-omni drops unknown request fields and still answers 200, so a sweep
+    over a misspelled `cfg_alpa` runs entirely at the server default and the
+    wavs look like a result. A rejected row costs one line of output instead.
+    """
+    overrides = {k: v for k, v in row.items() if k not in ROW_RESERVED}
+    unknown = sorted(set(overrides) - ROW_OVERRIDES)
+    if unknown:
+        return {}, (f"unknown key(s) {', '.join(unknown)}; "
+                    f"row keys must be one of {', '.join(sorted(ROW_RESERVED | ROW_OVERRIDES))}")
+    return overrides, None
+
+
+def args_with_overrides(args: argparse.Namespace, overrides: dict) -> argparse.Namespace:
+    """Return a copy of `args` with a batch row's overrides applied.
+
+    Overriding the namespace rather than patching the request body is what
+    keeps one request shape in the program: the row's `cfg_alpha` then travels
+    through build_speech_body exactly as the flag does, which matters because
+    that function decides *where* a knob goes (Voxtral's cfg_alpha lands in
+    `extra_params`, not as a flat field) and warns about bad values. A shallow
+    copy is enough since every knob is a scalar or a string.
+    """
+    row_args = copy.copy(args)
+    for key, value in overrides.items():
+        setattr(row_args, key, value)
+    return row_args
+
+
 def ensure_baked_voice(name: str, language: str | None, force: bool) -> str:
     """Bake ./voices/<name> into a tada-ref GGUF (if needed) and return the
     container-side voice path to send as the request `voice`.
@@ -719,11 +783,20 @@ def cmd_batch(base_url: str, jsonl_path: Path, args: argparse.Namespace) -> int:
     time so a vLLM/Voxtral server can batch them server-side. Reuses the same
     _body_from_args + _synthesize path as single mode, so every voice/speed/
     sampling flag applies identically to each row.
+
+    A row may also carry any synthesis knob as a key (`voice`, `cfg_alpha`,
+    `euler_steps`, `noise_seed`, `speed`, ...), which overrides the flag of the
+    same name for that row alone; see ROW_OVERRIDES. That is what makes a sweep
+    one invocation instead of one process per cell: on Voxtral these knobs are
+    genuinely per request (the model reads a cfg_alpha per row), so varying them
+    inside one concurrent batch is sound. The exception is `euler_steps`, which
+    is a loop bound shared by every request in a decode step and is honoured
+    only when they all agree, so sweep that one with --concurrency 1.
     """
     out_dir = Path(args.output or "tts_batch")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    todo: list[tuple[Path, str]] = []
+    todo: list[tuple[Path, str, dict]] = []
     planned: set[Path] = set()
     skipped_existing = bad_rows = 0
     with jsonl_path.open() as f:
@@ -739,6 +812,11 @@ def cmd_batch(base_url: str, jsonl_path: Path, args: argparse.Namespace) -> int:
             text = row.get("input") or row.get("text")
             if not text:
                 print(f"{jsonl_path}:{lineno} no 'input'/'text' field, row skipped", file=sys.stderr)
+                bad_rows += 1
+                continue
+            overrides, bad_key = row_overrides(row)
+            if bad_key:
+                print(f"{jsonl_path}:{lineno} {bad_key}, row skipped", file=sys.stderr)
                 bad_rows += 1
                 continue
             if row.get("output"):
@@ -757,7 +835,7 @@ def cmd_batch(base_url: str, jsonl_path: Path, args: argparse.Namespace) -> int:
             if out.exists() and not args.overwrite:
                 skipped_existing += 1
                 continue
-            todo.append((out, text))
+            todo.append((out, text, overrides))
 
     print(f"{jsonl_path}: {len(planned)} rows planned, {skipped_existing} already done, "
           f"{len(todo)} to generate, {bad_rows} bad rows", file=sys.stderr)
@@ -772,8 +850,9 @@ def cmd_batch(base_url: str, jsonl_path: Path, args: argparse.Namespace) -> int:
     # for the single-context TADA/crispasr backend pass --concurrency 1.
     pool = ThreadPoolExecutor(max_workers=max(1, args.concurrency))
     futures = {pool.submit(_synthesize, base_url,
-                           _body_from_args(text, args), out, args.timeout): out
-               for out, text in todo}
+                           _body_from_args(text, args_with_overrides(args, overrides)),
+                           out, args.timeout): out
+               for out, text, overrides in todo}
     try:
         for fut in _iter_progress(as_completed(futures), len(futures)):
             out = futures[fut]
@@ -818,7 +897,10 @@ def main() -> int:
                         "a single --text. Each row needs an 'input' (or 'text') field; "
                         "the output name comes from the row's 'output' field, else "
                         "'<id>.<format>', else a zero-padded line number. All the "
-                        "voice/speed/sampling flags apply to every row.")
+                        "voice/speed/sampling flags apply to every row, and a row can "
+                        "override any one of them for itself by naming it as a key "
+                        "('voice', 'cfg_alpha', 'noise_seed', ...), which is how a sweep "
+                        "runs in one invocation.")
     p.add_argument("--overwrite", action="store_true",
                    help="Batch mode: regenerate rows whose output file already exists "
                         "(default: skip them, so a killed run resumes on re-run).")
