@@ -250,17 +250,34 @@ services:
       # one fixed step count), so sweep without restarting:
       - VOXTRAL_EULER_STEPS=16
       # Stage-0 classifier-free guidance scale. Higher = the decoder sticks more
-      # tightly to the text at the cost of naturalness/expressivity. Guide:
+      # tightly to the text at the cost of naturalness/expressivity. The guide
+      # below is measured, not from the paper: 16 French voices x 10 values x one
+      # dense medical sentence, listened to on 2026-10-13 (PLAN stage A10), with
+      # the noise seed pinned so cfg was the only variable.
       #   1.0        = CFG OFF -> garbled/off-text audio; REFUSED by entrypoint.
-      #   1.2        = paper/default, the recommended setting.
-      #   ~1.3-1.7   = stronger text adherence; may sound flatter/harsher.
-      #   >~2.0      = over-guided, tends to introduce artifacts/distortion.
+      #   <1.2       = degrades FAST, and faster than the same distance above 2.0:
+      #                at 0.5 and below every one of the 16 voices rambled past
+      #                2.7x the sentence's natural length instead of stopping.
+      #   1.2-2.0    = usable band for the 20 shipped voices.
+      #   1.5-2.0    = usable band for the hybrid voices, which need more guidance
+      #                than the shipped ones to hold their articulation.
+      #   2.0        = ACTIVE. Best starting point for French medical text on both
+      #                kinds of voice. 1.5 is the floor worth retrying a bad take
+      #                at, which is the other reason to sit at the top of the band:
+      #                there is room to go down, and little to gain going up.
+      #   3.0+       = distortion grows with the value, and so does the risk of a
+      #                take that never finishes: above 3.0 the longest takes in the
+      #                sweep were exactly 327.68 s, i.e. they ran to the
+      #                VOXTRAL_MAX_TOKENS ceiling below and were cut off there.
       # Only the default (`tts.py --cfg-alpha` overrides it per request), but do NOT
       # comment it out: stage 0's default_sampling_params.extra_args must be
       # non-empty or vllm-omni sets has_sampling_extra_args=False and drops every
-      # per-request extra, the noise seed and euler steps included.
-      # - VOXTRAL_CFG_ALPHA=1.2
-      - VOXTRAL_CFG_ALPHA=1.3
+      # per-request extra, the noise seed and euler steps included. (The entrypoint
+      # now injects 2.0 when unset for exactly that reason, so an accidental
+      # comment-out is no longer silent, but keep it explicit here.)
+      # Was 1.3 from 2026-07-06 to 2026-10-13, so A8's grid and A9's medical
+      # audition both heard their voices at 1.3.
+      - VOXTRAL_CFG_ALPHA=2.0
       # Stage-0 GPU memory fraction (packaged 0.8). Stage 0 (0.8) + stage 1 (0.1)
       # + CUDA contexts + desktop usage overflow a 24GB card shared with a display
       # (stage 1 then fails with "Free memory ... less than desired GPU memory

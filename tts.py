@@ -372,8 +372,9 @@ def build_speech_body(
         TADA acoustic classifier-free guidance (server field `cfg_scale`,
         mapping to `acoustic_cfg`, default 1.6). Env `TADA_ACOUSTIC_CFG`.
     cfg_alpha : float or None
-        Voxtral classifier-free guidance scale (deploy default 1.2), sent
-        nested inside `extra_params` rather than as a flat field. Unrelated
+        Voxtral classifier-free guidance scale (this repo's server default is
+        2.0; usable 1.2-2.0 on the shipped voices, 1.5-2.0 on the hybrids),
+        sent nested inside `extra_params` rather than as a flat field. Unrelated
         to `cfg_scale` above: different backend, different server field,
         different default. Unset = the value the server booted with
         (`VOXTRAL_CFG_ALPHA` in docker-compose.yml).
@@ -1033,7 +1034,11 @@ def main() -> int:
         "7 and 2048).")
     voxtral.add_argument("--cfg-alpha", type=float, default=None,
                          help="Voxtral classifier-free guidance scale for THIS request "
-                              "(deploy default 1.2; higher = tighter text adherence). "
+                              "(higher = tighter text adherence; our server default is "
+                              "2.0). Measured band: 1.2-2.0 for the shipped voices, "
+                              "1.5-2.0 for the hybrids, 1.5 being the floor worth "
+                              "retrying a bad take at. Below 1.2 takes stop terminating, "
+                              "and 3.0+ distorts and risks a take that never finishes. "
                               "Distinct from TADA's --cfg-scale. 1.0 disables CFG and "
                               "yields garbled, off-text audio.")
     voxtral.add_argument("--euler-steps", type=int, default=None,

@@ -52,8 +52,10 @@ SENTENCE="${SENTENCE:-4}"
 # the interesting range is narrow, so this is dense between 1.0 and 3.0 and coarse above.
 # 1.0 is deliberately in the grid as the known-bad anchor (CFG off, the decoder emits
 # phonetically plausible but wrong audio, which is why entrypoint.sh refuses that value at
-# startup) so the ear has a floor to compare the rest against. 1.2 is the deploy default,
-# i.e. the value every earlier verdict was taken at.
+# startup) so the ear has a floor to compare the rest against. The grid is also where the
+# repo's default came from: it ran at 1.3 when this sweep was made (A8's grid and A9's
+# audition were both heard at 1.3) and the listening pass moved it to 2.0, so re-running
+# this script now brackets the default rather than sitting on it.
 CFGS="${CFGS:-0.1 0.5 1.0 1.2 1.5 2.0 2.5 3.0 4.0 5.0}"
 SEED="${SEED:-20261013}"
 CONCURRENCY="${CONCURRENCY:-4}"
@@ -105,7 +107,7 @@ echo "   -> ${DEST}"
 PF="$(mktemp -d)"
 trap 'rm -rf "${PF}"' EXIT
 for take in a b; do
-    uv run ./tts.py --url "${URL}" -t "${TEXT}" --voice fr_female --cfg-alpha 1.2 \
+    uv run ./tts.py --url "${URL}" -t "${TEXT}" --voice fr_female --cfg-alpha 2.0 \
         --noise-seed "${SEED}" -o "${PF}/pf_${take}.wav" >/dev/null
 done
 if cmp -s "${PF}/pf_a.wav" "${PF}/pf_b.wav"; then
@@ -171,7 +173,11 @@ difference between a voice's ten takes.
 cfg_alpha grid: ${CFGS}
   1.00 is the known-bad anchor: it turns CFG off and the decoder stops following
        the text (plausible-sounding but wrong audio). Expect it to be broken.
-  1.20 is the deploy default, i.e. what every earlier audition heard.
+  1.30 was the server default when this sweep ran, i.e. what every earlier
+       audition heard. It is between two grid points here, 1.20 and 1.50.
+  2.00 is the server default since 2026-10-13, decided by listening to this
+       sweep: usable band 1.2-2.0 for the shipped voices, 1.5-2.0 for the
+       hybrids, 1.5 the floor worth retrying a bad take at.
 
 The six voices rejected on medical text, which is what this sweep is really
 about: h_frm_itf, h_frf_hif, h_ptm_nlm, h_ptf_esf, h_frf_him, h_frm_def.

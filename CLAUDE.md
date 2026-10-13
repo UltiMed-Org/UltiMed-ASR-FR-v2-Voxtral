@@ -215,8 +215,10 @@ hand-run recipe.)
   model reads one cfg_alpha per request out of it
   (`model_executor/models/voxtral_tts/voxtral_tts.py::_extract_cfg_alpha`, falling back
   to 1.2). So `./tts.py -t "..." --voice fr_male --cfg-alpha 1.5` overrides
-  `VOXTRAL_CFG_ALPHA` for that one call, no restart, and sweeps need no `up -d` between
-  values. tts.py keeps it opt-in like every other knob (omitted when unset, server keeps
+  `VOXTRAL_CFG_ALPHA` (which this repo sets to **2.0**, see below for the measured band)
+  for that one call, no restart, and sweeps need no `up -d` between
+  values. Being per request is also what lets a dataset run carry a **per-voice** value,
+  or retry a bad take at 1.5 without touching the server. tts.py keeps it opt-in like every other knob (omitted when unset, server keeps
   its deploy default) and only **warns** on the known-bad `1.0` rather than refusing it
   the way `entrypoint.sh` does at startup: per request the damage stops at that call.
   Do not confuse it with TADA's `--cfg-scale` (different backend, field and default).
@@ -334,12 +336,27 @@ hand-run recipe.)
   - `VOXTRAL_CFG_ALPHA` -> stage_id 0 classifier-free-guidance scale, patched into that
     stage's `default_sampling_params.extra_args.cfg_alpha` (the same field vllm-omni reads
     per-request cfg_alpha from, so this only sets the **default**: `tts.py --cfg-alpha`
-    overrides it per call, see above). Deploy default **1.2**. Nudge up for tighter text
-    adherence. The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
+    overrides it per call, see above). Packaged default 1.2; **this repo runs 2.0**, and
+    the entrypoint now injects 2.0 when the var is unset rather than leaving the field
+    absent. The value is measured, not inherited: 16 French voices x 10 values from 0.1 to
+    5.0 on one dense medical sentence with the noise seed pinned, listened to on
+    2026-10-13 (`voxtral/cloning/cfg_sweep.sh`, PLAN stage A10). **2.0 is the starting
+    point and 1.5 the floor worth retrying a bad take at**, which is why the default sits
+    at the top of the usable band rather than the middle: there is room to go down and
+    little to gain going up. Usable band **1.2-2.0 for the 20 shipped voices, 1.5-2.0 for
+    the hybrids**, which need more guidance to hold their articulation. Asymmetric in both
+    directions: below 1.2 it degrades much faster than the same distance above 2.0 (at 0.5
+    and below, all 16 voices rambled to ~2.7x the sentence's natural length instead of
+    stopping), and from 3.0 up distortion grows with the value while takes increasingly
+    fail to terminate at all (above 3.0 the sweep's longest takes were exactly 327.68 s,
+    i.e. they hit `VOXTRAL_MAX_TOKENS` and were cut off). Note A8's grid and A9's medical
+    audition were both heard at **1.3**, the value compose carried from 2026-07-06.
+    The entrypoint **refuses `1.0`**: disabling CFG makes the flow-matching
     decoder hallucinate phonetically-plausible-but-wrong audio (stops following the text).
     **Do not comment it out**: an empty stage-0 `extra_args` sets
     `has_sampling_extra_args=False` and vllm-omni then drops *every* per-request extra,
-    the noise seed and euler steps included.
+    the noise seed and euler steps included (the injected default now prevents that
+    silently happening, but the explicit line documents the value).
   - `VOXTRAL_EULER_STEPS` -> the **Euler ODE / NFE step count** of the **stage-0**
     flow-matching acoustic transformer (`n_decoding_steps`): the primary compute<->quality
     lever (more steps = steadier, higher-fidelity audio for more compute; CFG batches a

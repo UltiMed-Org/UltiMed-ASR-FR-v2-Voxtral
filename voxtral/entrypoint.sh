@@ -63,14 +63,23 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #   VOXTRAL_MAX_NUM_SEQS  -> both stages' max_num_seqs (packaged 32). The acoustic
 #                            stage is codec-bs=1, so raising this past the ~4-8
 #                            concurrency saturation point buys little.
-#   VOXTRAL_CFG_ALPHA     -> stage_id 0 classifier-free guidance scale (default
-#                            1.2). Nudge up for tighter text adherence; NEVER 1.0
+#   VOXTRAL_CFG_ALPHA     -> stage_id 0 classifier-free guidance scale. Default
+#                            2.0, which is this repo's measured starting point and
+#                            not the packaged 1.2: on 16 French voices reading
+#                            medical text, 2.0 was the best compromise and 1.5 the
+#                            floor worth retrying at (see PLAN stage A10). Usable
+#                            band 1.2-2.0 for the shipped voices, 1.5-2.0 for the
+#                            hybrids; below it degrades faster than above, and from
+#                            3.0 up distortion grows and a take can stop
+#                            terminating. NEVER 1.0
 #                            (disables CFG -> garbled/off-text audio; refused).
 #                            Overridable per request (`tts.py --cfg-alpha`), so this
-#                            is only the default. KEEP IT SET: stage 0's
-#                            default_sampling_params.extra_args must be non-empty or
-#                            vllm-omni sets has_sampling_extra_args=False and drops
-#                            EVERY per-request extra, the noise seed included.
+#                            is only the default. It is injected rather than left
+#                            unset so stage 0's
+#                            default_sampling_params.extra_args is always non-empty:
+#                            an empty one makes vllm-omni set
+#                            has_sampling_extra_args=False and drop EVERY
+#                            per-request extra, the noise seed included.
 #   VOXTRAL_GPU_MEM_UTIL  -> stage_id 0 gpu_memory_utilization (packaged 0.8).
 #                            Lower it (e.g. 0.7) so stage 0 + stage 1's 0.1 fit on
 #                            a 24GB card shared with a desktop; unset = 0.8.
@@ -97,6 +106,7 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #  carry `euler_steps`, which our fork honours when every request sharing that
 #  decode step agrees on the value.)
 VOXTRAL_ACOUSTIC_TEMP="${VOXTRAL_ACOUSTIC_TEMP:-0.7}" \
+VOXTRAL_CFG_ALPHA="${VOXTRAL_CFG_ALPHA:-2.0}" \
 python3 - "$TUNED_YAML" <<'PY'
 import os, sys, vllm_omni, yaml
 
@@ -116,7 +126,9 @@ temp = os.environ.get("VOXTRAL_ACOUSTIC_TEMP")  # always set (default injected a
 seed = os.environ.get("VOXTRAL_SEED")
 max_num_seqs = os.environ.get("VOXTRAL_MAX_NUM_SEQS")
 gpu_mem_util = os.environ.get("VOXTRAL_GPU_MEM_UTIL")  # stage 0 GPU memory fraction
-cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # stage 0 classifier-free guidance
+cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # always set (default injected above),
+# which also keeps stage 0's extra_args non-empty, the condition vllm-omni checks before
+# forwarding ANY per-request extra (noise seed, euler steps).
 max_tokens = os.environ.get("VOXTRAL_MAX_TOKENS")  # stage 0 output-length cap
 max_model_len = os.environ.get("VOXTRAL_MAX_MODEL_LEN")  # stage 0 total context
 
@@ -135,12 +147,16 @@ def _bounded_int(name, raw, minimum=1):
 
 # Guardrail: cfg_alpha=1.0 disables CFG, which makes the flow-matching decoder
 # hallucinate phonetically-plausible-but-wrong audio (it stops following the
-# text). The paper/default is 1.2; refuse the known-broken value outright.
+# text). Refuse the known-broken value outright. Note the repo default is 2.0
+# rather than the packaged 1.2: measured on 16 French voices reading medical text
+# (PLAN stage A10), 2.0 reads that material best and 1.5 is the floor worth
+# retrying at, while below 1.2 the decoder stops terminating and above 3.0 it
+# distorts and increasingly fails to stop at all.
 if cfg_alpha is not None and abs(float(cfg_alpha) - 1.0) < 1e-9:
     sys.exit(
         "voxtral entrypoint: VOXTRAL_CFG_ALPHA=1.0 disables classifier-free "
-        "guidance and produces garbled/off-text audio. Use ~1.2 (default); "
-        "raise slightly for tighter text adherence."
+        "guidance and produces garbled/off-text audio. Use 2.0 (this repo's "
+        "default), or 1.5-2.0; the shipped voices also take 1.2."
     )
 
 for stage in cfg.get("stages", []):
