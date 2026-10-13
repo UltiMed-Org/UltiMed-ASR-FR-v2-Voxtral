@@ -551,6 +551,42 @@ Expect 1.0 to sound broken: disabling CFG makes the decoder emit phonetically pl
 wrong audio, which is why `entrypoint.sh` refuses that value at startup. It is in the grid
 as the known-bad anchor, so the ear has a floor to compare against.
 
+**First result, duration only (2026-10-13).** 160 takes, none failed, 108.5 minutes of
+audio for a sentence that reads in 11.2 s, which is itself the headline: the wings of the
+range do not just sound worse, they stop terminating. Counting takes over 1.5x the expected
+length (16.7 s at the grid's 2.15 words/s), out of 16 voices per value:
+
+| cfg_alpha | median | max | over-long |
+|---|---|---|---|
+| 0.10 | 30.4 s | 30.4 s | 16/16 |
+| 0.50 | 30.4 s | 36.3 s | 16/16 |
+| 1.00 | 13.5 s | 32.6 s | 4/16 |
+| **1.20** | 12.8 s | 16.6 s | **0/16** |
+| 1.50 | 12.9 s | 18.9 s | 2/16 |
+| 2.00 | 13.4 s | 22.0 s | 3/16 |
+| 2.50 | 14.0 s | 22.3 s | 3/16 |
+| 3.00 | 13.2 s | 327.7 s | 2/16 |
+| 4.00 | 13.0 s | 327.7 s | 6/16 |
+| 5.00 | 30.1 s | 327.7 s | 12/16 |
+
+Three things worth keeping. First, the deploy default 1.2 is the only value where all 16
+voices produce a correctly-terminating take, including all six that A9 rejected, so by this
+measure it was already the right choice and there is no free lunch at a neighbouring value.
+Second, the failure modes at the two ends are different: below 1.0 every take is about 30 s,
+a stable 2.7x overrun that sounds like the decoder padding without guidance, while at 3.0
+and above the maxima are exactly **327.7 s**, i.e. 4096 frames at 12.5 Hz, which is the
+`VOXTRAL_MAX_TOKENS` ceiling compose sets. Those takes did not run long, they never stopped,
+and only the cap ended them. Third, over-long counts rise monotonically from 1.5 upward
+(2, 3, 3, then 6 and 12), so pushing guidance past the default to buy articulation trades
+against termination, which is the opposite of the intuition that more guidance means tighter
+text adherence.
+
+What this does **not** answer is the question the stage asks. Duration cannot tell a
+well-articulated take from a badly-articulated one of the right length, and A9's rejects
+were rejected on articulation. Values 1.2 through 2.5 all terminate for most voices, and
+whether a rejected voice is *usable* somewhere in that band is an ear question. The takes
+are in the drop box at `cfg_sweep/` for that pass; the roster stays at ten until then.
+
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
 Each `[N, 3072]` embedding is a sum of 37 rows from the known `[9088, 3072]` table, one row from each codebook's known offset range (offsets are `cumsum` of codebook sizes: 8194 for semantic, then 36 x 23 for acoustic, per `MultiVocabEmbeddings`). Recover the indices by coordinate descent: initialize by picking each codebook's nearest row to the residual, then repeatedly hold 36 fixed and re-solve the 37th exactly by nearest-row lookup on the residual.
