@@ -524,10 +524,11 @@ speaking medical French.
 `--only-file` and the v2 generator read. Listening tree kept at
 `exports/audition_medical/`. Harness: Claude Code.
 
-### [ ] A10. Does cfg_alpha change how many voices are valid?
+### [x] A10. Does cfg_alpha change how many voices are valid?
 
-Every verdict in A5, A8 and A9 was taken at a single cfg_alpha (the deploy default 1.2),
-because the whole grid was generated that way. So "valid" has only ever been measured as a
+Every verdict in A5, A8 and A9 was taken at a single cfg_alpha, **1.3** (compose carried
+that from 2026-07-06, commit `79960e4`; the packaged default is 1.2), because the whole grid
+was generated that way. So "valid" has only ever been measured as a
 property of the pair (voice, cfg_alpha) and then reported as a property of the voice. That
 is worth questioning rather than assuming, because cfg_alpha is the classifier-free-guidance
 scale of stage 0's flow-matching acoustic transformer, i.e. how hard the decoder is pushed
@@ -569,9 +570,10 @@ length (16.7 s at the grid's 2.15 words/s), out of 16 voices per value:
 | 4.00 | 13.0 s | 327.7 s | 6/16 |
 | 5.00 | 30.1 s | 327.7 s | 12/16 |
 
-Three things worth keeping. First, the deploy default 1.2 is the only value where all 16
-voices produce a correctly-terminating take, including all six that A9 rejected, so by this
-measure it was already the right choice and there is no free lunch at a neighbouring value.
+Three things worth keeping. First, 1.2 is the only value where all 16 voices produce a
+correctly-terminating take, including all six that A9 rejected, so by this measure there is
+no free lunch at a neighbouring value. Note 1.3, the value actually in use, falls between
+two grid points (1.20 and 1.50) and was not sampled.
 Second, the failure modes at the two ends are different: below 1.0 every take is about 30 s,
 a stable 2.7x overrun that sounds like the decoder padding without guidance, while at 3.0
 and above the maxima are exactly **327.7 s**, i.e. 4096 frames at 12.5 Hz, which is the
@@ -581,11 +583,41 @@ and only the cap ended them. Third, over-long counts rise monotonically from 1.5
 against termination, which is the opposite of the intuition that more guidance means tighter
 text adherence.
 
-What this does **not** answer is the question the stage asks. Duration cannot tell a
-well-articulated take from a badly-articulated one of the right length, and A9's rejects
-were rejected on articulation. Values 1.2 through 2.5 all terminate for most voices, and
-whether a rejected voice is *usable* somewhere in that band is an ear question. The takes
-are in the drop box at `cfg_sweep/` for that pass; the roster stays at ten until then.
+Duration cannot answer the question the stage asks, though: it cannot tell a
+well-articulated take from a badly-articulated one of the right length, and A9's rejects were
+rejected on articulation. Values 1.2 through 2.5 all terminate for most voices, so the band
+had to be heard.
+
+**Result of the listening pass (2026-10-13): the roster is unchanged at ten, and the server
+default moves from 1.3 to 2.0.** The user's verdict, in full:
+
+- **2.0 is where to start**, and **1.5 is as low as it is worth going** when a take has to be
+  retried. So the default now sits at the *top* of the usable band rather than in the middle:
+  there is somewhere to go down to, and little to gain going up.
+- Usable band **1.2 to 2.0 for the shipped voices, 1.5 to 2.0 for the hybrids**. The hybrids
+  needing more guidance than their donors is consistent with A6 and A9: a hybrid's
+  articulation is borrowed, and guidance is what holds it together.
+- **Below the band degrades much faster than above it.** The duration table shows the
+  mechanism on the low side (at 0.5 and under, 16 of 16 voices ramble to ~2.7x the natural
+  length), and by ear the degradation sets in well before that.
+- **From 3.0 up it distorts, more the higher you go, and the risk of a run that never
+  finishes rises with it.** That matches the maxima of exactly 327.68 s, i.e. takes stopped
+  only by `VOXTRAL_MAX_TOKENS`, which matters for a 600k-clip dataset run where a
+  non-terminating take costs 26 s of GPU instead of 4.
+- **Neither rejected voice is recoverable.** `h_ptm_nlm` and `h_ptf_esf` do get better as
+  cfg_alpha rises, which is evidence the mechanism is real, but their accent is still far too
+  strong where they are usable, "not worth it". So the answer to the stage's question is
+  **no: cfg_alpha moves quality within a voice, it does not move the roster.** A9's ten stand.
+
+The practical consequence for v2 is a retry ladder rather than a single value: generate at
+2.0, and retry a junk take at 1.5 before giving up on it, which costs nothing because the
+knob is per request. A per-voice cfg_alpha remains available if one of the ten turns out to
+need it, but nothing so far says any of them does.
+
+**Deliverables:** `voxtral/cloning/cfg_sweep.sh` (the sweep, re-runnable and resumable), the
+160 takes in the drop box at `cfg_sweep/`, and `VOXTRAL_CFG_ALPHA=2.0` in compose with the
+measured band documented there, in `voxtral/entrypoint.sh`, in CLAUDE.md and in `tts.py
+--cfg-alpha --help`. Harness: Claude Code.
 
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
@@ -880,12 +912,12 @@ Prior estimate before starting, for later calibration: roughly one in three that
 
 ## Open questions and TODOs
 
-- **TODO:** settle A10, whether cfg_alpha changes how many voices are valid. Every voice verdict so far (A5, A8, A9) was taken at the one deploy default 1.2, so the six A9 rejects may be recoverable at another value and the ten keepers have an untested margin. Blocks nothing, but it is the cheapest open question on the list: the knob is per request, so `voxtral/cloning/cfg_sweep.sh` answers it without a restart.
+- Open: A10 settled the cfg_alpha band on **one** sentence read by 16 voices. The two rejects it re-tested stayed rejected, so the roster is not at stake, but the band itself (1.2-2.0, 1.5-2.0 for hybrids) rests on one text. If v2's junk rate at 2.0 comes out worse than v1's at 1.3, re-run `cfg_sweep.sh` with `SENTENCE=11` (one of the ~30 s stability sentences) before blaming the voices: length is the axis the sweep did not vary.
 - **TODO:** choose the reference clip pool (`voices/` vs new recordings) before B4.
 - **TODO:** confirm whether editing the HF snapshot is stable across restarts, or whether `HF_HUB_OFFLINE=1` or a local model dir via `VOXTRAL_TTS_MODEL` is needed. If the local dir wins, `voxtral/entrypoint.sh:246` needs to stop assuming a repo id.
 - **TODO:** decide whether new voices live in the HF cache (fragile, re-applied at boot) or in a materialised local model dir (clean, needs the entrypoint change).
 - Open: is there an upper bound on N for a registered voice, given the prefix shares stage 0's `max_model_len` (compose runs 6144) with the generated frames? A 20 s prefix is 250 tokens, so this is not tight, but confirm before using very long references.
-- Open: does `VOXTRAL_CFG_ALPHA` interact with prefix adherence? If a new voice drifts, try nudging cfg before blaming the prefix.
+- Open: does `VOXTRAL_CFG_ALPHA` interact with prefix adherence? If a new voice drifts, try nudging cfg before blaming the prefix. A10 makes this likelier: the hybrids, whose articulation is borrowed from a semantic donor, need a higher floor (1.5) than the shipped voices (1.2), which is prefix adherence by another name.
 
 ## Session log
 
@@ -922,3 +954,4 @@ Newest at the bottom. One row per working session.
 | 2026-09-14 | A6 | Built the pool (380 code hybrids + 40 sparse mixes), the resumable sweep, the alternating driver and stop_all, and an ECAPA speaker-distance metric. 440 voices x 2 sentences in 40 min. Found that identity lives in the acoustic codes (+0.97 F0 correlation, 0.86 embedding similarity to the acoustic donor vs 0.20 to the semantic one), so hybrids repair French rather than inventing speakers: 6 identities that failed the gate now pass, 14 usable voices become 20. Sparse mixes do reach genuinely new embedding positions but only by degrading (corr -0.58 between distance-from-base and WER). User confirmed by ear that the 9-voice pitch-spread shortlist are all distinct. | deeper re-sweep of the 60 finalists |
 | 2026-09-14 | A7 built | Generalised the A6 machinery to named runs (`CLONING_RUN`) instead of copying it, and built the FLEURS benchmark on top: `sweep.py fleurs` fetches and caches the 332-sentence fr_fr test split, the stt pass records CER next to WER, `sweep.py stats` emits per-voice min/p25/median/mean/p75/max/stdev for both rates plus a per-sentence CSV, and both passes now carry a tqdm bar. `fleurs.sh` is the single entry point over the unchanged driver. Established that server-side prefix caching must stay off (two voices produce identical prompt_token_ids, so it would silently serve the wrong speaker) and that the ledger is the only cache that matters. Measured that whisper does not truncate at 30 s, which the 65-word sentences needed. | run it |
 | 2026-09-14 | A6 deep | Re-swept the 60 finalists at 12 sentences (21 min). 11 of 20 keeper picks changed, and a depth-2 median was off by 5.9 points on average, 48 at worst: the shallow pass was measuring luck. Fixed two scoring flaws it exposed (rank by mean excess over each sentence's own difficulty, and only let equally-deeply-measured candidates compete). The clean picks show the recipe: 18 of 20 keepers are hybrids whose semantic donor is fr_male, fr_female or de_female, all voices that read French at 0 pct themselves, so a clean reader of a language lends its articulation to any acoustic identity. | none, stage complete |
+| 2026-10-13 | A10 | Asked whether the voice verdicts were really about voices: every one of them (A5, A8, A9) had been taken at a single cfg_alpha, 1.3, and nothing had varied it. Built `cfg_sweep.sh` (160 takes: 16 voices x 10 values x one medical sentence, noise seed pinned, one flat directory) after teaching `tts.py --batch` per-row knob overrides, so the sweep is one invocation instead of 160 processes. Duration alone already showed the shape: 1.2 the only value where all 16 terminate, ~30 s rambling at 0.5 and below, and maxima of exactly 327.68 s (the token cap) at 3.0 and above, i.e. takes that never stop. The listening pass set the default to 2.0 with a usable band of 1.2-2.0, or 1.5-2.0 for hybrids, and 1.5 as the retry floor. Answer to the stage: cfg_alpha moves quality within a voice but not the roster, since both re-tested rejects improve and are still too accented to use. | v2: the voice column in the dataset repo, once the text edits are done |
