@@ -524,6 +524,33 @@ speaking medical French.
 `--only-file` and the v2 generator read. Listening tree kept at
 `exports/audition_medical/`. Harness: Claude Code.
 
+### [ ] A10. Does cfg_alpha change how many voices are valid?
+
+Every verdict in A5, A8 and A9 was taken at a single cfg_alpha (the deploy default 1.2),
+because the whole grid was generated that way. So "valid" has only ever been measured as a
+property of the pair (voice, cfg_alpha) and then reported as a property of the voice. That
+is worth questioning rather than assuming, because cfg_alpha is the classifier-free-guidance
+scale of stage 0's flow-matching acoustic transformer, i.e. how hard the decoder is pushed
+to follow the text, which is precisely the axis A9's rejections were about: the six voices
+dropped there failed on articulation under dense dosage text, not on timbre. If a reject
+holds together at 2.5 the roster is short by that voice; if a keeper only holds at 1.2 the
+roster is fragile in a way nothing has measured.
+
+The question is cheap to ask because the knob is per request on the fork
+(`_extract_cfg_alpha`, see CLAUDE.md), so a sweep needs no restart and no `up -d` between
+values. Two consequences if it does move verdicts: v2 can carry a **per-voice** cfg_alpha at
+zero cost (each row's request sets its own), and the A8/A9 rankings have to be read as
+"at 1.2" rather than as absolute.
+
+First evidence: `voxtral/cloning/cfg_sweep.sh`, run 2026-10-13. One medical sentence, all 16
+A9 candidates, 10 values from 0.1 to 5.0, `--noise-seed` pinned so cfg_alpha is the only
+thing that varies between takes (otherwise each take also draws a fresh ODE noise vector and
+the comparison is confounded). 160 takes in one flat directory, named
+`<voice>__cfg<D.DD>.wav` so a plain name sort groups them by voice with cfg ascending.
+Expect 1.0 to sound broken: disabling CFG makes the decoder emit phonetically plausible but
+wrong audio, which is why `entrypoint.sh` refuses that value at startup. It is in the grid
+as the known-bad anchor, so the ear has a floor to compare against.
+
 ### [x] B1. Recover the true codes of the shipped voices (CPU, no decoder)
 
 Each `[N, 3072]` embedding is a sum of 37 rows from the known `[9088, 3072]` table, one row from each codebook's known offset range (offsets are `cumsum` of codebook sizes: 8194 for semantic, then 36 x 23 for acoustic, per `MultiVocabEmbeddings`). Recover the indices by coordinate descent: initialize by picking each codebook's nearest row to the residual, then repeatedly hold 36 fixed and re-solve the 37th exactly by nearest-row lookup on the residual.
@@ -817,6 +844,7 @@ Prior estimate before starting, for later calibration: roughly one in three that
 
 ## Open questions and TODOs
 
+- **TODO:** settle A10, whether cfg_alpha changes how many voices are valid. Every voice verdict so far (A5, A8, A9) was taken at the one deploy default 1.2, so the six A9 rejects may be recoverable at another value and the ten keepers have an untested margin. Blocks nothing, but it is the cheapest open question on the list: the knob is per request, so `voxtral/cloning/cfg_sweep.sh` answers it without a restart.
 - **TODO:** choose the reference clip pool (`voices/` vs new recordings) before B4.
 - **TODO:** confirm whether editing the HF snapshot is stable across restarts, or whether `HF_HUB_OFFLINE=1` or a local model dir via `VOXTRAL_TTS_MODEL` is needed. If the local dir wins, `voxtral/entrypoint.sh:246` needs to stop assuming a repo id.
 - **TODO:** decide whether new voices live in the HF cache (fragile, re-applied at boot) or in a materialised local model dir (clean, needs the entrypoint change).
