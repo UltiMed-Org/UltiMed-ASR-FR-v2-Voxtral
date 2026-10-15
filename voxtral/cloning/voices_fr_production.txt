@@ -1,10 +1,23 @@
-# The French voices cleared for UltiMed v2 generation. Ten voices, ten distinct
-# identities, five female and five male.
+# The French voices cleared for UltiMed v2 generation. Nine voices, nine distinct
+# identities, four female and five male.
 #
 # A voice is heard as its SECOND name (the acoustic donor); the first name is the
-# semantic donor and moves pronunciation and stability only. So this list is ten
-# different speakers, not ten variants of a few: fr_female, fr_male, ar_male, es_male,
-# nl_female, de_female, it_male, pt_female, pt_male, cheerful_female.
+# semantic donor and moves pronunciation and stability only. So this list is nine
+# different speakers, not nine variants of a few: fr_female, fr_male, ar_male, es_male,
+# nl_female, de_female, it_male, pt_female, pt_male.
+#
+# It cleared TEN, five female and five male. `h_frm_chf` (heard as cheerful_female) was
+# dropped on 2026-10-15, which is why the roster is 4F/5M rather than even: in the
+# unbiased 5% STT sample of the v2 run it put 14 of its 180 checked clips over the CER
+# gate against 4 of 165 for the next worst voice and zero for four of the ten, p90 CER
+# 0.195 against 0.014 to 0.036 for the rest, and every `loop` and `overrun` among the
+# first 51 flagged clips was its. Its median CER was mid-pack (0.0069), so it read most
+# sentences well and then lost the text entirely on some: it derailed rather than being
+# bad, and the UltiMed code gate (utils/code_loops.py there) does catch those takes. It
+# was dropped anyway, because a dataset is not improved by a voice that needs retrying.
+# The acoustic donor may still be usable under a different semantic donor (h_frf_chf,
+# h_itf_chf): the first name is what moves stability, and that pairing was never
+# auditioned. Nothing was deleted server side, so re-adding a line is all it takes.
 #
 # Selected in two listening rounds, and the second one mattered: round 1 (A8) cleared 12
 # voices on FLEURS sentences, round 2 (A9) re-auditioned all 16 candidates on hard medical
@@ -24,4 +37,3 @@ h_itf_def
 h_frf_itm
 h_frm_ptf
 h_frf_ptm
-h_frm_chf
