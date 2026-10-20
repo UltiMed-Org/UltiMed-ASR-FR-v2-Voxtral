@@ -247,8 +247,8 @@ services:
       # which is what VOXTRAL_STAGE1_EAGER=0 lifts: the codec decoder only ever
       # sees fixed 50-frame windows, a good fit for CUDA graphs. UNMEASURED: time
       # the same take before/after and check boot still fits in stage 1's 0.1 share:
-      # - VOXTRAL_OPT_LEVEL=3
-      # - VOXTRAL_STAGE1_EAGER=0
+      - VOXTRAL_OPT_LEVEL=3
+      - VOXTRAL_STAGE1_EAGER=0
       # Euler ODE steps for the stage-0 flow-matching acoustic transformer: the main
       # compute<->quality lever. More steps = steadier/higher-fidelity audio for
       # more compute; fewer = faster. vllm-omni reads this only from the model's
