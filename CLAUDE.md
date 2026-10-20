@@ -329,7 +329,7 @@ hand-run recipe.)
   - `VOXTRAL_OPT_LEVEL` -> both stages' `optimization_level` (vLLM's `-O`, default 2,
     passed through `StageDeployConfig.engine_extras`). Per vLLM's docs `-O3` is
     currently identical to `-O2`, so this is future-proofing (or `-O0`/`-O1` for faster
-    boots). Compose runs 3. It does nothing on stage 1, which **cannot leave
+    boots). Commented out in compose since it changes nothing. It does nothing on stage 1, which **cannot leave
     `enforce_eager: true`**: tried 2026-10-20, capture dies in
     `voxtral_tts.py::forward` on `(input_ids == 0).all()` ("operation not permitted
     when stream is capturing") and the container boot-loops. The whole audio_tokenizer
@@ -342,7 +342,12 @@ hand-run recipe.)
     `POST /start_profile` and `/stop_profile`; nothing is recorded between those calls
     otherwise. Each stage dumps `profiler_out_0.txt` sorted by self CUDA time, so the
     stage-0 vs stage-1 GPU split of one take needs no trace viewer. Dev-only routes:
-    unset it after use. The recipe is in the compose comment.
+    unset it after use. The recipe is in the compose comment. **Measured 2026-10-20**
+    (one idle take, 351 frames = 28 s of audio, `n_decoding_steps` 16, cfg 2.0): stage 0
+    **8.918 s** of self CUDA time, stage 1 **0.056 s** (0.6%). So the codec decoder is
+    not worth a CUDA graph wrapper, and stage 0 is ~88% bf16 GEMMs at ~445 launches per
+    frame, i.e. the 16 Euler steps x 3 layers x CFG-doubled acoustic transformer, not
+    the 4B LLM step. `VOXTRAL_EULER_STEPS` is therefore the one real speed lever.
   - `VOXTRAL_GPU_MEM_UTIL` -> stage_id 0's `gpu_memory_utilization`, patched into the YAML
     (packaged **0.8**; unset = 0.8). Stage 0 (0.8) + stage 1 (0.1) + each engine's CUDA
     context + any desktop GPU usage overflow a 24GB card shared with a display, and stage 1

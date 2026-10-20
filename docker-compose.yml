@@ -241,10 +241,10 @@ services:
       # lever no longer exists in the 0.22 schema.)
       # - VOXTRAL_MAX_NUM_SEQS=32
       # vLLM's -O level on both stages (default 2). Per vLLM's docs 3 is currently
-      # identical to 2, so this is future-proofing. Stage 1 always runs eager (its
-      # forward cannot be CUDA-graph captured, see entrypoint.sh), so only stage 0
-      # is affected:
-      - VOXTRAL_OPT_LEVEL=3
+      # identical to 2, and this model does not support torch.compile, so on stage 0
+      # it only picks the CUDA graph mode; stage 1 always runs eager (its forward
+      # cannot be CUDA-graph captured, see entrypoint.sh). No effect today:
+      # - VOXTRAL_OPT_LEVEL=3
       # Torch profiler on both stages, output under <dir>/stage0 and /stage1. Setting
       # it registers POST /start_profile and /stop_profile; nothing is recorded
       # until /start_profile, but those routes are dev-only, so unset it after use:
@@ -252,7 +252,7 @@ services:
       #   ./tts.py -t "<long text>" --voice fr_male --noise-seed 7 -o p.wav
       #   curl -X POST localhost:8003/stop_profile
       # Then compare the "Self CUDA time total" of each stage's profiler_out_0.txt.
-      - VOXTRAL_PROFILE_DIR=/cache/profiles
+      # - VOXTRAL_PROFILE_DIR=/cache/profiles
       # Euler ODE steps for the stage-0 flow-matching acoustic transformer: the main
       # compute<->quality lever. More steps = steadier/higher-fidelity audio for
       # more compute; fewer = faster. vllm-omni reads this only from the model's
