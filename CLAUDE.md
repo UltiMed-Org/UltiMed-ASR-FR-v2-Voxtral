@@ -329,13 +329,14 @@ hand-run recipe.)
   - `VOXTRAL_OPT_LEVEL` -> both stages' `optimization_level` (vLLM's `-O`, default 2,
     passed through `StageDeployConfig.engine_extras`). Per vLLM's docs `-O3` is
     currently identical to `-O2`, so this is future-proofing (or `-O0`/`-O1` for faster
-    boots), and it does nothing on a stage running `enforce_eager: true`.
-  - `VOXTRAL_STAGE1_EAGER=0` -> stage_id 1's `enforce_eager: false` (packaged `true`),
-    letting the codec decoder compile and capture CUDA graphs. Plausible win since it
-    only ever sees fixed 50-frame windows, but **unmeasured**: upstream may have chosen
-    eager for the async-chunk connector, and capture spends boot time plus VRAM from
-    stage 1's 0.1 share. Time the same take before/after. Both knobs are commented out
-    in compose.
+    boots). Compose runs 3. It does nothing on stage 1, which **cannot leave
+    `enforce_eager: true`**: tried 2026-10-20, capture dies in
+    `voxtral_tts.py::forward` on `(input_ids == 0).all()` ("operation not permitted
+    when stream is capturing") and the container boot-loops. The whole audio_tokenizer
+    forward is data-dependent Python (per-request splitting into lists), so making it
+    capturable would mean a fork patch that graphs only the inner decoder at the fixed
+    50-frame window shape. Note vLLM also logs that this model does not support
+    `torch.compile`, so on stage 0 the `-O` level only governs CUDA graph mode.
   - `VOXTRAL_GPU_MEM_UTIL` -> stage_id 0's `gpu_memory_utilization`, patched into the YAML
     (packaged **0.8**; unset = 0.8). Stage 0 (0.8) + stage 1 (0.1) + each engine's CUDA
     context + any desktop GPU usage overflow a 24GB card shared with a display, and stage 1
