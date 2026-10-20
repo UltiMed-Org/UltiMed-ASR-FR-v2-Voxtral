@@ -326,6 +326,16 @@ hand-run recipe.)
     Note the acoustic stage is `codec-bs=1`, so per the maintainers audio throughput
     **saturates around client concurrency 4-8**; raising this past that buys little. (The
     0.18 `runtime.defaults.max_inflight` lever no longer exists in the 0.22 schema.)
+  - `VOXTRAL_OPT_LEVEL` -> both stages' `optimization_level` (vLLM's `-O`, default 2,
+    passed through `StageDeployConfig.engine_extras`). Per vLLM's docs `-O3` is
+    currently identical to `-O2`, so this is future-proofing (or `-O0`/`-O1` for faster
+    boots), and it does nothing on a stage running `enforce_eager: true`.
+  - `VOXTRAL_STAGE1_EAGER=0` -> stage_id 1's `enforce_eager: false` (packaged `true`),
+    letting the codec decoder compile and capture CUDA graphs. Plausible win since it
+    only ever sees fixed 50-frame windows, but **unmeasured**: upstream may have chosen
+    eager for the async-chunk connector, and capture spends boot time plus VRAM from
+    stage 1's 0.1 share. Time the same take before/after. Both knobs are commented out
+    in compose.
   - `VOXTRAL_GPU_MEM_UTIL` -> stage_id 0's `gpu_memory_utilization`, patched into the YAML
     (packaged **0.8**; unset = 0.8). Stage 0 (0.8) + stage 1 (0.1) + each engine's CUDA
     context + any desktop GPU usage overflow a 24GB card shared with a display, and stage 1

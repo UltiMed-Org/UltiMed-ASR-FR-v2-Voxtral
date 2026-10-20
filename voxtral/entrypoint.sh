@@ -101,6 +101,10 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            ~104 KiB of KV cache (2 x 26 layers x 8 kv heads x 128
 #                            head_dim x 2 bytes), so raising it trades concurrency
 #                            for length within the same gpu_memory_utilization pool.
+#   VOXTRAL_OPT_LEVEL     -> vLLM -O level (optimization_level) on both stages
+#                            (vLLM default 2; 3 is currently identical to 2).
+#   VOXTRAL_STAGE1_EAGER  -> "0" sets stage_id 1 enforce_eager: false so the codec
+#                            decoder compiles/CUDA-graphs (packaged: eager). Unmeasured.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
 #  params.json, not this deploy YAML. It too is now only a default: a request can
 #  carry `euler_steps`, which our fork honours when every request sharing that
@@ -131,6 +135,8 @@ cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # always set (default injected 
 # forwarding ANY per-request extra (noise seed, euler steps).
 max_tokens = os.environ.get("VOXTRAL_MAX_TOKENS")  # stage 0 output-length cap
 max_model_len = os.environ.get("VOXTRAL_MAX_MODEL_LEN")  # stage 0 total context
+opt_level = os.environ.get("VOXTRAL_OPT_LEVEL")  # vLLM -O level, both stages
+stage1_eager = os.environ.get("VOXTRAL_STAGE1_EAGER")  # "0" lets stage 1 compile
 
 
 def _bounded_int(name, raw, minimum=1):
@@ -201,6 +207,21 @@ for stage in cfg.get("stages", []):
         sampling["max_tokens"] = _bounded_int("VOXTRAL_MAX_TOKENS", max_tokens)
     if stage.get("stage_id") == 0 and max_model_len:
         stage["max_model_len"] = _bounded_int("VOXTRAL_MAX_MODEL_LEN", max_model_len)
+    # vLLM's -O level (EngineArgs.optimization_level, default 2), passed through
+    # StageDeployConfig.engine_extras like the seed. Per vLLM's docs -O3 is currently
+    # identical to -O2, so this only matters once O3 grows its own passes, or to drop
+    # to -O0/-O1 for faster boots. It does nothing on a stage with enforce_eager: true,
+    # which is why it comes paired with the stage-1 switch below.
+    if opt_level:
+        stage["optimization_level"] = _bounded_int("VOXTRAL_OPT_LEVEL", opt_level, minimum=0)
+    # Stage 1 (codec decoder) ships enforce_eager: true. It only ever sees fixed
+    # 50-frame windows (codec_left_context_frames 25 + codec_chunk_frames 25), the
+    # shape CUDA graphs suit best, so compiling it may speed up decoding. Unmeasured:
+    # upstream may have chosen eager for the async-chunk connector, and compiling
+    # costs boot time plus a little VRAM out of stage 1's 0.1 share. "0" compiles,
+    # anything else (or unset) keeps the packaged eager mode.
+    if stage.get("stage_id") == 1 and stage1_eager == "0":
+        stage["enforce_eager"] = False
 
 # The prompt always costs tokens, so a max_tokens that reaches max_model_len can
 # never be spent in full: vLLM stops the request at the context limit instead
@@ -223,10 +244,11 @@ with open(dst, "w") as f:
 sys.stderr.write(
     "voxtral entrypoint: patched %s -> %s "
     "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s gpu_mem_util=%s "
-    "max_tokens=%s [%.2f s of audio] max_model_len=%s)\n"
+    "max_tokens=%s [%.2f s of audio] max_model_len=%s opt_level=%s stage1_eager=%s)\n"
     % (src, dst, temp, seed or "default", max_num_seqs or "default",
        cfg_alpha or "default", gpu_mem_util or "default",
-       max_tokens or "default", (eff_tokens or 0) / 12.5, max_model_len or "default")
+       max_tokens or "default", (eff_tokens or 0) / 12.5, max_model_len or "default",
+       opt_level or "default", "no" if stage1_eager == "0" else "yes")
 )
 PY
 
