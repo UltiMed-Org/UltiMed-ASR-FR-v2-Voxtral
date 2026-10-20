@@ -245,6 +245,14 @@ services:
       # forward cannot be CUDA-graph captured, see entrypoint.sh), so only stage 0
       # is affected:
       - VOXTRAL_OPT_LEVEL=3
+      # Torch profiler on both stages, output under <dir>/stage0 and /stage1. Setting
+      # it registers POST /start_profile and /stop_profile; nothing is recorded
+      # until /start_profile, but those routes are dev-only, so unset it after use:
+      #   curl -X POST localhost:8003/start_profile
+      #   ./tts.py -t "<long text>" --voice fr_male --noise-seed 7 -o p.wav
+      #   curl -X POST localhost:8003/stop_profile
+      # Then compare the "Self CUDA time total" of each stage's profiler_out_0.txt.
+      - VOXTRAL_PROFILE_DIR=/cache/profiles
       # Euler ODE steps for the stage-0 flow-matching acoustic transformer: the main
       # compute<->quality lever. More steps = steadier/higher-fidelity audio for
       # more compute; fewer = faster. vllm-omni reads this only from the model's

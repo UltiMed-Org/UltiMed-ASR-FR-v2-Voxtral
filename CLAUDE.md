@@ -337,6 +337,12 @@ hand-run recipe.)
     capturable would mean a fork patch that graphs only the inner decoder at the fixed
     50-frame window shape. Note vLLM also logs that this model does not support
     `torch.compile`, so on stage 0 the `-O` level only governs CUDA graph mode.
+  - `VOXTRAL_PROFILE_DIR` -> a torch `profiler_config` on both stages (output in
+    `<dir>/stage0` and `<dir>/stage1`). Its presence is what makes vllm-omni register
+    `POST /start_profile` and `/stop_profile`; nothing is recorded between those calls
+    otherwise. Each stage dumps `profiler_out_0.txt` sorted by self CUDA time, so the
+    stage-0 vs stage-1 GPU split of one take needs no trace viewer. Dev-only routes:
+    unset it after use. The recipe is in the compose comment.
   - `VOXTRAL_GPU_MEM_UTIL` -> stage_id 0's `gpu_memory_utilization`, patched into the YAML
     (packaged **0.8**; unset = 0.8). Stage 0 (0.8) + stage 1 (0.1) + each engine's CUDA
     context + any desktop GPU usage overflow a 24GB card shared with a display, and stage 1

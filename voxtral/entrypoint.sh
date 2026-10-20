@@ -103,6 +103,8 @@ TUNED_YAML=/tmp/voxtral_tts_tuned.yaml
 #                            for length within the same gpu_memory_utilization pool.
 #   VOXTRAL_OPT_LEVEL     -> vLLM -O level (optimization_level) on both stages
 #                            (vLLM default 2; 3 is currently identical to 2).
+#   VOXTRAL_PROFILE_DIR   -> torch profiler_config on both stages (<dir>/stage<N>),
+#                            which also enables POST /start_profile + /stop_profile.
 # (VOXTRAL_EULER_STEPS is handled separately below: it patches the model's
 #  params.json, not this deploy YAML. It too is now only a default: a request can
 #  carry `euler_steps`, which our fork honours when every request sharing that
@@ -134,6 +136,7 @@ cfg_alpha = os.environ.get("VOXTRAL_CFG_ALPHA")  # always set (default injected 
 max_tokens = os.environ.get("VOXTRAL_MAX_TOKENS")  # stage 0 output-length cap
 max_model_len = os.environ.get("VOXTRAL_MAX_MODEL_LEN")  # stage 0 total context
 opt_level = os.environ.get("VOXTRAL_OPT_LEVEL")  # vLLM -O level, both stages
+profile_dir = os.environ.get("VOXTRAL_PROFILE_DIR")  # torch profiler output, both stages
 
 
 def _bounded_int(name, raw, minimum=1):
@@ -214,6 +217,22 @@ for stage in cfg.get("stages", []):
     # and the container boot-loops (tried 2026-10-20).
     if opt_level:
         stage["optimization_level"] = _bounded_int("VOXTRAL_OPT_LEVEL", opt_level, minimum=0)
+    # A stage-level profiler_config is what makes vllm-omni register POST
+    # /start_profile and /stop_profile (api_server.py::_should_enable_profiler_endpoints);
+    # nothing is recorded until /start_profile is called. One subdirectory per stage so
+    # the two workers' rank-0 files do not overwrite each other, and the
+    # self_cuda_time_total summary gives each stage's GPU time without opening a trace.
+    if profile_dir:
+        stage["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": os.path.join(profile_dir, "stage%d" % stage["stage_id"]),
+            "torch_profiler_use_gzip": True,
+            "torch_profiler_dump_cuda_time_total": True,
+            # vLLM defaults this to True; stacks on every op of a minutes-long take
+            # bloat the trace and the CPU overhead, and the per-stage GPU total is
+            # all this is for.
+            "torch_profiler_with_stack": False,
+        }
 
 # The prompt always costs tokens, so a max_tokens that reaches max_model_len can
 # never be spent in full: vLLM stops the request at the context limit instead
@@ -236,11 +255,11 @@ with open(dst, "w") as f:
 sys.stderr.write(
     "voxtral entrypoint: patched %s -> %s "
     "(acoustic_temp=%s seed=%s max_num_seqs=%s cfg_alpha=%s gpu_mem_util=%s "
-    "max_tokens=%s [%.2f s of audio] max_model_len=%s opt_level=%s)\n"
+    "max_tokens=%s [%.2f s of audio] max_model_len=%s opt_level=%s profile_dir=%s)\n"
     % (src, dst, temp, seed or "default", max_num_seqs or "default",
        cfg_alpha or "default", gpu_mem_util or "default",
        max_tokens or "default", (eff_tokens or 0) / 12.5, max_model_len or "default",
-       opt_level or "default")
+       opt_level or "default", profile_dir or "off")
 )
 PY
 
