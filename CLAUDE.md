@@ -14,7 +14,14 @@ Two moving parts:
 1. **`docker-compose.yml`** runs two containers from the prebuilt image
    `ghcr.io/crispstrobe/crispasr:main-cuda`:
    - `crispasr` (ASR), active backend `whisper` (`ggml-large-v3-turbo.bin`, pinned
-     via `--hf-repo`, multilingual, `-fa` flash-attn, transcribe-only). The compose
+     via `--hf-repo`, multilingual, `-fa` flash-attn, transcribe-only). The ggml file
+     is the one variable part: `CRISPASR_ASR_GGML` (unset = the turbo file) is
+     interpolated into `CRISPASR_EXTRA_ARGS`, so a QC tier can flip the judge to
+     `ggml-large-v3.bin` without editing the compose. It has to be in the environment
+     of the `docker compose` process, which here means `./.env` (compose reads it by
+     itself, and it survives this sudoers' refusal of `sudo -E docker compose`) or an
+     export inherited by something already running as root, e.g. the dataset repo's
+     `driver.sh` -> `switch_server.sh` under `sudo -E`. The compose
      comments mark ACTIVE vs ALT and keep lighter whisper models (`base`/`small`),
      `parakeet` (quality: Q8_0 + MAES), and `voxtral4b` as alternatives. Protected by
      `CRISPASR_API_KEYS`. This service is **replicated** (`deploy.replicas: 4`, no

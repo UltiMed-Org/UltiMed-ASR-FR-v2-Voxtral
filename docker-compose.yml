@@ -61,7 +61,17 @@ services:
       # within-request long-audio speedup at higher RAM; -t N sets CPU threads
       # (minor on GPU). NOTE: -p is intra-request only; the server itself is still
       # single-model and mutex-serialized (no cross-request batching, any backend).
-      - CRISPASR_EXTRA_ARGS=--verbose -fa --hf-repo ggerganov/whisper.cpp:ggml-large-v3-turbo.bin
+      # The ggml FILE is the one part a QC tier flips, so it is a variable rather than
+      # a hand edit: CRISPASR_ASR_GGML, unset = the turbo file above. docker compose
+      # interpolates it from its OWN environment, so it must be exported where compose
+      # runs (`sudo -E CRISPASR_ASR_GGML=ggml-large-v3.bin docker compose up -d ...`,
+      # or via driver.sh -> switch_server.sh, which inherits it under sudo -E), or
+      # written in ./.env, which compose reads by itself. A value in the shell alone
+      # does NOT reach a plain `sudo docker compose`, since sudo resets the environment.
+      # The dataset QC's second-opinion tier uses ggml-large-v3.bin (non-turbo, ~3.1GB,
+      # 32 decoder layers against turbo's 4, so ~2-3x the compute per clip), which also
+      # wants the replica count down to 4 on a 24GB card that drives a display.
+      - CRISPASR_EXTRA_ARGS=--verbose -fa --hf-repo ggerganov/whisper.cpp:${CRISPASR_ASR_GGML:-ggml-large-v3-turbo.bin}
       - CRISPASR_DIAGNOSTICS=0
       # The whisper path does NOT honor CRISPASR_KV_QUANT (it uses whisper.cpp's own
       # KV handling; --type-k / --type-v are the CLI knobs there). These apply to the
